@@ -57,6 +57,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -487,12 +488,29 @@ fun LoadingCard(message: String) {
 
 @Composable
 fun LoginReminderCard(message: String, actionLabel: String, onAction: () -> Unit) {
-    StatusCard(
-        title = message,
-        body = "",
-        actionLabel = actionLabel,
-        onAction = onAction,
-    )
+    GlassPanel {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = message,
+                modifier = Modifier.fillMaxWidth(),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                textAlign = TextAlign.Center,
+            )
+            Button(
+                onClick = onAction,
+                shape = RoundedCornerShape(999.dp),
+            ) {
+                Text(actionLabel)
+            }
+        }
+    }
 }
 
 @Composable

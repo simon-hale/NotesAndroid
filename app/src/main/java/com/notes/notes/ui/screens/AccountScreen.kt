@@ -121,7 +121,11 @@ fun AccountScreen(
                 if (uiState.session.isLoggedIn) {
                     AccountSummaryCard(
                         uiState = uiState,
-                        onClick = if (showingAccountDetails) null else viewModel::openSettingsAccountPage,
+                        onClick = if (showingAccountDetails) {
+                            viewModel::closeSettingsSubPage
+                        } else {
+                            viewModel::openSettingsAccountPage
+                        },
                         showLogoutButton = showingAccountDetails,
                         onLogout = if (showingAccountDetails) viewModel::logout else null,
                     )
