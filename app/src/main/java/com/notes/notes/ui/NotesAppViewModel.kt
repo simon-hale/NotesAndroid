@@ -534,7 +534,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 sendWarningMessage(strings.fileDisk.noFileSelected)
                 return@launch
             }
-            val pathString = _uiState.value.disk.paths.joinToString(separator = "") { "${it.name}/" }
+            val pathString = _uiState.value.disk.paths.joinToString(separator = "") { "${it.id}/" }
             _uiState.update { it.copy(disk = it.disk.copy(isUploading = true, uploadProgress = 0f)) }
             val totalFiles = candidates.size.coerceAtLeast(1)
             candidates.forEachIndexed { index, candidate ->

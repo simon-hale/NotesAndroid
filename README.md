@@ -1,6 +1,6 @@
 # Notes-Android
 
-This Android App is an AI-built project using GPT-5.4 in Codex, ported from [NotesFront (Vue3-Web)](https://github.com/simon-hale/NotesFrontend)
+This Android App is an AI-built project using GPT-5.4 in Codex, ported from [NotesFrontend (Vue3-Web)](https://github.com/simon-hale/NotesFrontend)
 
 1. Environment
 
