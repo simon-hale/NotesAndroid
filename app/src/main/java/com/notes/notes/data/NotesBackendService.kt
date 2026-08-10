@@ -102,7 +102,7 @@ class NotesBackendService {
 
     suspend fun changePassword(
         accessToken: String,
-        username: String,
+        curPassword: String,
         password: String,
         confirmedPassword: String,
         language: AppLanguage,
@@ -112,7 +112,7 @@ class NotesBackendService {
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
-                "username" to username,
+                "cur_password" to curPassword,
                 "password" to password,
                 "confirmedPassword" to confirmedPassword,
                 "language" to language.code,
@@ -121,13 +121,13 @@ class NotesBackendService {
         ensureBusinessSuccess(json)
     }
 
-    suspend fun deleteAccount(accessToken: String, username: String, language: AppLanguage) {
+    suspend fun deleteAccount(accessToken: String, curPassword: String, language: AppLanguage) {
         val json = requestJson(
             path = "/api/user/delete/",
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
-                "username" to username,
+                "cur_password" to curPassword,
                 "language" to language.code,
             ),
         )
@@ -137,12 +137,11 @@ class NotesBackendService {
         }
     }
 
-    suspend fun loadRoot(accessToken: String, username: String): RootDirectoryResult {
+    suspend fun loadRoot(accessToken: String): RootDirectoryResult {
         val json = requestJson(
             path = "/api/directory/init/",
             method = "POST",
             bearerToken = accessToken,
-            form = mapOf("username" to username),
         )
         ensureBusinessSuccess(json)
         return RootDirectoryResult(
@@ -151,14 +150,13 @@ class NotesBackendService {
         )
     }
 
-    suspend fun loadDirectory(accessToken: String, username: String, parentId: Long): DirectoryListing {
+    suspend fun loadDirectory(accessToken: String, parentId: Long): DirectoryListing {
         val json = requestJson(
             path = "/api/directory/id/",
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
                 "parent_id" to parentId.toString(),
-                "username" to username,
             ),
         )
         ensureBusinessSuccess(json)
@@ -167,7 +165,6 @@ class NotesBackendService {
 
     suspend fun createDirectory(
         accessToken: String,
-        username: String,
         parentId: Long,
         name: String,
         language: AppLanguage,
@@ -179,7 +176,6 @@ class NotesBackendService {
             form = mapOf(
                 "name" to name,
                 "parent_id" to parentId.toString(),
-                "username" to username,
                 "language" to language.code,
             ),
         )
@@ -202,7 +198,6 @@ class NotesBackendService {
 
     suspend fun renameFile(
         accessToken: String,
-        username: String,
         parentId: Long,
         fileId: Long,
         newName: String,
@@ -213,7 +208,6 @@ class NotesBackendService {
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
-                "username" to username,
                 "parentId" to parentId.toString(),
                 "fileId" to fileId.toString(),
                 "filenameNew" to newName,
@@ -236,14 +230,13 @@ class NotesBackendService {
         ensureBusinessSuccess(json)
     }
 
-    suspend fun deleteFile(accessToken: String, username: String, fileId: Long, language: AppLanguage) {
+    suspend fun deleteFile(accessToken: String, fileId: Long, language: AppLanguage) {
         val json = requestJson(
             path = "/api/file/delete/",
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
                 "id" to fileId.toString(),
-                "username" to username,
                 "language" to language.code,
             ),
         )
@@ -252,7 +245,6 @@ class NotesBackendService {
 
     suspend fun getFilePreview(
         accessToken: String,
-        username: String,
         fileId: Long,
         language: AppLanguage,
     ): FilePreviewDescriptor {
@@ -262,7 +254,6 @@ class NotesBackendService {
             bearerToken = accessToken,
             form = mapOf(
                 "id" to fileId.toString(),
-                "username" to username,
                 "language" to language.code,
             ),
         )
@@ -275,22 +266,22 @@ class NotesBackendService {
 
     suspend fun requestOssSts(
         accessToken: String,
-        username: String,
         pathString: String,
         filename: String,
         parentId: Long,
         language: AppLanguage,
+        usage: String,
     ): OssStsToken {
         val json = requestJson(
             path = "/api/oss/sts/",
             method = "GET",
             bearerToken = accessToken,
             form = mapOf(
-                "username" to username,
                 "string_of_path" to pathString,
                 "filename" to filename,
                 "parent_id" to parentId.toString(),
                 "language" to language.code,
+                "usage" to usage,
             ),
         )
         val message = json.optString("error_message")
@@ -310,7 +301,6 @@ class NotesBackendService {
 
     suspend fun insertFileInfo(
         accessToken: String,
-        username: String,
         pathString: String,
         filename: String,
         parentId: Long,
@@ -321,7 +311,6 @@ class NotesBackendService {
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
-                "username" to username,
                 "string_of_path" to pathString,
                 "filename" to filename,
                 "parent_id" to parentId.toString(),

@@ -77,6 +77,7 @@ fun AccountScreen(
 ) {
     val strings = stringsFor(uiState.settings.language)
     var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
+    var deleteCurPassword by rememberSaveable { mutableStateOf("") }
     val scrollState = rememberScrollState()
     val showingAccountDetails =
         uiState.session.isLoggedIn && uiState.settingsSubPage == SettingsSubPage.ACCOUNT
@@ -204,6 +205,14 @@ fun AccountScreen(
                         description = strings.deleteAccount.warning,
                         icon = Icons.Outlined.Delete,
                     ) {
+                        OutlinedTextField(
+                            value = deleteCurPassword,
+                            onValueChange = { deleteCurPassword = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text(strings.deleteAccount.curPassword) },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                        )
                         Button(
                             onClick = { showDeleteConfirm = true },
                             enabled = !uiState.accountBusy,
@@ -229,7 +238,7 @@ fun AccountScreen(
                 Button(
                     onClick = {
                         showDeleteConfirm = false
-                        viewModel.deleteAccount()
+                        viewModel.deleteAccount(deleteCurPassword)
                     },
                     shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
                 ) {
@@ -406,6 +415,7 @@ private fun AuthEntryCard(uiState: NotesUiState, viewModel: NotesAppViewModel) {
 @Composable
 private fun ChangePasswordCard(uiState: NotesUiState, viewModel: NotesAppViewModel) {
     val strings = stringsFor(uiState.settings.language)
+    var curPassword by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
     var confirmedPassword by rememberSaveable { mutableStateOf("") }
 
@@ -414,6 +424,14 @@ private fun ChangePasswordCard(uiState: NotesUiState, viewModel: NotesAppViewMod
         description = strings.changePassword.warning,
         icon = Icons.Outlined.Lock,
     ) {
+        OutlinedTextField(
+            value = curPassword,
+            onValueChange = { curPassword = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text(strings.changePassword.curPassword) },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true,
+        )
         OutlinedTextField(
             value = password,
             onValueChange = { password = it },
@@ -431,7 +449,7 @@ private fun ChangePasswordCard(uiState: NotesUiState, viewModel: NotesAppViewMod
             singleLine = true,
         )
         Button(
-            onClick = { viewModel.changePassword(password, confirmedPassword) },
+            onClick = { viewModel.changePassword(curPassword, password, confirmedPassword) },
             enabled = !uiState.accountBusy,
             modifier = Modifier.fillMaxWidth(),
             shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),

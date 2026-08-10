@@ -367,7 +367,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.createDirectory(
                     accessToken = session.accessToken,
-                    username = session.username,
                     parentId = parent.id,
                     name = name,
                     language = uiState.value.settings.language,
@@ -422,7 +421,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.renameFile(
                     accessToken = session.accessToken,
-                    username = session.username,
                     parentId = parent.id,
                     fileId = file.id,
                     newName = trimmed,
@@ -472,7 +470,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.deleteFile(
                     accessToken = session.accessToken,
-                    username = session.username,
                     fileId = file.id,
                     language = uiState.value.settings.language,
                 )
@@ -545,11 +542,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     try {
                         val sts = backendService.requestOssSts(
                             accessToken = session.accessToken,
-                            username = session.username,
                             pathString = pathString,
                             filename = fileName,
                             parentId = path.id,
                             language = uiState.value.settings.language,
+                            usage = "SINGLE_FILE_UPLOAD",
                         )
                         if (sts.overwriteSameName) {
                             sendWarningMessage(strings.fileDisk.overwriteSameName)
@@ -563,7 +560,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         }
                         backendService.insertFileInfo(
                             accessToken = session.accessToken,
-                            username = session.username,
                             pathString = pathString,
                             filename = fileName,
                             parentId = path.id,
@@ -614,7 +610,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 val descriptor = backendService.getFilePreview(
                     accessToken = session.accessToken,
-                    username = session.username,
                     fileId = file.id,
                     language = uiState.value.settings.language,
                 )
@@ -639,7 +634,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 val descriptor = backendService.getFilePreview(
                     accessToken = session.accessToken,
-                    username = session.username,
                     fileId = targetFile.id,
                     language = uiState.value.settings.language,
                 )
@@ -667,7 +661,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 val descriptor = backendService.getFilePreview(
                     accessToken = session.accessToken,
-                    username = session.username,
                     fileId = selectedFile.id,
                     language = uiState.value.settings.language,
                 )
@@ -732,7 +725,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun login(username: String, password: String, rememberMe: Boolean) {
         viewModelScope.launch {
             val normalizedUsername = username.trim()
-            if (normalizedUsername.isBlank() || password.isBlank()) {
+            if (normalizedUsername.isBlank() || password.isEmpty()) {
                 sendWarningMessage(requiredFieldsMessage())
                 return@launch
             }
@@ -755,7 +748,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun register(username: String, password: String, confirmedPassword: String) {
         viewModelScope.launch {
             val normalizedUsername = username.trim()
-            if (normalizedUsername.isBlank() || password.isBlank() || confirmedPassword.isBlank()) {
+            if (normalizedUsername.isBlank() || password.isEmpty() || confirmedPassword.isEmpty()) {
                 sendWarningMessage(requiredFieldsMessage())
                 return@launch
             }
@@ -788,10 +781,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun changePassword(newPassword: String, confirmedPassword: String) {
+    fun changePassword(curPassword: String, newPassword: String, confirmedPassword: String) {
         viewModelScope.launch {
             val session = activeSession() ?: return@launch
-            if (newPassword.isBlank() || confirmedPassword.isBlank()) {
+            if (curPassword.isEmpty() || newPassword.isEmpty() || confirmedPassword.isEmpty()) {
                 sendWarningMessage(requiredFieldsMessage())
                 return@launch
             }
@@ -803,7 +796,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.changePassword(
                     accessToken = session.accessToken,
-                    username = session.username,
+                    curPassword = curPassword,
                     password = newPassword,
                     confirmedPassword = confirmedPassword,
                     language = uiState.value.settings.language,
@@ -817,14 +810,18 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun deleteAccount() {
+    fun deleteAccount(curPassword: String) {
         viewModelScope.launch {
             val session = activeSession() ?: return@launch
+            if (curPassword.isEmpty()) {
+                sendWarningMessage(requiredFieldsMessage())
+                return@launch
+            }
             setAccountBusy(true)
             runCatching {
                 backendService.deleteAccount(
                     accessToken = session.accessToken,
-                    username = session.username,
+                    curPassword = curPassword,
                     language = uiState.value.settings.language,
                 )
                 preferencesStore.clearCredentials()
@@ -953,7 +950,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.loadRoot(
                     accessToken = session.accessToken,
-                    username = session.username,
                 )
             }.map { result ->
                 LoadedDiskPage(
@@ -967,7 +963,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.loadDirectory(
                     accessToken = session.accessToken,
-                    username = session.username,
                     parentId = target.directoryId,
                 )
             }.map { listing ->

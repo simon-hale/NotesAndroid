@@ -93,6 +93,7 @@ data class AccountStrings(
 )
 
 data class ChangePasswordStrings(
+    val curPassword: String,
     val newPassword: String,
     val confirmPassword: String,
     val mismatch: String,
@@ -101,6 +102,7 @@ data class ChangePasswordStrings(
 )
 
 data class DeleteAccountStrings(
+    val curPassword: String,
     val warning: String,
     val confirmFirst: String,
     val modalTitle: String,
@@ -323,6 +325,7 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             signedInAsTemplate = "当前登录：%s",
         ),
         changePassword = ChangePasswordStrings(
+            curPassword = "原密码",
             newPassword = "新密码",
             confirmPassword = "确认密码",
             mismatch = "两次输入的密码不一致",
@@ -330,6 +333,7 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             submit = "确认修改",
         ),
         deleteAccount = DeleteAccountStrings(
+            curPassword = "当前密码",
             warning = "确定要删除这个账户吗？删除后所有信息都会被清除",
             confirmFirst = "确认删除",
             modalTitle = "二次确认",
@@ -503,6 +507,7 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             signedInAsTemplate = "Signed in as %s",
         ),
         changePassword = ChangePasswordStrings(
+            curPassword = "Original Password",
             newPassword = "New Password",
             confirmPassword = "Confirm Password",
             mismatch = "The two passwords do not match.",
@@ -510,6 +515,7 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             submit = "Confirm changes",
         ),
         deleteAccount = DeleteAccountStrings(
+            curPassword = "Current Password",
             warning = "Are you sure you want to delete this account? All your information will be deleted!",
             confirmFirst = "Confirm deletion",
             modalTitle = "Second confirmation",
