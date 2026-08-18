@@ -950,6 +950,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 backendService.loadRoot(
                     accessToken = session.accessToken,
+                    language = uiState.value.settings.language,
                 )
             }.map { result ->
                 LoadedDiskPage(
@@ -964,6 +965,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 backendService.loadDirectory(
                     accessToken = session.accessToken,
                     parentId = target.directoryId,
+                    language = uiState.value.settings.language,
                 )
             }.map { listing ->
                 LoadedDiskPage(

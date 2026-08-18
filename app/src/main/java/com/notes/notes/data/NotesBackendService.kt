@@ -137,11 +137,14 @@ class NotesBackendService {
         }
     }
 
-    suspend fun loadRoot(accessToken: String): RootDirectoryResult {
+    suspend fun loadRoot(accessToken: String, language: AppLanguage): RootDirectoryResult {
         val json = requestJson(
             path = "/api/directory/init/",
             method = "POST",
             bearerToken = accessToken,
+            form = mapOf(
+                "language" to language.code,
+            ),
         )
         ensureBusinessSuccess(json)
         return RootDirectoryResult(
@@ -150,13 +153,14 @@ class NotesBackendService {
         )
     }
 
-    suspend fun loadDirectory(accessToken: String, parentId: Long): DirectoryListing {
+    suspend fun loadDirectory(accessToken: String, parentId: Long, language: AppLanguage): DirectoryListing {
         val json = requestJson(
             path = "/api/directory/id/",
             method = "POST",
             bearerToken = accessToken,
             form = mapOf(
                 "parent_id" to parentId.toString(),
+                "language" to language.code,
             ),
         )
         ensureBusinessSuccess(json)
@@ -274,7 +278,7 @@ class NotesBackendService {
     ): OssStsToken {
         val json = requestJson(
             path = "/api/oss/sts/",
-            method = "GET",
+            method = "POST",
             bearerToken = accessToken,
             form = mapOf(
                 "string_of_path" to pathString,
