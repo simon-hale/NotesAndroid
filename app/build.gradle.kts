@@ -32,7 +32,7 @@ android {
         minSdk = 35
         targetSdk = 36
         versionCode = 6
-        versionName = "1.0.8"
+        versionName = "1.0.9"
 
         buildConfigField("String", "NOTES_BASE_URL", "\"${notesBaseUrl.escapeBuildConfigString()}\"")
 

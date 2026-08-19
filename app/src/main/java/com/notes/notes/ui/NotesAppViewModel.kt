@@ -328,12 +328,42 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun removeUploadCandidate(candidate: UploadCandidate) {
+        if (_uiState.value.disk.isUploading) return
         val releaseFailure = removeUploadCandidateInternal(candidate)
         if (releaseFailure != null) {
             sendErrorMessage(
                 releaseUploadPermissionFailedMessage(
                     fileName = candidate.displayName,
                     throwable = releaseFailure,
+                )
+            )
+        }
+    }
+
+    fun clearUploadCandidates() {
+        val state = _uiState.value
+
+        if (state.disk.isUploading) return
+
+        val candidates = state.disk.uploadCandidates
+        if (candidates.isEmpty()) return
+
+        val releaseFailures = releaseUploadCandidatePermissions(candidates)
+
+        _uiState.update { currentState ->
+            currentState.copy(
+                disk = currentState.disk.copy(
+                    uploadCandidates = emptyList(),
+                    uploadProgress = 0f,
+                )
+            )
+        }
+
+        if (releaseFailures.isNotEmpty()) {
+            sendErrorMessage(
+                bulkReleaseUploadPermissionFailedMessage(
+                    count = releaseFailures.size,
+                    throwable = releaseFailures.first(),
                 )
             )
         }

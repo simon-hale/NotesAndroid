@@ -324,6 +324,7 @@ fun DiskScreen(
             },
             onPickFiles = { filePicker.launch(arrayOf("*/*")) },
             onRemoveCandidate = viewModel::removeUploadCandidate,
+            onClearCandidates = viewModel::clearUploadCandidates,
             onUpload = viewModel::uploadSelectedFiles,
             language = uiState.settings.language,
             strings = strings,
@@ -603,6 +604,7 @@ private fun UploadBottomSheet(
     onCreateFolder: () -> Unit,
     onPickFiles: () -> Unit,
     onRemoveCandidate: (UploadCandidate) -> Unit,
+    onClearCandidates: () -> Unit,
     onUpload: () -> Unit,
     language: AppLanguage,
     strings: com.notes.notes.core.AppStrings,
@@ -722,6 +724,8 @@ private fun UploadBottomSheet(
                         }
                     }
                 }
+                val hasUploadCandidates = uploadCandidates.isNotEmpty()
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -733,10 +737,22 @@ private fun UploadBottomSheet(
                         enabled = !isUploading,
                         onClick = onPickFiles,
                     )
+
+                    if (hasUploadCandidates) {
+                        SecondaryActionButton(
+                            label = strings.fileDisk.clearSelectedFiles,
+                            modifier = Modifier.weight(1f),
+                            enabled = !isUploading,
+                            onClick = onClearCandidates,
+                        )
+                    }
+
                     PrimaryActionButton(
                         label = strings.common.upload,
-                        modifier = Modifier.weight(3f),
-                        enabled = !isUploading && uploadCandidates.isNotEmpty(),
+                        modifier = Modifier.weight(
+                            if (hasUploadCandidates) 2f else 1f
+                        ),
+                        enabled = !isUploading && hasUploadCandidates,
                         onClick = onUpload,
                     )
                 }
