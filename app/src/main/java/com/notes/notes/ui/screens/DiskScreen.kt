@@ -745,16 +745,13 @@ private fun UploadBottomSheet(
                             enabled = !isUploading,
                             onClick = onClearCandidates,
                         )
+                        PrimaryActionButton(
+                            label = strings.common.upload,
+                            modifier = Modifier.weight(2f),
+                            enabled = !isUploading,
+                            onClick = onUpload,
+                        )
                     }
-
-                    PrimaryActionButton(
-                        label = strings.common.upload,
-                        modifier = Modifier.weight(
-                            if (hasUploadCandidates) 2f else 1f
-                        ),
-                        enabled = !isUploading && hasUploadCandidates,
-                        onClick = onUpload,
-                    )
                 }
             }
         }
