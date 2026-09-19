@@ -4,6 +4,8 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.Data
+import androidx.work.WorkInfo
 import com.notes.notes.core.AppLanguage
 import com.notes.notes.core.AppSettingsState
 import com.notes.notes.core.AppTab
@@ -34,6 +36,8 @@ import com.notes.notes.data.NotesBackendService
 import com.notes.notes.data.NotesServiceException
 import com.notes.notes.data.PreviewRepository
 import com.notes.notes.data.UploadUriPermissionManager
+import com.notes.notes.data.UploadWork
+import com.notes.notes.data.UploadWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,6 +51,7 @@ import java.text.Collator
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 
 class NotesAppViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -66,6 +71,18 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     val messages = messageChannel.receiveAsFlow()
     private var latestDiskRequestToken = 0L
 
+    /** Last lifecycle state seen for every observed upload work, keyed by WorkManager id. */
+    private val uploadWorkStates = mutableMapOf<UUID, WorkInfo.State>()
+    private val overwriteWarnedUploads = mutableSetOf<UUID>()
+
+    /** Upload batch currently reflected in the UI, used for byte weighted progress across files. */
+    private var uploadBatchId: String? = null
+    private var uploadBatchTotalBytes = 0L
+
+    /** Work items this ViewModel enqueued itself, plus the ones already reported to the user. */
+    private var uploadBatchWorkIds: Set<UUID> = emptySet()
+    private val handledUploadWorkIds = mutableSetOf<UUID>()
+
     init {
         viewModelScope.launch {
             val initial = preferencesStore.preferences.first()
@@ -76,6 +93,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             cleanupStaleUploadUriPermissions()
             bootstrap(initial.savedUsername, initial.savedAccessToken)
         }
+        observeUploadWork()
     }
 
     fun setCurrentTab(tab: AppTab) {
@@ -554,84 +572,246 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun uploadSelectedFiles() {
         viewModelScope.launch {
             val strings = strings()
+            val state = _uiState.value
+            if (state.disk.isUploading) return@launch
             val session = activeSession() ?: return@launch
             val path = currentPath() ?: return@launch
-            val candidates = _uiState.value.disk.uploadCandidates
+            val candidates = state.disk.uploadCandidates
             if (candidates.isEmpty()) {
                 sendWarningMessage(strings.fileDisk.noFileSelected)
                 return@launch
             }
-            val pathString = _uiState.value.disk.paths.joinToString(separator = "") { "${it.id}/" }
+            val pathString = state.disk.paths.joinToString(separator = "") { "${it.id}/" }
             _uiState.update { it.copy(disk = it.disk.copy(isUploading = true, uploadProgress = 0f)) }
-            val totalFiles = candidates.size.coerceAtLeast(1)
-            candidates.forEachIndexed { index, candidate ->
-                val fileName = candidate.displayName
-                runCatching {
-                    val uri = Uri.parse(candidate.uriString)
-                    val tempFile = transferRepository.copyUriToTemporaryFile(uri, candidate.displayName)
-                    try {
-                        val sts = backendService.requestOssSts(
-                            accessToken = session.accessToken,
-                            pathString = pathString,
-                            filename = fileName,
-                            parentId = path.id,
-                            language = uiState.value.settings.language,
-                            usage = "SINGLE_FILE_UPLOAD",
-                        )
-                        if (sts.overwriteSameName) {
-                            sendWarningMessage(strings.fileDisk.overwriteSameName)
-                        }
-                        transferRepository.uploadToOss(sts, tempFile) { current, total ->
-                            val fileProgress = if (total <= 0) 0f else current.toFloat() / total.toFloat()
-                            val overall = (index + fileProgress) / totalFiles.toFloat()
-                            _uiState.update { state ->
-                                state.copy(disk = state.disk.copy(uploadProgress = overall))
-                            }
-                        }
-                        backendService.insertFileInfo(
-                            accessToken = session.accessToken,
-                            pathString = pathString,
-                            filename = fileName,
-                            parentId = path.id,
-                            language = uiState.value.settings.language,
-                        )
-                    } finally {
-                        tempFile.delete()
-                    }
-                }.onSuccess {
-                    val releaseFailure = removeUploadCandidateInternal(candidate)
-                    if (releaseFailure == null) {
-                        sendSuccessMessage(
-                            strings.format(
-                                strings.fileDisk.uploadSuccessTemplate,
-                                _uiState.value.settings.language.asLocale(),
-                                fileName,
-                            )
-                        )
-                    } else {
-                        sendErrorMessage(
-                            uploadSucceededButReleaseFailedMessage(
-                                fileName = fileName,
-                                throwable = releaseFailure,
-                            )
-                        )
-                    }
-                }.onFailure { throwable ->
-                    sendErrorMessage(
-                        strings.format(
-                            strings.fileDisk.uploadFailedTemplate,
-                            _uiState.value.settings.language.asLocale(),
-                            fileName,
-                        )
+            // WorkManager owns the transfer from here on, so it survives backgrounding and process death.
+            val batch = UploadWork.enqueue(
+                context = getApplication(),
+                accessToken = session.accessToken,
+                language = state.settings.language,
+                parentId = path.id,
+                pathString = pathString,
+                candidates = candidates,
+            )
+            uploadBatchId = batch?.batchId
+            uploadBatchWorkIds = batch?.workIds.orEmpty()
+            uploadBatchTotalBytes = candidates.sumOf { it.sizeBytes.coerceAtLeast(1L) }
+        }
+    }
+
+    private fun observeUploadWork() {
+        viewModelScope.launch {
+            UploadWork.workInfos(getApplication()).collect(::applyUploadWorkInfos)
+        }
+    }
+
+    /**
+     * Mirrors the WorkManager upload queue into the disk UI: overall progress, per-file results and the
+     * overwrite warning.
+     *
+     * Work items of the batch this ViewModel enqueued are reported exactly once, even when the first
+     * observed state is already final (a tiny or empty file can finish before it is ever seen running).
+     * Work restored from an earlier session is only reported when a live state change is observed, so
+     * old success and error messages are never replayed.
+     */
+    private fun applyUploadWorkInfos(infos: List<WorkInfo>) {
+        infos.forEach { info ->
+            val previousState = uploadWorkStates.put(info.id, info.state)
+            val belongsToCurrentBatch = info.id in uploadBatchWorkIds
+            val changedWhileObserved = previousState != null && previousState != info.state
+            if (info.state.isFinished && (belongsToCurrentBatch || changedWhileObserved)) {
+                handleUploadWorkFinishedOnce(info)
+            }
+        }
+        releaseUnusedUploadPermissions(infos)
+
+        val unfinished = infos.filterNot { it.state.isFinished }
+        val runningWork = unfinished.firstOrNull { it.state == WorkInfo.State.RUNNING }
+        trackUploadBatch(infos, runningWork)
+        if (runningWork != null &&
+            runningWork.progress.getBoolean(UploadWorker.KEY_PROGRESS_OVERWRITE_SAME_NAME, false) &&
+            overwriteWarnedUploads.add(runningWork.id)
+        ) {
+            sendWarningMessage(strings().fileDisk.overwriteSameName)
+        }
+
+        val uploadProgress = batchUploadProgress(infos, runningWork)
+        val wasUploading = _uiState.value.disk.isUploading
+        val isUploading = unfinished.isNotEmpty()
+        if (wasUploading != isUploading || uploadProgress != null) {
+            _uiState.update { state ->
+                state.copy(
+                    disk = state.disk.copy(
+                        isUploading = isUploading,
+                        uploadProgress = uploadProgress
+                            ?: if (isUploading) state.disk.uploadProgress else 0f,
                     )
-                    sendThrowableMessage(throwable)
-                }
+                )
             }
-            _uiState.update {
-                it.copy(disk = it.disk.copy(isUploading = false, uploadProgress = 0f))
-            }
+        }
+
+        if (wasUploading && !isUploading) {
             refreshCurrentDirectory()
         }
+        if (!isUploading) {
+            uploadWorkStates.clear()
+            overwriteWarnedUploads.clear()
+            handledUploadWorkIds.clear()
+            uploadBatchId = null
+            uploadBatchTotalBytes = 0L
+            uploadBatchWorkIds = emptySet()
+        }
+    }
+
+    private fun handleUploadWorkFinishedOnce(info: WorkInfo) {
+        if (!handledUploadWorkIds.add(info.id)) return
+        handleUploadWorkFinished(info)
+    }
+
+    /**
+     * Releases persisted read permissions that no upload needs any more, for example the document of a
+     * file that finished while the previous process was gone and is therefore never replayed in the UI.
+     * Documents of pending work items and of the current upload candidates are kept, so a failed file
+     * stays manually retryable. This cleanup is silent and idempotent.
+     */
+    private fun releaseUnusedUploadPermissions(infos: List<WorkInfo>) {
+        val neededUris = buildSet {
+            _uiState.value.disk.uploadCandidates.forEach { candidate -> add(candidate.uriString) }
+            infos.filterNot { it.state.isFinished }
+                .forEach { info -> UploadWork.sourceUri(info)?.let(::add) }
+        }
+        infos.asSequence()
+            .filter { it.state.isFinished }
+            .mapNotNull(::finishedWorkUri)
+            .distinct()
+            .filterNot { uriString -> uriString in neededUris }
+            .forEach { uriString -> releaseUploadCandidatePermission(uriString) }
+    }
+
+    /** The document of a finished work item: its result data, or its uri tag for older work items. */
+    private fun finishedWorkUri(info: WorkInfo): String? =
+        info.outputData.getString(UploadWorker.KEY_RESULT_URI)?.takeIf(String::isNotEmpty)
+            ?: UploadWork.sourceUri(info)
+
+    /**
+     * Remembers which batch the UI is showing and how many bytes it holds. The running work publishes
+     * both values, which also restores them when the queue survived a process restart.
+     */
+    private fun trackUploadBatch(infos: List<WorkInfo>, runningWork: WorkInfo?) {
+        runningWork?.progress?.getString(UploadWorker.KEY_PROGRESS_BATCH_ID)
+            ?.takeIf(String::isNotEmpty)
+            ?.let { batchId ->
+                uploadBatchId = batchId
+                uploadBatchTotalBytes = runningWork.progress
+                    .getLong(UploadWorker.KEY_PROGRESS_BATCH_TOTAL_BYTES, uploadBatchTotalBytes)
+            }
+        val batchId = uploadBatchId ?: return
+        if (uploadBatchTotalBytes > 0L) return
+
+        infos.firstOrNull { info ->
+            info.outputData.getString(UploadWorker.KEY_RESULT_BATCH_ID) == batchId
+        }?.let { info ->
+            uploadBatchTotalBytes = info.outputData.getLong(UploadWorker.KEY_RESULT_BATCH_TOTAL_BYTES, 0L)
+        }
+    }
+
+    /**
+     * Byte weighted progress across the batch, as in the web client: a file only counts as completed
+     * once its OSS upload and the backend bookkeeping both succeeded, and the last percent is kept back
+     * so a failing file is never displayed as a finished one.
+     */
+    private fun batchUploadProgress(infos: List<WorkInfo>, runningWork: WorkInfo?): Float? {
+        val batchId = uploadBatchId ?: return null
+        if (uploadBatchTotalBytes <= 0L) return null
+
+        val completedBytes = infos
+            .filter { info ->
+                info.state == WorkInfo.State.SUCCEEDED &&
+                    info.outputData.getString(UploadWorker.KEY_RESULT_BATCH_ID) == batchId &&
+                    info.outputData.getString(UploadWorker.KEY_RESULT_OUTCOME) == UploadWorker.OUTCOME_SUCCESS
+            }
+            .sumOf { info -> info.outputData.getLong(UploadWorker.KEY_RESULT_FILE_BYTES, 0L) }
+
+        val currentFileBytes = runningWork?.let { info ->
+            val fileBytes = info.progress.getLong(UploadWorker.KEY_PROGRESS_FILE_BYTES, 0L)
+            val fileProgress = info.progress.getFloat(UploadWorker.KEY_PROGRESS_FILE_PROGRESS, 0f)
+            (fileBytes * fileProgress).toLong()
+        } ?: 0L
+
+        val ratio = (completedBytes + currentFileBytes).toFloat() / uploadBatchTotalBytes.toFloat()
+        return ratio.coerceIn(0f, MAX_UPLOAD_PROGRESS_BEFORE_COMPLETION)
+    }
+
+    private fun handleUploadWorkFinished(info: WorkInfo) {
+        val strings = strings()
+        val language = _uiState.value.settings.language
+        val displayName = info.outputData.getString(UploadWorker.KEY_RESULT_DISPLAY_NAME).orEmpty()
+        val uriString = info.outputData.getString(UploadWorker.KEY_RESULT_URI).orEmpty()
+        val candidate = _uiState.value.disk.uploadCandidates
+            .firstOrNull { uriString.isNotEmpty() && it.uriString == uriString }
+        val succeeded = info.state == WorkInfo.State.SUCCEEDED &&
+            info.outputData.getString(UploadWorker.KEY_RESULT_OUTCOME) == UploadWorker.OUTCOME_SUCCESS
+        if (succeeded) {
+            // Removing the candidate also releases the persisted read permission of the document.
+            val releaseFailure = if (candidate != null) {
+                removeUploadCandidateInternal(candidate)
+            } else {
+                uriString.takeIf(String::isNotEmpty)?.let(::releaseUploadCandidatePermission)
+            }
+            if (releaseFailure == null) {
+                sendSuccessMessage(
+                    strings.format(
+                        strings.fileDisk.uploadSuccessTemplate,
+                        language.asLocale(),
+                        displayName,
+                    )
+                )
+            } else {
+                sendErrorMessage(
+                    uploadSucceededButReleaseFailedMessage(
+                        fileName = displayName,
+                        throwable = releaseFailure,
+                    )
+                )
+            }
+            return
+        }
+
+        if (info.state != WorkInfo.State.SUCCEEDED && info.state != WorkInfo.State.FAILED) return
+
+        // A failed file stays in the pending list, so its read permission is still needed for a retry.
+        if (candidate == null && uriString.isNotEmpty() && info.state == WorkInfo.State.FAILED) {
+            releaseUploadCandidatePermission(uriString)
+        }
+        if (displayName.isNotEmpty()) {
+            sendErrorMessage(
+                strings.format(
+                    strings.fileDisk.uploadFailedTemplate,
+                    language.asLocale(),
+                    displayName,
+                )
+            )
+        }
+        sendErrorMessage(uploadWorkFailureMessage(info.outputData))
+    }
+
+    private fun uploadWorkFailureMessage(data: Data): String {
+        val strings = strings()
+        return when (data.getString(UploadWorker.KEY_RESULT_ERROR_KIND)) {
+            UploadWorker.ERROR_KIND_BUSINESS ->
+                data.getString(UploadWorker.KEY_RESULT_ERROR_DETAIL).orEmpty().ifBlank { strings.common.networkError }
+
+            UploadWorker.ERROR_KIND_HTTP ->
+                strings.httpErrorMessage(data.getInt(UploadWorker.KEY_RESULT_ERROR_STATUS, 0))
+
+            UploadWorker.ERROR_KIND_MISSING_BASE_URL -> strings.common.baseUrlMissing
+            UploadWorker.ERROR_KIND_FOREGROUND -> uploadBackgroundUnavailableMessage()
+            else -> strings.common.networkError
+        }
+    }
+
+    private fun uploadBackgroundUnavailableMessage(): String = when (_uiState.value.settings.language) {
+        AppLanguage.ZH_CN -> "无法在后台保持上传，请保持应用在前台后重试"
+        AppLanguage.EN_US -> "The upload could not keep running in the background. Keep the app open and retry."
     }
 
     fun downloadFile(file: FileEntry) {
@@ -646,7 +826,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 emitMessage(strings().fileDisk.downloadStarted, MessageTone.INFO)
                 transferRepository.downloadToDownloads(descriptor.url, file.name)
                 emitMessage(strings().fileDisk.downloadCompleted, MessageTone.SUCCESS)
-            }.onSuccess {
             }.onFailure { throwable ->
                 sendThrowableMessage(throwable)
             }
@@ -670,7 +849,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 emitMessage(strings().fileDisk.downloadStarted, MessageTone.INFO)
                 transferRepository.downloadToDownloads(descriptor.url, targetFile.name)
                 emitMessage(strings().fileDisk.downloadCompleted, MessageTone.SUCCESS)
-            }.onSuccess {
             }.onFailure { throwable ->
                 sendThrowableMessage(throwable)
             }
@@ -1240,7 +1418,16 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun resetSessionAndContent() {
         val cacheFilesToDelete = _uiState.value.reading.activeCacheFiles
-        val releaseFailures = releaseUploadCandidatePermissions(_uiState.value.disk.uploadCandidates)
+        // Queued uploads belong to the session that just ended, and so do their persisted read
+        // permissions: every persisted permission in this app comes from a picked upload candidate.
+        UploadWork.cancelAll(getApplication())
+        uploadWorkStates.clear()
+        overwriteWarnedUploads.clear()
+        handledUploadWorkIds.clear()
+        uploadBatchId = null
+        uploadBatchTotalBytes = 0L
+        uploadBatchWorkIds = emptySet()
+        val releaseFailures = UploadUriPermissionManager.releaseAllPersistedReadPermissions(getApplication())
         cleanupPreviewCacheFiles(cacheFilesToDelete)
         previewRepository.clearAllPreviewCache()
         invalidateDiskRequests()
@@ -1284,7 +1471,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         )
     }
 
-    private fun cleanupStaleUploadUriPermissions() {
+    private suspend fun cleanupStaleUploadUriPermissions() {
+        // Uploads restored by WorkManager still need the persisted read permission of their document.
+        if (UploadWork.hasPendingUploads(getApplication())) return
+
         val failures = UploadUriPermissionManager.releaseAllPersistedReadPermissions(getApplication())
         if (failures.isNotEmpty()) {
             sendErrorMessage(
@@ -1405,5 +1595,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun registrationSuccessMessage(): String = when (_uiState.value.settings.language) {
         AppLanguage.ZH_CN -> "注册成功，请切换到登录"
         AppLanguage.EN_US -> "Registration succeeded. Switch back to Login."
+    }
+
+    private companion object {
+        /**
+         * Keeps visible progress below completion while a batch is running: the web client reserves its
+         * last percent for the backend insert, so a failing file is never shown as finished.
+         */
+        const val MAX_UPLOAD_PROGRESS_BEFORE_COMPLETION = 0.99f
     }
 }

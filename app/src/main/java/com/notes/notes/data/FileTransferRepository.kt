@@ -7,15 +7,21 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
+import com.alibaba.sdk.android.oss.ClientConfiguration
 import com.alibaba.sdk.android.oss.OSS
 import com.alibaba.sdk.android.oss.OSSClient
 import com.alibaba.sdk.android.oss.callback.OSSProgressCallback
 import com.alibaba.sdk.android.oss.common.auth.OSSStsTokenCredentialProvider
+import com.alibaba.sdk.android.oss.model.AbortMultipartUploadRequest
+import com.alibaba.sdk.android.oss.model.MultipartUploadRequest
 import com.alibaba.sdk.android.oss.model.PutObjectRequest
 import com.notes.notes.core.DownloadedFileEntry
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import java.io.File
+
+/** Raised when the picked document cannot be uploaded as-is, for example when its size is unknown. */
+class UploadSourceException(message: String) : Exception(message)
 
 class FileTransferRepository(
     private val context: Context,
@@ -24,40 +30,50 @@ class FileTransferRepository(
 
     private val downloadRelativePath = "${Environment.DIRECTORY_DOWNLOADS}/Notes"
 
-    suspend fun copyUriToTemporaryFile(uri: Uri, displayName: String): File = withContext(Dispatchers.IO) {
-        val fileName = displayName.ifBlank { "upload-${System.currentTimeMillis()}" }
-        val tempDir = File(context.cacheDir, "upload-cache").apply { mkdirs() }
-        val tempFile = File(tempDir, "${System.currentTimeMillis()}-$fileName")
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            tempFile.outputStream().use { output ->
-                input.copyTo(output)
-            }
-        } ?: error("Unable to read file uri: $uri")
-        tempFile
-    }
-
+    /**
+     * Uploads [sourceUri] to the STS-scoped object key with the OSS multipart API.
+     *
+     * The OSS SDK reads the picked document through the ContentResolver, so the file never has to be
+     * copied into the app cache first. Non-empty files are split into [PART_SIZE_BYTES] parts that are
+     * uploaded [PARALLEL_PART_COUNT] at a time and retried by the SDK itself.
+     */
     suspend fun uploadToOss(
         sts: OssStsToken,
-        sourceFile: File,
+        sourceUri: Uri,
         onProgress: (currentBytes: Long, totalBytes: Long) -> Unit,
-    ) = withContext(Dispatchers.IO) {
-        val credentialProvider = OSSStsTokenCredentialProvider(
-            sts.accessKeyId,
-            sts.accessKeySecret,
-            sts.securityToken,
-        )
-        val endpoint = if (sts.region.startsWith("http")) {
-            sts.region
-        } else {
-            "https://${sts.region}.aliyuncs.com"
+    ): Unit = withContext(Dispatchers.IO) {
+        val oss = createOssClient(sts)
+        if (resolveUploadSize(sourceUri) == 0L) {
+            // Multipart upload rejects empty sources; a single PUT is enough for them.
+            oss.putObject(PutObjectRequest(sts.bucket, sts.objectKey, sourceUri))
+            onProgress(0L, 0L)
+            return@withContext
         }
-        val oss: OSS = OSSClient(context, endpoint, credentialProvider)
-        val request = PutObjectRequest(sts.bucket, sts.objectKey, sourceFile.absolutePath).apply {
-            progressCallback = OSSProgressCallback<PutObjectRequest> { _, currentSize, totalSize ->
-                onProgress(currentSize, totalSize)
+
+        val request = MultipartUploadRequest<MultipartUploadRequest<*>>(
+            sts.bucket,
+            sts.objectKey,
+            sourceUri,
+        ).apply {
+            partSize = PART_SIZE_BYTES
+            threadNum = PARALLEL_PART_COUNT
+            progressCallback = OSSProgressCallback { _, currentBytes, totalBytes ->
+                onProgress(currentBytes, totalBytes)
             }
         }
-        oss.putObject(request)
+
+        val task = oss.asyncMultipartUpload(request, null)
+        try {
+            // Poll instead of waiting forever so that cancellation (worker stop, logout) stays responsive.
+            while (!task.isCompleted) {
+                delay(UPLOAD_POLL_INTERVAL_MILLIS)
+            }
+            task.getResult()
+        } catch (throwable: Throwable) {
+            task.cancel()
+            abortMultipartUploadQuietly(oss, sts, request.uploadId)
+            throw throwable
+        }
     }
 
     suspend fun downloadToDownloads(url: String, fileName: String) = withContext(Dispatchers.IO) {
@@ -143,5 +159,67 @@ class FileTransferRepository(
         if (deleted <= 0) {
             error("Unable to delete downloaded file: ${file.name}")
         }
+    }
+
+    private fun createOssClient(sts: OssStsToken): OSS {
+        val credentialProvider = OSSStsTokenCredentialProvider(
+            sts.accessKeyId,
+            sts.accessKeySecret,
+            sts.securityToken,
+        )
+        val endpoint = if (sts.region.startsWith("http")) {
+            sts.region
+        } else {
+            "https://${sts.region}.aliyuncs.com"
+        }
+        val configuration = ClientConfiguration().apply {
+            connectionTimeout = REQUEST_TIMEOUT_MILLIS
+            socketTimeout = REQUEST_TIMEOUT_MILLIS
+            // The SDK retries transient failures (network errors and 5xx) per request.
+            maxErrorRetry = MAX_ERROR_RETRY
+            maxConcurrentRequest = PARALLEL_PART_COUNT
+            maxConcurrentRequestsPerHost = PARALLEL_PART_COUNT
+        }
+        return OSSClient(context, endpoint, credentialProvider, configuration)
+    }
+
+    /**
+     * Returns the size the OSS SDK will use for [sourceUri], or 0 for an empty document.
+     *
+     * The SDK derives the content length from the same file descriptor, so an unreadable size cannot
+     * be uploaded reliably and is rejected instead of being sent as an empty object.
+     */
+    private fun resolveUploadSize(sourceUri: Uri): Long {
+        val statSize = context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { it.statSize } ?: -1L
+        if (statSize > 0L) return statSize
+
+        val hasContent = context.contentResolver.openInputStream(sourceUri)?.use { it.read() >= 0 } ?: false
+        if (hasContent) {
+            throw UploadSourceException("Unable to read the size of $sourceUri")
+        }
+        return 0L
+    }
+
+    private fun abortMultipartUploadQuietly(oss: OSS, sts: OssStsToken, uploadId: String?) {
+        if (uploadId.isNullOrBlank()) return
+        runCatching {
+            oss.abortMultipartUpload(AbortMultipartUploadRequest(sts.bucket, sts.objectKey, uploadId))
+        }
+    }
+
+    private companion object {
+        /** 5 MiB parts, the same part size the web client uses. */
+        const val PART_SIZE_BYTES = 5L * 1024L * 1024L
+
+        /** Parallel part uploads, matching the web client's `parallel: 3`. */
+        const val PARALLEL_PART_COUNT = 3
+
+        /** Longest single OSS request, matching the web client's 180 s timeout. */
+        const val REQUEST_TIMEOUT_MILLIS = 180_000
+
+        /** Request-level retries performed by the OSS SDK, matching the web client's retry budget. */
+        const val MAX_ERROR_RETRY = 2
+
+        const val UPLOAD_POLL_INTERVAL_MILLIS = 250L
     }
 }

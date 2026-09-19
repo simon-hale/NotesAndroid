@@ -2,6 +2,7 @@ package com.notes.notes
 
 import android.app.Application
 import com.notes.notes.data.PreviewCacheCleaner
+import com.notes.notes.data.UploadCacheCleaner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,6 +18,7 @@ class NotesApplication : Application() {
                 context = this@NotesApplication,
                 maxAgeMillis = PREVIEW_CACHE_MAX_AGE_MILLIS,
             )
+            UploadCacheCleaner.clearStale(this@NotesApplication)
         }
     }
 

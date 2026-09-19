@@ -31,8 +31,8 @@ android {
         applicationId = "com.notes.notes"
         minSdk = 35
         targetSdk = 36
-        versionCode = 11
-        versionName = "1.0.10"
+        versionCode = 12
+        versionName = "1.1.0"
 
         buildConfigField("String", "NOTES_BASE_URL", "\"${notesBaseUrl.escapeBuildConfigString()}\"")
 
@@ -93,6 +93,7 @@ dependencies {
     implementation(libs.commonmark.ext.gfm.strikethrough)
     implementation(libs.poi.ooxml)
     implementation(libs.oss.android.sdk)
+    implementation(libs.androidx.work.runtime.ktx)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
