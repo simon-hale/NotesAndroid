@@ -988,6 +988,24 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             resetSessionAndContent()
         }
     }
+    fun logoutAll() {
+        viewModelScope.launch {
+            val session = activeSession() ?: return@launch
+
+            setAccountBusy(true)
+
+            runCatching {
+                backendService.logoutAll(session.accessToken)
+            }.onSuccess {
+                preferencesStore.clearCredentials()
+                resetSessionAndContent()
+            }.onFailure { throwable ->
+                sendThrowableMessage(throwable)
+            }
+
+            setAccountBusy(false)
+        }
+    }
 
     fun changePassword(curPassword: String, newPassword: String, confirmedPassword: String) {
         viewModelScope.launch {

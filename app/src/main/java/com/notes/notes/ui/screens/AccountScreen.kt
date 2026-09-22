@@ -77,6 +77,7 @@ fun AccountScreen(
 ) {
     val strings = stringsFor(uiState.settings.language)
     var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
+    var showLogoutAllConfirm by rememberSaveable { mutableStateOf(false) }
     var deleteCurPassword by rememberSaveable { mutableStateOf("") }
     val scrollState = rememberScrollState()
     val showingAccountDetails =
@@ -128,7 +129,18 @@ fun AccountScreen(
                             viewModel::openSettingsAccountPage
                         },
                         showLogoutButton = showingAccountDetails,
-                        onLogout = if (showingAccountDetails) viewModel::logout else null,
+                        onLogout = if (showingAccountDetails) {
+                            viewModel::logout
+                        } else {
+                            null
+                        },
+                        onLogoutAll = if (showingAccountDetails) {
+                            {
+                                showLogoutAllConfirm = true
+                            }
+                        } else {
+                            null
+                        },
                     )
                 } else {
                     AuthEntryCard(uiState = uiState, viewModel = viewModel)
@@ -254,6 +266,43 @@ fun AccountScreen(
             text = { Text(strings.deleteAccount.modalBody) },
         )
     }
+    if (showLogoutAllConfirm) {
+        NotesAlertDialog(
+            onDismissRequest = {
+                if (!uiState.accountBusy) {
+                    showLogoutAllConfirm = false
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showLogoutAllConfirm = false
+                        viewModel.logoutAll()
+                    },
+                    enabled = !uiState.accountBusy,
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
+                ) {
+                    Text(strings.account.logoutAllConfirmButton)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showLogoutAllConfirm = false
+                    },
+                    enabled = !uiState.accountBusy,
+                ) {
+                    Text(strings.common.cancel)
+                }
+            },
+            title = {
+                Text(strings.account.logoutAllConfirmTitle)
+            },
+            text = {
+                Text(strings.account.logoutAllConfirmBody)
+            },
+        )
+    }
 }
 
 @Composable
@@ -262,8 +311,10 @@ private fun AccountSummaryCard(
     onClick: (() -> Unit)? = null,
     showLogoutButton: Boolean = false,
     onLogout: (() -> Unit)? = null,
+    onLogoutAll: (() -> Unit)? = null,
 ) {
     val strings = stringsFor(uiState.settings.language)
+
     GlassPanel(onClick = onClick) {
         Column(
             modifier = Modifier
@@ -276,7 +327,11 @@ private fun AccountSummaryCard(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                UserInitialAvatar(text = uiState.session.username, size = 56.dp)
+                UserInitialAvatar(
+                    text = uiState.session.username,
+                    size = 56.dp,
+                )
+
                 Column(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -286,17 +341,41 @@ private fun AccountSummaryCard(
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onSurface,
                     )
+
                     Text(
                         text = strings.account.currentAccount,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+
                 if (showLogoutButton && onLogout != null) {
                     SecondaryActionButton(
                         label = strings.account.logoutButton,
                         onClick = onLogout,
                     )
+                }
+            }
+
+            if (showLogoutButton && onLogoutAll != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = strings.account.logoutAllPrompt,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    TextButton(
+                        onClick = onLogoutAll,
+                        enabled = !uiState.accountBusy,
+                    ) {
+                        Text(strings.account.logoutAllAction)
+                    }
                 }
             }
         }

@@ -86,6 +86,16 @@ data class AccountStrings(
     val logoutButton: String,
     val logoutPanelDescription: String,
     val currentAccount: String,
+
+    val logoutAllPrompt: String,
+
+    val logoutAllAction: String,
+
+    val logoutAllConfirmTitle: String,
+
+    val logoutAllConfirmBody: String,
+
+    val logoutAllConfirmButton: String,
     val languagePanelTitle: String,
     val languagePanelDescription: String,
     val currentLanguage: String,
@@ -320,6 +330,11 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             logoutButton = "退出登录",
             logoutPanelDescription = "结束当前设备上的登录状态，并返回到登录入口",
             currentAccount = "当前账户",
+            logoutAllPrompt = "还在其他设备上登录？",
+            logoutAllAction = "退出所有设备",
+            logoutAllConfirmTitle = "退出所有设备？",
+            logoutAllConfirmBody = "这会立即结束此账户在所有设备上的现有登录状态，所有设备都需要重新登录。",
+            logoutAllConfirmButton = "确认全部退出",
             languagePanelTitle = "语言设置",
             languagePanelDescription = "选择应用显示语言，设置会保存在当前设备上",
             currentLanguage = "当前语言",
@@ -503,6 +518,11 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             logoutButton = "Log out",
             logoutPanelDescription = "End the session on this device and return to the account entry page.",
             currentAccount = "Current account",
+            logoutAllPrompt = "Signed in on another device?",
+            logoutAllAction = "Log out on all devices",
+            logoutAllConfirmTitle = "Log out on all devices?",
+            logoutAllConfirmBody = "This will immediately end the current sign-in on every device. Every device will need to sign in again.",
+            logoutAllConfirmButton = "Log out everywhere",
             languagePanelTitle = "Language settings",
             languagePanelDescription = "Choose the display language for this app. The setting will be saved on this device.",
             currentLanguage = "Current language",

@@ -81,6 +81,15 @@ class NotesBackendService {
         ensureBusinessSuccess(json)
     }
 
+    suspend fun logoutAll(accessToken: String) {
+        val json = requestJson(
+            path = "/api/user/logout-all/",
+            method = "POST",
+            bearerToken = accessToken,
+        )
+        ensureBusinessSuccess(json)
+    }
+
     suspend fun register(
         username: String,
         password: String,
