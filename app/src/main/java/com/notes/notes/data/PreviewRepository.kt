@@ -518,9 +518,6 @@ class PreviewRepository(
     private fun previewColors(isDarkTheme: Boolean, palette: ThemePalette): PreviewColors {
         val accent = when (palette) {
             ThemePalette.BLUE -> "#4F9CFF"
-            ThemePalette.EMERALD -> "#27B47E"
-            ThemePalette.AMBER -> "#D8921E"
-            ThemePalette.ROSE -> "#D65B8D"
             ThemePalette.SAGE -> "#6E8A63"
             ThemePalette.ALMOND -> "#B28B49"
         }

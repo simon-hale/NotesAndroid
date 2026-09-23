@@ -53,9 +53,6 @@ data class ThemeStrings(
     val palette: String,
     val eyeCarePalette: String,
     val blue: String,
-    val emerald: String,
-    val amber: String,
-    val rose: String,
     val sage: String,
     val almond: String,
 )
@@ -230,9 +227,6 @@ data class AppStrings(
 
 fun ThemePalette.label(strings: AppStrings): String = when (this) {
     ThemePalette.BLUE -> strings.theme.blue
-    ThemePalette.EMERALD -> strings.theme.emerald
-    ThemePalette.AMBER -> strings.theme.amber
-    ThemePalette.ROSE -> strings.theme.rose
     ThemePalette.SAGE -> strings.theme.sage
     ThemePalette.ALMOND -> strings.theme.almond
 }
@@ -299,9 +293,6 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             palette = "主题配色",
             eyeCarePalette = "护眼主题",
             blue = "默认蓝",
-            emerald = "翡翠绿",
-            amber = "琥珀色",
-            rose = "玫瑰色",
             sage = "鼠尾草",
             almond = "杏仁色",
         ),
@@ -487,9 +478,6 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             palette = "Palette",
             eyeCarePalette = "Eye-care themes",
             blue = "Default blue",
-            emerald = "Emerald",
-            amber = "Amber",
-            rose = "Rose",
             sage = "Sage",
             almond = "Almond",
         ),

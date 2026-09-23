@@ -25,9 +25,6 @@ enum class ThemeMode(val storageValue: String) {
 
 enum class ThemePalette(val storageValue: String) {
     BLUE("blue"),
-    EMERALD("emerald"),
-    AMBER("amber"),
-    ROSE("rose"),
     SAGE("sage"),
     ALMOND("almond");
 
