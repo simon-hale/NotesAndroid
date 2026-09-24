@@ -474,20 +474,28 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     newName = trimmed,
                     language = uiState.value.settings.language,
                 )
-            }.onSuccess {
+            }.onSuccess { warningMessage ->
                 refreshCurrentDirectory()
                 _uiState.update { state ->
                     val reading = state.reading
                     state.copy(
                         reading = reading.copy(
-                            selectedFile = reading.selectedFile?.takeIf { it.id == file.id }?.copy(name = trimmed)
+                            selectedFile = reading.selectedFile
+                                ?.takeIf { it.id == file.id }
+                                ?.copy(name = trimmed)
                                 ?: reading.selectedFile,
-                            displayedFile = reading.displayedFile?.takeIf { it.id == file.id }?.copy(name = trimmed)
+                            displayedFile = reading.displayedFile
+                                ?.takeIf { it.id == file.id }
+                                ?.copy(name = trimmed)
                                 ?: reading.displayedFile,
                         )
                     )
                 }
-                sendSuccessMessage(strings.fileDisk.renamed)
+                if (warningMessage.isNullOrBlank()) {
+                    sendSuccessMessage(strings.fileDisk.renamed)
+                } else {
+                    sendWarningMessage(warningMessage)
+                }
             }.onFailure { throwable ->
                 sendThrowableMessage(throwable)
             }

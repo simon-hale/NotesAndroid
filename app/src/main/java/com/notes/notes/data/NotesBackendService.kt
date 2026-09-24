@@ -215,7 +215,7 @@ class NotesBackendService {
         fileId: Long,
         newName: String,
         language: AppLanguage,
-    ) {
+    ): String? {
         val json = requestJson(
             path = "/api/file/modify/name/",
             method = "POST",
@@ -227,7 +227,17 @@ class NotesBackendService {
                 "language" to language.code,
             ),
         )
-        ensureBusinessSuccess(json)
+        return when (val message = json.optString("error_message")) {
+            "success" -> null
+            "success_oss_error" -> {
+                json.optString("warning_message").takeIf { it.isNotBlank() }
+            }
+            else -> {
+                throw NotesServiceException.Business(
+                    message.ifBlank { "Unknown error" }
+                )
+            }
+        }
     }
 
     suspend fun deleteDirectory(accessToken: String, directoryId: Long, language: AppLanguage) {
