@@ -11,14 +11,19 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.OutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
 
 data class DirectoryListing(
     val directories: List<DirectoryEntry>,
@@ -43,7 +48,31 @@ data class OssStsToken(
     val accessKeySecret: String,
     val securityToken: String,
     val objectKey: String,
-)
+    /** Expiration as Unix epoch seconds, or 0 when the backend did not report a parsable one. */
+    val expiration: Long,
+) {
+    val hasCredentials: Boolean
+        get() = accessKeyId.isNotBlank() && accessKeySecret.isNotBlank() && securityToken.isNotBlank()
+}
+
+/**
+ * A live download response.
+ *
+ * The presigned URL that produced it is never kept: [close] only releases the connection, and the
+ * caller must ask the backend for a new URL before every resume.
+ */
+class DownloadStreamResponse(
+    val statusCode: Int,
+    val etag: String,
+    val contentLength: Long,
+    val inputStream: InputStream,
+    private val connection: HttpURLConnection,
+) {
+    fun close() {
+        runCatching { inputStream.close() }
+        connection.disconnect()
+    }
+}
 
 sealed class NotesServiceException(message: String, cause: Throwable? = null) : Exception(message, cause) {
     data object MissingBaseUrl : NotesServiceException("BASE_URL is missing")
@@ -319,6 +348,7 @@ class NotesBackendService {
             accessKeySecret = json.optString("accessKeySecret"),
             securityToken = json.optString("securityToken"),
             objectKey = json.optString("objectKey"),
+            expiration = parseExpiration(json.optString("expiration")),
         )
     }
 
@@ -387,22 +417,61 @@ class NotesBackendService {
         }
     }
 
-    suspend fun downloadToOutput(url: String, outputStream: OutputStream) = withContext(Dispatchers.IO) {
+    /**
+     * Opens a ranged GET against the short-lived presigned [url].
+     *
+     * `Accept-Encoding: identity` is always sent so the byte offsets of a resumed download keep
+     * matching the object, and [offset]/[ifMatchETag] turn the request into a conditional resume.
+     * The caller owns the returned response and must [DownloadStreamResponse.close] it.
+     */
+    suspend fun openDownloadStream(
+        url: String,
+        offset: Long,
+        ifMatchETag: String?,
+    ): DownloadStreamResponse = withContext(Dispatchers.IO) {
         val connection = openRawConnection(url)
+        var handedOver = false
         try {
-            val statusCode = connection.responseCode
-            if (statusCode !in 200..299) {
-                val body = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                throw NotesServiceException.Http(statusCode, body)
+            connection.setRequestProperty("Accept-Encoding", "identity")
+            DownloadResumePolicy.rangeHeaderValue(offset)?.let { range ->
+                connection.setRequestProperty("Range", range)
             }
-            BufferedInputStream(connection.inputStream).use { input ->
-                BufferedOutputStream(outputStream).use { output ->
-                    input.copyTo(output)
-                    output.flush()
+            if (!ifMatchETag.isNullOrBlank()) {
+                connection.setRequestProperty("If-Match", ifMatchETag)
+            }
+            val statusCode = connection.responseCode
+            val etag = connection.getHeaderField("ETag").orEmpty().trim()
+            val contentLength = connection.getHeaderFieldLong("Content-Length", -1L)
+            when (statusCode) {
+                in 200..299 -> {
+                    handedOver = true
+                    DownloadStreamResponse(
+                        statusCode = statusCode,
+                        etag = etag,
+                        contentLength = contentLength,
+                        inputStream = BufferedInputStream(connection.inputStream),
+                        connection = connection,
+                    )
+                }
+
+                // 412: remote object changed. 416: the requested range is not satisfiable.
+                412, 416 -> DownloadStreamResponse(
+                    statusCode = statusCode,
+                    etag = etag,
+                    contentLength = contentLength,
+                    inputStream = ByteArrayInputStream(ByteArray(0)),
+                    connection = connection,
+                )
+
+                else -> {
+                    val body = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                    throw NotesServiceException.Http(statusCode, body)
                 }
             }
         } finally {
-            connection.disconnect()
+            if (!handedOver) {
+                connection.disconnect()
+            }
         }
     }
 
@@ -503,6 +572,20 @@ class NotesBackendService {
         if (baseUrl.isBlank()) {
             throw NotesServiceException.MissingBaseUrl
         }
+    }
+
+    /**
+     * Parses the ISO-8601 `expiration` of an STS ticket into Unix epoch seconds.
+     *
+     * A value that cannot be parsed yields 0, which callers treat as "expiration unknown".
+     */
+    private fun parseExpiration(raw: String?): Long {
+        val value = raw?.trim().orEmpty()
+        if (value.isEmpty()) return 0L
+        val instant = runCatching { Instant.parse(value) }.getOrNull()
+            ?: runCatching { OffsetDateTime.parse(value).toInstant() }.getOrNull()
+            ?: runCatching { LocalDateTime.parse(value).toInstant(ZoneOffset.UTC) }.getOrNull()
+        return instant?.epochSecond ?: 0L
     }
 
     private fun JSONObject.toDirectoryListing(): DirectoryListing = DirectoryListing(

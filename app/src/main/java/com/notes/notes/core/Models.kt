@@ -135,7 +135,17 @@ data class DiskScreenState(
     val uploadCandidates: List<UploadCandidate> = emptyList(),
     val isUploading: Boolean = false,
     val uploadProgress: Float = 0f,
-)
+    /** Live and paused uploads of the current account, shown in the upload sheet. */
+    val uploadTransfers: List<UploadTransferEntry> = emptyList(),
+    /** Live and paused downloads, shown above the completed downloads. */
+    val downloadTransfers: List<DownloadTransferEntry> = emptyList(),
+    /** True while a pause/resume/cancel request is being applied, so the UI can lock its actions. */
+    val transferActionBusy: Boolean = false,
+) {
+    val hasPausedUploads: Boolean get() = uploadTransfers.any { it.phase == UploadPhase.PAUSED }
+    val hasFinalizingUploads: Boolean get() = uploadTransfers.any { it.phase == UploadPhase.METADATA_PENDING }
+    val hasActiveUploads: Boolean get() = uploadTransfers.isNotEmpty()
+}
 
 @Immutable
 sealed interface PreviewContent {

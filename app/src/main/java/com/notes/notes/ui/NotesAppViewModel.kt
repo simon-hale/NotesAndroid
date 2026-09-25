@@ -2,6 +2,7 @@ package com.notes.notes.ui
 
 import android.app.Application
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.Data
@@ -11,6 +12,9 @@ import com.notes.notes.core.AppSettingsState
 import com.notes.notes.core.AppTab
 import com.notes.notes.core.DirectoryEntry
 import com.notes.notes.core.DiskScreenState
+import com.notes.notes.core.DownloadPhase
+import com.notes.notes.core.DownloadTransfer
+import com.notes.notes.core.DownloadTransferEntry
 import com.notes.notes.core.DownloadedFileEntry
 import com.notes.notes.core.FileEntry
 import com.notes.notes.core.MessageTone
@@ -26,20 +30,31 @@ import com.notes.notes.core.SortKey
 import com.notes.notes.core.ThemeMode
 import com.notes.notes.core.ThemePalette
 import com.notes.notes.core.ThemeSettings
+import com.notes.notes.core.TransferNotice
 import com.notes.notes.core.UiMessage
 import com.notes.notes.core.UploadCandidate
+import com.notes.notes.core.UploadPhase
+import com.notes.notes.core.UploadTransfer
+import com.notes.notes.core.UploadTransferEntry
 import com.notes.notes.core.stringsFor
 import com.notes.notes.data.AppPreferencesStore
 import com.notes.notes.data.DirectoryListing
+import com.notes.notes.data.DownloadWork
+import com.notes.notes.data.DownloadWorker
 import com.notes.notes.data.FileTransferRepository
 import com.notes.notes.data.NotesBackendService
 import com.notes.notes.data.NotesServiceException
 import com.notes.notes.data.PreviewRepository
+import com.notes.notes.data.TransferAccount
+import com.notes.notes.data.TransferStsCredentialProvider
+import com.notes.notes.data.TransferStore
 import com.notes.notes.data.UploadUriPermissionManager
 import com.notes.notes.data.UploadWork
 import com.notes.notes.data.UploadWorker
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
@@ -47,6 +62,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.Collator
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -59,6 +75,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private val backendService = NotesBackendService()
     private val previewRepository = PreviewRepository(application, backendService)
     private val transferRepository = FileTransferRepository(application)
+    private val transferStore = TransferStore(application)
 
     private val _uiState = MutableStateFlow(
         NotesUiState(
@@ -83,6 +100,23 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private var uploadBatchWorkIds: Set<UUID> = emptySet()
     private val handledUploadWorkIds = mutableSetOf<UUID>()
 
+    /** Persisted transfer records mirrored into memory; the UI and cleanup rules read these. */
+    private var uploadTransfers: List<UploadTransfer> = emptyList()
+    private var downloadTransfers: List<DownloadTransfer> = emptyList()
+
+    /** Latest WorkManager snapshots, used to tell "running" from "waiting for network" and "gone". */
+    private var uploadWorkInfos: List<WorkInfo> = emptyList()
+    private var downloadWorkInfos: List<WorkInfo> = emptyList()
+
+    /**
+     * Transfers this ViewModel just enqueued. Until their work item shows up, a missing work item must
+     * not be mistaken for "stopped", or a freshly started transfer would immediately look paused.
+     */
+    private val recentlyEnqueuedTransfers = mutableMapOf<String, Long>()
+
+    private val handledDownloadWorkIds = mutableSetOf<UUID>()
+    private val downloadWorkStates = mutableMapOf<UUID, WorkInfo.State>()
+
     init {
         viewModelScope.launch {
             val initial = preferencesStore.preferences.first()
@@ -94,6 +128,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             bootstrap(initial.savedUsername, initial.savedAccessToken)
         }
         observeUploadWork()
+        observeDownloadWork()
+        observeTransferRecords()
     }
 
     fun setCurrentTab(tab: AppTab) {
@@ -346,7 +382,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun removeUploadCandidate(candidate: UploadCandidate) {
-        if (_uiState.value.disk.isUploading) return
+        if (_uiState.value.disk.isUploading || _uiState.value.disk.transferActionBusy) return
         val releaseFailure = removeUploadCandidateInternal(candidate)
         if (releaseFailure != null) {
             sendErrorMessage(
@@ -361,12 +397,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun clearUploadCandidates() {
         val state = _uiState.value
 
-        if (state.disk.isUploading) return
+        if (state.disk.isUploading || state.disk.transferActionBusy) return
 
         val candidates = state.disk.uploadCandidates
         if (candidates.isEmpty()) return
-
-        val releaseFailures = releaseUploadCandidatePermissions(candidates)
 
         _uiState.update { currentState ->
             currentState.copy(
@@ -376,6 +410,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 )
             )
         }
+
+        // Clearing the selection is not a transfer cancel: documents that a transfer still needs keep
+        // their persisted read permission.
+        val releaseFailures = releaseUploadCandidatePermissions(candidates)
 
         if (releaseFailures.isNotEmpty()) {
             sendErrorMessage(
@@ -388,7 +426,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun removeUploadCandidateInternal(candidate: UploadCandidate): Throwable? {
-        val releaseFailure = releaseUploadCandidatePermission(candidate.uriString)
         _uiState.update { state ->
             state.copy(
                 disk = state.disk.copy(
@@ -396,7 +433,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 )
             )
         }
-        return releaseFailure
+        // Only now can the permission be released: a paused or queued transfer of the same document
+        // still needs it.
+        return releaseUploadCandidatePermission(candidate.uriString)
     }
 
     fun createDirectory(name: String) {
@@ -581,7 +620,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             val strings = strings()
             val state = _uiState.value
-            if (state.disk.isUploading) return@launch
+            if (state.disk.transferActionBusy) return@launch
+            if (state.disk.uploadTransfers.any { it.phase == UploadPhase.TRANSFERRING }) return@launch
             val session = activeSession() ?: return@launch
             val path = currentPath() ?: return@launch
             val candidates = state.disk.uploadCandidates
@@ -589,27 +629,416 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 sendWarningMessage(strings.fileDisk.noFileSelected)
                 return@launch
             }
+            // Resume anything left over instead of starting a second parallel batch.
+            if (state.disk.uploadTransfers.isNotEmpty()) {
+                resumeUploads()
+                return@launch
+            }
+
             val pathString = state.disk.paths.joinToString(separator = "") { "${it.id}/" }
+            val language = state.settings.language
+            val batchId = "batch-${System.currentTimeMillis()}"
+            val createdAt = System.currentTimeMillis()
+            val fileBytes = candidates.map { it.sizeBytes.coerceAtLeast(1L) }
+            val batchTotalBytes = fileBytes.sum()
+
+            // The transfer target is frozen here: every later credential refresh and metadata commit
+            // reuses these values, never the directory the user happens to be browsing later.
+            val transfers = withContext(Dispatchers.IO) {
+                candidates.mapIndexed { index, candidate ->
+                    val sourceUri = Uri.parse(candidate.uriString)
+                    val transferId = UUID.randomUUID().toString()
+                    UploadTransfer(
+                        transferId = transferId,
+                        accountKey = session.username,
+                        sourceUri = candidate.uriString,
+                        displayName = candidate.displayName,
+                        expectedSize = candidate.sizeBytes,
+                        lastModified = transferRepository.resolveSourceLastModified(sourceUri),
+                        parentId = path.id,
+                        pathString = pathString,
+                        language = language.code,
+                        batchId = batchId,
+                        batchTotalBytes = batchTotalBytes,
+                        fileBytes = fileBytes[index],
+                        checkpointDir = transferRepository.checkpointDirectoryPath(transferId),
+                        phase = UploadPhase.TRANSFERRING,
+                        bucket = "",
+                        region = "",
+                        objectKey = "",
+                        uploadId = "",
+                        notice = TransferNotice.NONE,
+                        createdAt = createdAt,
+                        transferredBytes = 0L,
+                    )
+                }
+            }
+
+            // Marked before the record is stored: until the work item shows up, a missing work item
+            // must not be mistaken for "stopped".
+            markRecentlyEnqueued(transfers.map { it.transferId })
+            // Persisted before the work is enqueued, so a crash cannot leave untracked uploads.
+            transferStore.addUploads(transfers)
+            // Mirrored immediately so permission cleanup never believes these documents are unused.
+            uploadTransfers = uploadTransfers + transfers
+            uploadBatchId = batchId
+            uploadBatchTotalBytes = batchTotalBytes
             _uiState.update { it.copy(disk = it.disk.copy(isUploading = true, uploadProgress = 0f)) }
             // WorkManager owns the transfer from here on, so it survives backgrounding and process death.
             val batch = UploadWork.enqueue(
                 context = getApplication(),
                 accessToken = session.accessToken,
-                language = state.settings.language,
-                parentId = path.id,
-                pathString = pathString,
-                candidates = candidates,
+                transfers = transfers,
             )
-            uploadBatchId = batch?.batchId
             uploadBatchWorkIds = batch?.workIds.orEmpty()
-            uploadBatchTotalBytes = candidates.sumOf { it.sizeBytes.coerceAtLeast(1L) }
         }
+    }
+
+    /** Pauses every transfer of the current upload batch. Pausing never aborts the multipart upload. */
+    fun pauseUploads() {
+        viewModelScope.launch {
+            val targets = uploadTransfers.filter { it.phase == UploadPhase.TRANSFERRING }
+            if (targets.isEmpty()) return@launch
+            setTransferActionBusy(true)
+            // The phase is persisted before the work is stopped, so the worker can never report the
+            // transfer as failed for a pause the user asked for.
+            targets.forEach { transfer ->
+                transferStore.updateUpload(transfer.transferId) { current ->
+                    if (current.phase == UploadPhase.TRANSFERRING) {
+                        current.copy(phase = UploadPhase.PAUSED)
+                    } else {
+                        current
+                    }
+                }
+            }
+            UploadWork.cancelTransfers(getApplication(), targets.map { it.transferId })
+                .let { operations -> awaitWorkCancellations(operations) }
+            setTransferActionBusy(false)
+            sendInfoMessage(strings().transfers.paused)
+        }
+    }
+
+    /** Resumes paused uploads and retries metadata-only transfers of the current account. */
+    fun resumeUploads() {
+        viewModelScope.launch {
+            val candidates = uploadTransfers.filter { it.phase != UploadPhase.TRANSFERRING }
+            if (candidates.isEmpty()) return@launch
+            val session = activeSession() ?: return@launch
+            setTransferActionBusy(true)
+
+            val owned = candidates.filter { ownsTransfer(session, it.accountKey) }
+            val foreign = candidates.filterNot { ownsTransfer(session, it.accountKey) }
+            if (foreign.isNotEmpty()) {
+                // Another account's transfers must never run under this session.
+                transferStore.removeUploads(foreign.map { it.transferId })
+                UploadWork.cancelTransfers(getApplication(), foreign.map { it.transferId })
+                releaseUnusedUploadPermissions()
+            }
+            if (owned.isEmpty()) {
+                setTransferActionBusy(false)
+                return@launch
+            }
+
+            owned.filter { it.phase == UploadPhase.PAUSED }.forEach { transfer ->
+                transferStore.updateUpload(transfer.transferId) { current ->
+                    if (current.phase == UploadPhase.PAUSED) {
+                        current.copy(phase = UploadPhase.TRANSFERRING)
+                    } else {
+                        current
+                    }
+                }
+            }
+            // Metadata-only transfers stay METADATA_PENDING: their object is already complete.
+            uploadBatchId = owned.first().batchId
+            uploadBatchTotalBytes = owned.first().batchTotalBytes
+            markRecentlyEnqueued(owned.map { it.transferId })
+            val batch = UploadWork.enqueue(                context = getApplication(),
+                accessToken = session.accessToken,
+                transfers = owned,
+            )
+            uploadBatchWorkIds = batch?.workIds.orEmpty()
+            setTransferActionBusy(false)
+        }
+    }
+
+    /**
+     * Destructive cancel of the current upload batch.
+     *
+     * Unlike pause this aborts the multipart upload, deletes the SDK checkpoint and drops the transfer
+     * record. A transfer whose object is already complete keeps its object: nothing is deleted from OSS.
+     */
+    fun cancelUploads() {
+        cancelUploadTransfers(uploadTransfers)
+    }
+
+    /** Destructive cancel of a single transfer, for example from its row in the upload sheet. */
+    fun cancelUpload(transferId: String) {
+        cancelUploadTransfers(uploadTransfers.filter { it.transferId == transferId })
+    }
+
+    private fun cancelUploadTransfers(targets: List<UploadTransfer>) {
+        if (targets.isEmpty()) return
+        viewModelScope.launch {
+            setTransferActionBusy(true)
+            // State is removed first so the finishing worker cannot commit metadata for a cancelled task.
+            val removed = transferStore.removeUploads(targets.map(UploadTransfer::transferId))
+            // Mirrored immediately so the permission cleanup below sees the up-to-date need list.
+            val removedIds = removed.mapTo(mutableSetOf(), UploadTransfer::transferId)
+            uploadTransfers = uploadTransfers.filterNot { it.transferId in removedIds }
+            // Waiting for the cancellation to be persisted guarantees the stopped worker no longer
+            // holds the checkpoint directory that is deleted below.
+            awaitWorkCancellations(
+                UploadWork.cancelTransfers(getApplication(), removed.map(UploadTransfer::transferId))
+            )
+            releaseUnusedUploadPermissions()
+            withContext(Dispatchers.IO) {
+                // Best effort only: an unreachable backend must never block the UI or a logout.
+                withTimeoutOrNull(CANCEL_ABORT_TIMEOUT_MILLIS) {
+                    removed.forEach { transfer -> abortAndCleanCheckpoint(transfer) }
+                }
+            }
+            setTransferActionBusy(false)
+            sendInfoMessage(strings().transfers.transferCanceled)
+        }
+    }
+
+    /** Blocks on a background dispatcher until WorkManager persisted the requested cancellations. */
+    private suspend fun awaitWorkCancellations(operations: List<androidx.work.Operation>) {
+        if (operations.isEmpty()) return
+        withContext(Dispatchers.IO) {
+            UploadWork.awaitCancellations(operations, WORK_CANCELLATION_TIMEOUT_MILLIS)
+        }
+    }
+
+    /**
+     * Aborts the multipart upload of [transfer] when it is still abortable, then removes its checkpoint.
+     * The bucket lifecycle policy cleans up parts that could not be aborted here.
+     */
+    private suspend fun abortAndCleanCheckpoint(transfer: UploadTransfer) {
+        if (transfer.phase != UploadPhase.METADATA_PENDING &&
+            transfer.uploadId.isNotBlank() &&
+            transfer.objectKey.isNotBlank()
+        ) {
+            try {
+                val accessToken = currentAccessToken()
+                if (accessToken != null) {
+                    val ticket = backendService.requestOssSts(
+                        accessToken = accessToken,
+                        pathString = transfer.pathString,
+                        filename = transfer.displayName,
+                        parentId = transfer.parentId,
+                        language = AppLanguage.fromCode(transfer.language),
+                        usage = OSS_USAGE_SINGLE_FILE_UPLOAD,
+                    )
+                    // Let the stopped SDK task release the checkpoint file before it is deleted.
+                    delay(CHECKPOINT_RELEASE_DELAY_MILLIS)
+                    transferRepository.abortMultipartUpload(
+                        ticket = ticket,
+                        objectKey = transfer.objectKey,
+                        uploadId = transfer.uploadId,
+                        credentialProvider = TransferStsCredentialProvider(
+                            transfer = transfer,
+                            accessToken = accessToken,
+                            backendService = backendService,
+                            firstTicket = ticket,
+                        ),
+                    )
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                // Local state is removed either way; the lifecycle policy handles abandoned parts.
+                Log.w(TAG, "Best-effort multipart abort failed for ${transfer.displayName}", throwable)
+            }
+        }
+        transferRepository.deleteCheckpointDirectory(transfer.checkpointDir)
     }
 
     private fun observeUploadWork() {
         viewModelScope.launch {
             UploadWork.workInfos(getApplication()).collect(::applyUploadWorkInfos)
         }
+    }
+
+    private fun observeDownloadWork() {
+        viewModelScope.launch {
+            DownloadWork.workInfos(getApplication()).collect(::applyDownloadWorkInfos)
+        }
+    }
+
+    private fun observeTransferRecords() {
+        viewModelScope.launch {
+            transferStore.uploads.collect(::applyUploadRecords)
+        }
+        viewModelScope.launch {
+            transferStore.downloads.collect(::applyDownloadRecords)
+        }
+    }
+
+    private fun applyUploadRecords(records: List<UploadTransfer>) {
+        val previous = uploadTransfers.associateBy(UploadTransfer::transferId)
+        uploadTransfers = records
+        records.forEach { record ->
+            if (record.notice == TransferNotice.NONE) return@forEach
+            if (previous[record.transferId]?.notice == record.notice) return@forEach
+            val message = when (record.notice) {
+                TransferNotice.SOURCE_CHANGED -> strings().transfers.uploadSourceChanged
+                TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
+                TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
+                TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
+                TransferNotice.NONE -> return@forEach
+            }
+            sendWarningMessage(message)
+            viewModelScope.launch {
+                transferStore.updateUpload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
+            }
+        }
+        refreshTransferUi()
+        reconcileUploadPhases()
+    }
+
+    private fun applyDownloadRecords(records: List<DownloadTransfer>) {
+        val previous = downloadTransfers.associateBy(DownloadTransfer::transferId)
+        downloadTransfers = records
+        records.forEach { record ->
+            if (record.notice == TransferNotice.NONE) return@forEach
+            if (previous[record.transferId]?.notice == record.notice) return@forEach
+            val message = when (record.notice) {
+                TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
+                TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
+                TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
+                else -> return@forEach
+            }
+            sendWarningMessage(message)
+            viewModelScope.launch {
+                transferStore.updateDownload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
+            }
+        }
+        refreshTransferUi()
+        reconcileDownloadPhases()
+    }
+
+    /** Mirrors the persisted transfers plus live work state into the disk UI. */
+    private fun refreshTransferUi() {
+        val uploadEntries = uploadTransfers.map { record ->
+            val info = uploadWorkInfos.firstOrNull { info ->
+                !info.state.isFinished && UploadWork.transferId(info) == record.transferId
+            }
+            val liveBytes = info?.progress?.let { data ->
+                val fraction = data.getFloat(UploadWorker.KEY_PROGRESS_FILE_PROGRESS, 0f)
+                val fileBytes = data.getLong(UploadWorker.KEY_PROGRESS_FILE_BYTES, record.fileBytes)
+                (fileBytes * fraction).toLong()
+            } ?: 0L
+            UploadTransferEntry(
+                transferId = record.transferId,
+                displayName = record.displayName,
+                phase = record.phase,
+                fileBytes = record.fileBytes,
+                transferredBytes = maxOf(liveBytes, record.transferredBytes),
+                waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
+            )
+        }
+        val downloadEntries = downloadTransfers.map { record ->
+            val info = downloadWorkInfos.firstOrNull { info ->
+                !info.state.isFinished && DownloadWork.transferId(info) == record.transferId
+            }
+            DownloadTransferEntry(
+                transferId = record.transferId,
+                fileName = record.fileName,
+                phase = record.phase,
+                downloadedBytes = record.downloadedBytes,
+                totalBytes = record.totalBytes,
+                waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
+            )
+        }
+        // Enqueue grace entries of settled transfers are no longer needed.
+        val knownTransferIds = uploadTransfers.mapTo(mutableSetOf(), UploadTransfer::transferId)
+        downloadTransfers.forEach { knownTransferIds += it.transferId }
+        recentlyEnqueuedTransfers.keys.retainAll(knownTransferIds)
+        _uiState.update { state ->
+            state.copy(
+                disk = state.disk.copy(
+                    uploadTransfers = uploadEntries,
+                    downloadTransfers = downloadEntries,
+                )
+            )
+        }
+    }
+
+    /**
+     * A transfer recorded as transferring without any live work item can only continue if the user
+     * resumes it, for example after the system stopped the worker while the app was gone.
+     */
+    private fun reconcileUploadPhases() {
+        val now = System.currentTimeMillis()
+        val liveTransferIds = uploadWorkInfos
+            .filterNot { it.state.isFinished }
+            .mapNotNull(UploadWork::transferId)
+            .toSet()
+        uploadTransfers
+            .filter { it.phase == UploadPhase.TRANSFERRING && it.transferId !in liveTransferIds }
+            .filter { isEnqueueSettled(it.transferId, now) }
+            .forEach { record ->
+                viewModelScope.launch {
+                    transferStore.updateUpload(record.transferId) { current ->
+                        if (current.phase == UploadPhase.TRANSFERRING) {
+                            current.copy(phase = UploadPhase.PAUSED)
+                        } else {
+                            current
+                        }
+                    }
+                }
+            }
+    }
+
+    private fun reconcileDownloadPhases() {
+        val now = System.currentTimeMillis()
+        val liveTransferIds = downloadWorkInfos
+            .filterNot { it.state.isFinished }
+            .mapNotNull(DownloadWork::transferId)
+            .toSet()
+        downloadTransfers
+            .filter { it.phase == DownloadPhase.TRANSFERRING && it.transferId !in liveTransferIds }
+            .filter { isEnqueueSettled(it.transferId, now) }
+            .forEach { record ->
+                viewModelScope.launch {
+                    transferStore.updateDownload(record.transferId) { current ->
+                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                            current.copy(phase = DownloadPhase.PAUSED)
+                        } else {
+                            current
+                        }
+                    }
+                }
+            }
+    }
+
+    private fun markRecentlyEnqueued(transferIds: Collection<String>) {
+        val now = System.currentTimeMillis()
+        transferIds.forEach { transferId ->
+            recentlyEnqueuedTransfers[transferId] = now
+        }
+    }
+
+    private fun isEnqueueSettled(transferId: String, now: Long): Boolean {
+        val enqueuedAt = recentlyEnqueuedTransfers[transferId] ?: return true
+        if (now - enqueuedAt < ENQUEUE_GRACE_MILLIS) return false
+        recentlyEnqueuedTransfers.remove(transferId)
+        return true
+    }
+
+    private fun setTransferActionBusy(busy: Boolean) {
+        _uiState.update { it.copy(disk = it.disk.copy(transferActionBusy = busy)) }
+    }
+
+    private fun ownsTransfer(session: SessionState, accountKey: String): Boolean =
+        accountKey.isBlank() || session.username.isBlank() || accountKey == session.username
+
+    private suspend fun currentAccessToken(): String? {
+        val stored = runCatching { preferencesStore.preferences.first() }.getOrNull()
+        val storedToken = stored?.savedAccessToken.orEmpty()
+        if (storedToken.isNotBlank()) return storedToken
+        return _uiState.value.session.accessToken.takeIf { it.isNotBlank() }
     }
 
     /**
@@ -622,6 +1051,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * old success and error messages are never replayed.
      */
     private fun applyUploadWorkInfos(infos: List<WorkInfo>) {
+        uploadWorkInfos = infos
         infos.forEach { info ->
             val previousState = uploadWorkStates.put(info.id, info.state)
             val belongsToCurrentBatch = info.id in uploadBatchWorkIds
@@ -630,7 +1060,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 handleUploadWorkFinishedOnce(info)
             }
         }
-        releaseUnusedUploadPermissions(infos)
+        releaseUnusedUploadPermissions()
 
         val unfinished = infos.filterNot { it.state.isFinished }
         val runningWork = unfinished.firstOrNull { it.state == WorkInfo.State.RUNNING }
@@ -645,13 +1075,15 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         val uploadProgress = batchUploadProgress(infos, runningWork)
         val wasUploading = _uiState.value.disk.isUploading
         val isUploading = unfinished.isNotEmpty()
+        // A paused batch keeps its last progress instead of jumping back to zero.
+        val keepProgress = isUploading || uploadTransfers.isNotEmpty()
         if (wasUploading != isUploading || uploadProgress != null) {
             _uiState.update { state ->
                 state.copy(
                     disk = state.disk.copy(
                         isUploading = isUploading,
                         uploadProgress = uploadProgress
-                            ?: if (isUploading) state.disk.uploadProgress else 0f,
+                            ?: if (keepProgress) state.disk.uploadProgress else 0f,
                     )
                 )
             }
@@ -668,6 +1100,50 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             uploadBatchTotalBytes = 0L
             uploadBatchWorkIds = emptySet()
         }
+        refreshTransferUi()
+        reconcileUploadPhases()
+    }
+
+    private fun applyDownloadWorkInfos(infos: List<WorkInfo>) {
+        downloadWorkInfos = infos
+        infos.forEach { info ->
+            val previousState = downloadWorkStates.put(info.id, info.state)
+            val changedWhileObserved = previousState != null && previousState != info.state
+            if (!info.state.isFinished || !changedWhileObserved) return@forEach
+            if (!handledDownloadWorkIds.add(info.id)) return@forEach
+            when (info.outputData.getString(DownloadWorker.KEY_RESULT_OUTCOME)) {
+                DownloadWorker.OUTCOME_SUCCESS -> {
+                    sendSuccessMessage(strings().fileDisk.downloadCompleted)
+                    loadDownloadedFiles()
+                }
+
+                DownloadWorker.OUTCOME_FAILED -> {
+                    sendErrorMessage(downloadWorkFailureMessage(info.outputData))
+                }
+
+                else -> Unit
+            }
+        }
+        if (infos.any { !it.state.isFinished }) {
+            handledDownloadWorkIds.clear()
+        }
+        refreshTransferUi()
+        reconcileDownloadPhases()
+    }
+
+    private fun downloadWorkFailureMessage(data: Data): String {
+        val strings = strings()
+        return when (data.getString(DownloadWorker.KEY_RESULT_ERROR_KIND)) {
+            DownloadWorker.ERROR_KIND_BUSINESS ->
+                data.getString(DownloadWorker.KEY_RESULT_ERROR_DETAIL).orEmpty().ifBlank { strings.common.networkError }
+
+            DownloadWorker.ERROR_KIND_HTTP ->
+                strings.httpErrorMessage(data.getInt(DownloadWorker.KEY_RESULT_ERROR_STATUS, 0))
+
+            DownloadWorker.ERROR_KIND_MISSING_BASE_URL -> strings.common.baseUrlMissing
+            DownloadWorker.ERROR_KIND_FOREGROUND -> strings.common.networkError
+            else -> strings.common.networkError
+        }
     }
 
     private fun handleUploadWorkFinishedOnce(info: WorkInfo) {
@@ -678,27 +1154,21 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /**
      * Releases persisted read permissions that no upload needs any more, for example the document of a
      * file that finished while the previous process was gone and is therefore never replayed in the UI.
-     * Documents of pending work items and of the current upload candidates are kept, so a failed file
-     * stays manually retryable. This cleanup is silent and idempotent.
+     *
+     * Documents of pending work items, of persisted transfers and of the current upload candidates are
+     * kept, so a paused or failed file stays resumable. This cleanup is silent and idempotent.
      */
-    private fun releaseUnusedUploadPermissions(infos: List<WorkInfo>) {
+    private fun releaseUnusedUploadPermissions() {
         val neededUris = buildSet {
             _uiState.value.disk.uploadCandidates.forEach { candidate -> add(candidate.uriString) }
-            infos.filterNot { it.state.isFinished }
+            uploadTransfers.forEach { transfer -> add(transfer.sourceUri) }
+            uploadWorkInfos.filterNot { it.state.isFinished }
                 .forEach { info -> UploadWork.sourceUri(info)?.let(::add) }
         }
-        infos.asSequence()
-            .filter { it.state.isFinished }
-            .mapNotNull(::finishedWorkUri)
-            .distinct()
+        UploadUriPermissionManager.persistedReadPermissionUris(getApplication())
             .filterNot { uriString -> uriString in neededUris }
             .forEach { uriString -> releaseUploadCandidatePermission(uriString) }
     }
-
-    /** The document of a finished work item: its result data, or its uri tag for older work items. */
-    private fun finishedWorkUri(info: WorkInfo): String? =
-        info.outputData.getString(UploadWorker.KEY_RESULT_URI)?.takeIf(String::isNotEmpty)
-            ?: UploadWork.sourceUri(info)
 
     /**
      * Remembers which batch the UI is showing and how many bytes it holds. The running work publishes
@@ -756,15 +1226,20 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         val uriString = info.outputData.getString(UploadWorker.KEY_RESULT_URI).orEmpty()
         val candidate = _uiState.value.disk.uploadCandidates
             .firstOrNull { uriString.isNotEmpty() && it.uriString == uriString }
+        val outcome = info.outputData.getString(UploadWorker.KEY_RESULT_OUTCOME)
+        // Paused or cancelled work reports nothing: the transfer record carries that state instead.
+        if (outcome == UploadWorker.OUTCOME_CANCELED) return
+
         val succeeded = info.state == WorkInfo.State.SUCCEEDED &&
-            info.outputData.getString(UploadWorker.KEY_RESULT_OUTCOME) == UploadWorker.OUTCOME_SUCCESS
+            outcome == UploadWorker.OUTCOME_SUCCESS
         if (succeeded) {
-            // Removing the candidate also releases the persisted read permission of the document.
+            // Removing the candidate also releases the persisted read permission when it is unused.
             val releaseFailure = if (candidate != null) {
                 removeUploadCandidateInternal(candidate)
             } else {
-                uriString.takeIf(String::isNotEmpty)?.let(::releaseUploadCandidatePermission)
+                releaseUploadCandidatePermission(uriString)
             }
+            releaseUnusedUploadPermissions()
             if (releaseFailure == null) {
                 sendSuccessMessage(
                     strings.format(
@@ -823,21 +1298,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun downloadFile(file: FileEntry) {
-        viewModelScope.launch {
-            val session = activeSession() ?: return@launch
-            runCatching {
-                val descriptor = backendService.getFilePreview(
-                    accessToken = session.accessToken,
-                    fileId = file.id,
-                    language = uiState.value.settings.language,
-                )
-                emitMessage(strings().fileDisk.downloadStarted, MessageTone.INFO)
-                transferRepository.downloadToDownloads(descriptor.url, file.name)
-                emitMessage(strings().fileDisk.downloadCompleted, MessageTone.SUCCESS)
-            }.onFailure { throwable ->
-                sendThrowableMessage(throwable)
-            }
-        }
+        startDownload(fileId = file.id, fileName = file.name)
     }
 
     fun downloadSelectedReadingFile() {
@@ -847,19 +1308,130 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 sendWarningMessage(strings().reading.selectFileFirst)
                 return@launch
             }
+            startDownload(fileId = targetFile.id, fileName = targetFile.name)
+        }
+    }
+
+    /**
+     * Starts one persistent download.
+     *
+     * The MediaStore entry is created up front with `IS_PENDING = 1`, and the presigned URL is only
+     * requested by the worker: it is short lived and must never be persisted as transfer state.
+     */
+    private fun startDownload(fileId: Long, fileName: String) {
+        viewModelScope.launch {
             val session = activeSession() ?: return@launch
-            runCatching {
-                val descriptor = backendService.getFilePreview(
-                    accessToken = session.accessToken,
-                    fileId = targetFile.id,
-                    language = uiState.value.settings.language,
-                )
-                emitMessage(strings().fileDisk.downloadStarted, MessageTone.INFO)
-                transferRepository.downloadToDownloads(descriptor.url, targetFile.name)
-                emitMessage(strings().fileDisk.downloadCompleted, MessageTone.SUCCESS)
-            }.onFailure { throwable ->
-                sendThrowableMessage(throwable)
+            if (_uiState.value.disk.transferActionBusy) return@launch
+
+            val existing = downloadTransfers.firstOrNull {
+                it.fileId == fileId && ownsTransfer(session, it.accountKey)
             }
+            if (existing != null) {
+                resumeDownload(existing.transferId)
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+            val transfer = withContext(Dispatchers.IO) {
+                runCatching {
+                    DownloadTransfer(
+                        transferId = UUID.randomUUID().toString(),
+                        accountKey = session.username,
+                        fileId = fileId,
+                        fileName = fileName,
+                        destinationUri = transferRepository.createPendingDownloadDestination(fileName).toString(),
+                        downloadedBytes = 0L,
+                        totalBytes = 0L,
+                        etag = "",
+                        language = _uiState.value.settings.language.code,
+                        phase = DownloadPhase.TRANSFERRING,
+                        notice = TransferNotice.NONE,
+                        createdAt = System.currentTimeMillis(),
+                    )
+                }
+            }.getOrElse { throwable ->
+                setTransferActionBusy(false)
+                sendThrowableMessage(throwable)
+                return@launch
+            }
+
+            markRecentlyEnqueued(listOf(transfer.transferId))
+            transferStore.addDownload(transfer)
+            downloadTransfers = downloadTransfers + transfer
+            DownloadWork.enqueue(getApplication(), session.accessToken, listOf(transfer))
+            setTransferActionBusy(false)
+            emitMessage(strings().fileDisk.downloadStarted, MessageTone.INFO)
+        }
+    }
+
+    /** Pauses a download without losing its partial bytes; the pending MediaStore item is kept. */
+    fun pauseDownload(transferId: String) {
+        viewModelScope.launch {
+            val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
+            if (transfer.phase != DownloadPhase.TRANSFERRING) return@launch
+            setTransferActionBusy(true)
+            transferStore.updateDownload(transferId) { current ->
+                if (current.phase == DownloadPhase.TRANSFERRING) {
+                    current.copy(phase = DownloadPhase.PAUSED)
+                } else {
+                    current
+                }
+            }
+            awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transferId))
+            setTransferActionBusy(false)
+            sendInfoMessage(strings().transfers.paused)
+        }
+    }
+
+    /** Resumes a paused download. The worker always asks for a new presigned URL before continuing. */
+    fun resumeDownload(transferId: String) {
+        viewModelScope.launch {
+            val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
+            val session = activeSession() ?: return@launch
+            if (!ownsTransfer(session, transfer.accountKey)) {
+                cancelDownloadInternal(transfer)
+                return@launch
+            }
+            setTransferActionBusy(true)
+            transferStore.updateDownload(transferId) { current ->
+                if (current.phase == DownloadPhase.PAUSED) {
+                    current.copy(phase = DownloadPhase.TRANSFERRING)
+                } else {
+                    current
+                }
+            }
+            markRecentlyEnqueued(listOf(transferId))
+            DownloadWork.enqueue(                context = getApplication(),
+                accessToken = session.accessToken,
+                transfers = listOf(transfer.copy(phase = DownloadPhase.TRANSFERRING)),
+            )
+            setTransferActionBusy(false)
+        }
+    }
+
+    /** Destructive cancel: the unfinished MediaStore item and the transfer state are deleted. */
+    fun cancelDownload(transferId: String) {
+        viewModelScope.launch {
+            val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
+            setTransferActionBusy(true)
+            cancelDownloadInternal(transfer)
+            setTransferActionBusy(false)
+            sendInfoMessage(strings().transfers.transferCanceled)
+        }
+    }
+
+    private suspend fun cancelDownloadInternal(transfer: DownloadTransfer) {
+        transferStore.removeDownload(transfer.transferId)
+        awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transfer.transferId))
+        withContext(Dispatchers.IO) {
+            transferRepository.deleteDownloadDestination(transfer.destinationUri)
+        }
+    }
+
+    /** Blocks on a background dispatcher until WorkManager persisted the requested cancellation. */
+    private suspend fun awaitDownloadCancellation(operation: androidx.work.Operation) {
+        withContext(Dispatchers.IO) {
+            DownloadWork.awaitCancellation(operation, WORK_CANCELLATION_TIMEOUT_MILLIS)
         }
     }
 
@@ -1444,15 +2016,62 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun resetSessionAndContent() {
         val cacheFilesToDelete = _uiState.value.reading.activeCacheFiles
-        // Queued uploads belong to the session that just ended, and so do their persisted read
-        // permissions: every persisted permission in this app comes from a picked upload candidate.
+        // Queued transfers belong to the session that just ended: their work is stopped, their remote
+        // multipart uploads are aborted best-effort and their local state is deleted, so nothing can
+        // ever run under the next account.
         UploadWork.cancelAll(getApplication())
+        DownloadWork.cancelAll(getApplication())
         uploadWorkStates.clear()
         overwriteWarnedUploads.clear()
         handledUploadWorkIds.clear()
+        handledDownloadWorkIds.clear()
+        recentlyEnqueuedTransfers.clear()
         uploadBatchId = null
         uploadBatchTotalBytes = 0L
         uploadBatchWorkIds = emptySet()
+
+        val uploads = transferStore.uploadsOnce()
+        val downloads = transferStore.downloadsOnce()
+        transferStore.removeUploads(uploads.map(UploadTransfer::transferId))
+        transferStore.removeDownloads(downloads.map(DownloadTransfer::transferId))
+        uploadTransfers = emptyList()
+        downloadTransfers = emptyList()
+
+        withContext(Dispatchers.IO) {
+            withTimeoutOrNull(LOGOUT_ABORT_TIMEOUT_MILLIS) {
+                uploads.forEach { transfer ->
+                    runCatching {
+                        if (transfer.phase == UploadPhase.METADATA_PENDING) return@runCatching
+                        if (transfer.uploadId.isBlank() || transfer.objectKey.isBlank()) return@runCatching
+                        val accessToken = currentAccessToken() ?: return@runCatching
+                        val ticket = backendService.requestOssSts(
+                            accessToken = accessToken,
+                            pathString = transfer.pathString,
+                            filename = transfer.displayName,
+                            parentId = transfer.parentId,
+                            language = AppLanguage.fromCode(transfer.language),
+                            usage = OSS_USAGE_SINGLE_FILE_UPLOAD,
+                        )
+                        transferRepository.abortMultipartUpload(
+                            ticket = ticket,
+                            objectKey = transfer.objectKey,
+                            uploadId = transfer.uploadId,
+                            credentialProvider = TransferStsCredentialProvider(
+                                transfer = transfer,
+                                accessToken = accessToken,
+                                backendService = backendService,
+                                firstTicket = ticket,
+                            ),
+                        )
+                    }
+                }
+            }
+            // Local checkpoints and unfinished MediaStore items are always removed, even when the
+            // best-effort abort above timed out.
+            uploads.forEach { transferRepository.deleteCheckpointDirectory(it.checkpointDir) }
+            downloads.forEach { transferRepository.deleteDownloadDestination(it.destinationUri) }
+        }
+
         val releaseFailures = UploadUriPermissionManager.releaseAllPersistedReadPermissions(getApplication())
         cleanupPreviewCacheFiles(cacheFilesToDelete)
         previewRepository.clearAllPreviewCache()
@@ -1491,6 +2110,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun releaseUploadCandidatePermission(uriString: String): Throwable? {
+        // A persisted read permission is kept for as long as any transfer, pending work item or
+        // selected candidate still refers to the document.
+        val stillNeeded = uploadTransfers.any { it.sourceUri == uriString } ||
+            uploadWorkInfos.any { !it.state.isFinished && UploadWork.sourceUri(it) == uriString } ||
+            _uiState.value.disk.uploadCandidates.any { it.uriString == uriString }
+        if (stillNeeded) return null
+
         return UploadUriPermissionManager.releaseReadPermission(
             context = getApplication(),
             uri = Uri.parse(uriString),
@@ -1498,7 +2124,16 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private suspend fun cleanupStaleUploadUriPermissions() {
-        // Uploads restored by WorkManager still need the persisted read permission of their document.
+        val transfers = transferStore.uploadsOnce()
+        // Checkpoints of transfers that no longer exist can never be resumed: drop them silently.
+        withContext(Dispatchers.IO) {
+            val knownTransferIds = transfers.mapTo(mutableSetOf(), UploadTransfer::transferId)
+            transferRepository.orphanCheckpointDirectories(knownTransferIds)
+                .forEach { directory -> runCatching { directory.deleteRecursively() } }
+        }
+
+        // Recoverable transfers and uploads restored by WorkManager still need their document.
+        if (transfers.isNotEmpty()) return
         if (UploadWork.hasPendingUploads(getApplication())) return
 
         val failures = UploadUriPermissionManager.releaseAllPersistedReadPermissions(getApplication())
@@ -1624,10 +2259,29 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private companion object {
+        const val TAG = "NotesAppViewModel"
+
         /**
          * Keeps visible progress below completion while a batch is running: the web client reserves its
          * last percent for the backend insert, so a failing file is never shown as finished.
          */
         const val MAX_UPLOAD_PROGRESS_BEFORE_COMPLETION = 0.99f
+
+        const val OSS_USAGE_SINGLE_FILE_UPLOAD = "SINGLE_FILE_UPLOAD"
+
+        /** How long a just-enqueued transfer may be missing from the WorkManager snapshot. */
+        const val ENQUEUE_GRACE_MILLIS = 5_000L
+
+        /** A destructive cancel is best effort; the UI must never wait on it for long. */
+        const val CANCEL_ABORT_TIMEOUT_MILLIS = 15_000L
+
+        /** Logout waits for aborts only briefly: local state is cleaned either way. */
+        const val LOGOUT_ABORT_TIMEOUT_MILLIS = 10_000L
+
+        /** Lets a stopped SDK task release its checkpoint file before the directory is deleted. */
+        const val CHECKPOINT_RELEASE_DELAY_MILLIS = 300L
+
+        /** Upper bound for waiting until WorkManager persisted a cancellation. */
+        const val WORK_CANCELLATION_TIMEOUT_MILLIS = 5_000L
     }
 }

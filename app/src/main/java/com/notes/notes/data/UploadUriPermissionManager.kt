@@ -13,6 +13,25 @@ object UploadUriPermissionManager {
         }.exceptionOrNull()
     }
 
+    fun persistReadPermissionIfNeeded(context: Context, uri: Uri): Throwable? {
+        if (hasPersistedReadPermission(context, uri)) return null
+        return persistReadPermission(context, uri)
+    }
+
+    fun hasPersistedReadPermission(context: Context, uri: Uri): Boolean =
+        context.contentResolver.persistedUriPermissions.any { permission ->
+            permission.isReadPermission && permission.uri == uri
+        }
+
+    /** Every document this app currently holds a persisted read permission for. */
+    fun persistedReadPermissionUris(context: Context): List<String> =
+        context.contentResolver.persistedUriPermissions
+            .asSequence()
+            .filter { it.isReadPermission }
+            .map { it.uri.toString() }
+            .distinct()
+            .toList()
+
     fun releaseReadPermission(context: Context, uri: Uri): Throwable? {
         val hasPersistedReadPermission = context.contentResolver.persistedUriPermissions.any { permission ->
             permission.isReadPermission && permission.uri == uri
