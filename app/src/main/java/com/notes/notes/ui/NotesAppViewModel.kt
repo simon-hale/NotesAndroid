@@ -697,7 +697,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /** Pauses every transfer of the current upload batch. Pausing never aborts the multipart upload. */
     fun pauseUploads() {
         viewModelScope.launch {
-            val targets = uploadTransfers.filter { it.phase == UploadPhase.TRANSFERRING }
+            val targets = ownedUploadTransfers().filter { it.phase == UploadPhase.TRANSFERRING }
             if (targets.isEmpty()) return@launch
             setTransferActionBusy(true)
             // The phase is persisted before the work is stopped, so the worker can never report the
@@ -721,23 +721,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /** Resumes paused uploads and retries metadata-only transfers of the current account. */
     fun resumeUploads() {
         viewModelScope.launch {
-            val candidates = uploadTransfers.filter { it.phase != UploadPhase.TRANSFERRING }
-            if (candidates.isEmpty()) return@launch
             val session = activeSession() ?: return@launch
+            // Only this account's transfers: a foreign record is never resumed, cancelled or deleted
+            // merely because another user is signed in.
+            val owned = ownedUploadTransfers().filter { it.phase != UploadPhase.TRANSFERRING }
+            if (owned.isEmpty()) return@launch
             setTransferActionBusy(true)
-
-            val owned = candidates.filter { ownsTransfer(session, it.accountKey) }
-            val foreign = candidates.filterNot { ownsTransfer(session, it.accountKey) }
-            if (foreign.isNotEmpty()) {
-                // Another account's transfers must never run under this session.
-                transferStore.removeUploads(foreign.map { it.transferId })
-                UploadWork.cancelTransfers(getApplication(), foreign.map { it.transferId })
-                releaseUnusedUploadPermissions()
-            }
-            if (owned.isEmpty()) {
-                setTransferActionBusy(false)
-                return@launch
-            }
 
             owned.filter { it.phase == UploadPhase.PAUSED }.forEach { transfer ->
                 transferStore.updateUpload(transfer.transferId) { current ->
@@ -752,7 +741,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             uploadBatchId = owned.first().batchId
             uploadBatchTotalBytes = owned.first().batchTotalBytes
             markRecentlyEnqueued(owned.map { it.transferId })
-            val batch = UploadWork.enqueue(                context = getApplication(),
+            val batch = UploadWork.enqueue(
+                context = getApplication(),
                 accessToken = session.accessToken,
                 transfers = owned,
             )
@@ -768,12 +758,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * record. A transfer whose object is already complete keeps its object: nothing is deleted from OSS.
      */
     fun cancelUploads() {
-        cancelUploadTransfers(uploadTransfers)
+        cancelUploadTransfers(ownedUploadTransfers())
     }
 
     /** Destructive cancel of a single transfer, for example from its row in the upload sheet. */
     fun cancelUpload(transferId: String) {
-        cancelUploadTransfers(uploadTransfers.filter { it.transferId == transferId })
+        cancelUploadTransfers(ownedUploadTransfers().filter { it.transferId == transferId })
     }
 
     private fun cancelUploadTransfers(targets: List<UploadTransfer>) {
@@ -878,21 +868,24 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun applyUploadRecords(records: List<UploadTransfer>) {
         val previous = uploadTransfers.associateBy(UploadTransfer::transferId)
         uploadTransfers = records
-        records.forEach { record ->
-            if (record.notice == TransferNotice.NONE) return@forEach
-            if (previous[record.transferId]?.notice == record.notice) return@forEach
-            val message = when (record.notice) {
-                TransferNotice.SOURCE_CHANGED -> strings().transfers.uploadSourceChanged
-                TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
-                TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
-                TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
-                TransferNotice.NONE -> return@forEach
+        records
+            // Another account's notices are not this session's to surface or to clear.
+            .filter { isOwnedByActiveSession(it.accountKey) }
+            .forEach { record ->
+                if (record.notice == TransferNotice.NONE) return@forEach
+                if (previous[record.transferId]?.notice == record.notice) return@forEach
+                val message = when (record.notice) {
+                    TransferNotice.SOURCE_CHANGED -> strings().transfers.uploadSourceChanged
+                    TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
+                    TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
+                    TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
+                    TransferNotice.NONE -> return@forEach
+                }
+                sendWarningMessage(message)
+                viewModelScope.launch {
+                    transferStore.updateUpload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
+                }
             }
-            sendWarningMessage(message)
-            viewModelScope.launch {
-                transferStore.updateUpload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
-            }
-        }
         refreshTransferUi()
         reconcileUploadPhases()
     }
@@ -900,57 +893,69 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun applyDownloadRecords(records: List<DownloadTransfer>) {
         val previous = downloadTransfers.associateBy(DownloadTransfer::transferId)
         downloadTransfers = records
-        records.forEach { record ->
-            if (record.notice == TransferNotice.NONE) return@forEach
-            if (previous[record.transferId]?.notice == record.notice) return@forEach
-            val message = when (record.notice) {
-                TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
-                TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
-                TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
-                else -> return@forEach
+        records
+            // Another account's notices are not this session's to surface or to clear.
+            .filter { isOwnedByActiveSession(it.accountKey) }
+            .forEach { record ->
+                if (record.notice == TransferNotice.NONE) return@forEach
+                if (previous[record.transferId]?.notice == record.notice) return@forEach
+                val message = when (record.notice) {
+                    TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
+                    TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
+                    TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
+                    else -> return@forEach
+                }
+                sendWarningMessage(message)
+                viewModelScope.launch {
+                    transferStore.updateDownload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
+                }
             }
-            sendWarningMessage(message)
-            viewModelScope.launch {
-                transferStore.updateDownload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
-            }
-        }
         refreshTransferUi()
         reconcileDownloadPhases()
     }
 
-    /** Mirrors the persisted transfers plus live work state into the disk UI. */
+    /**
+     * Mirrors the persisted transfers plus live work state into the disk UI.
+     *
+     * Only records owned by the active session are projected: another account's transfers stay in the
+     * store, untouched and invisible, until their owner signs in again.
+     */
     private fun refreshTransferUi() {
-        val uploadEntries = uploadTransfers.map { record ->
-            val info = uploadWorkInfos.firstOrNull { info ->
-                !info.state.isFinished && UploadWork.transferId(info) == record.transferId
+        val uploadEntries = uploadTransfers
+            .filter { isOwnedByActiveSession(it.accountKey) }
+            .map { record ->
+                val info = uploadWorkInfos.firstOrNull { info ->
+                    !info.state.isFinished && UploadWork.transferId(info) == record.transferId
+                }
+                val liveBytes = info?.progress?.let { data ->
+                    val fraction = data.getFloat(UploadWorker.KEY_PROGRESS_FILE_PROGRESS, 0f)
+                    val fileBytes = data.getLong(UploadWorker.KEY_PROGRESS_FILE_BYTES, record.fileBytes)
+                    (fileBytes * fraction).toLong()
+                } ?: 0L
+                UploadTransferEntry(
+                    transferId = record.transferId,
+                    displayName = record.displayName,
+                    phase = record.phase,
+                    fileBytes = record.fileBytes,
+                    transferredBytes = maxOf(liveBytes, record.transferredBytes),
+                    waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
+                )
             }
-            val liveBytes = info?.progress?.let { data ->
-                val fraction = data.getFloat(UploadWorker.KEY_PROGRESS_FILE_PROGRESS, 0f)
-                val fileBytes = data.getLong(UploadWorker.KEY_PROGRESS_FILE_BYTES, record.fileBytes)
-                (fileBytes * fraction).toLong()
-            } ?: 0L
-            UploadTransferEntry(
-                transferId = record.transferId,
-                displayName = record.displayName,
-                phase = record.phase,
-                fileBytes = record.fileBytes,
-                transferredBytes = maxOf(liveBytes, record.transferredBytes),
-                waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
-            )
-        }
-        val downloadEntries = downloadTransfers.map { record ->
-            val info = downloadWorkInfos.firstOrNull { info ->
-                !info.state.isFinished && DownloadWork.transferId(info) == record.transferId
+        val downloadEntries = downloadTransfers
+            .filter { isOwnedByActiveSession(it.accountKey) }
+            .map { record ->
+                val info = downloadWorkInfos.firstOrNull { info ->
+                    !info.state.isFinished && DownloadWork.transferId(info) == record.transferId
+                }
+                DownloadTransferEntry(
+                    transferId = record.transferId,
+                    fileName = record.fileName,
+                    phase = record.phase,
+                    downloadedBytes = record.downloadedBytes,
+                    totalBytes = record.totalBytes,
+                    waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
+                )
             }
-            DownloadTransferEntry(
-                transferId = record.transferId,
-                fileName = record.fileName,
-                phase = record.phase,
-                downloadedBytes = record.downloadedBytes,
-                totalBytes = record.totalBytes,
-                waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
-            )
-        }
         // Enqueue grace entries of settled transfers are no longer needed.
         val knownTransferIds = uploadTransfers.mapTo(mutableSetOf(), UploadTransfer::transferId)
         downloadTransfers.forEach { knownTransferIds += it.transferId }
@@ -975,7 +980,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             .filterNot { it.state.isFinished }
             .mapNotNull(UploadWork::transferId)
             .toSet()
-        uploadTransfers
+        ownedUploadTransfers()
             .filter { it.phase == UploadPhase.TRANSFERRING && it.transferId !in liveTransferIds }
             .filter { isEnqueueSettled(it.transferId, now) }
             .forEach { record ->
@@ -998,6 +1003,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             .mapNotNull(DownloadWork::transferId)
             .toSet()
         downloadTransfers
+            // A foreign owner's record is not this session's to recover.
+            .filter { isOwnedByActiveSession(it.accountKey) }
             .filter { it.phase == DownloadPhase.TRANSFERRING && it.transferId !in liveTransferIds }
             .filter { isEnqueueSettled(it.transferId, now) }
             .forEach { record ->
@@ -1031,8 +1038,27 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(disk = it.disk.copy(transferActionBusy = busy)) }
     }
 
-    private fun ownsTransfer(session: SessionState, accountKey: String): Boolean =
-        accountKey.isBlank() || session.username.isBlank() || accountKey == session.username
+    /**
+     * True when the active session may see and operate on a transfer owned by [accountKey].
+     *
+     * A transfer owned by another account is never projected into the UI and never mutated, its
+     * record and OSS checkpoint included; it stays isolated until its owner signs in again, or until
+     * an explicit logout for that owner removes it. Records without an owner key come from an older
+     * app version and belong to whoever is signed in.
+     */
+    private fun isOwnedByActiveSession(accountKey: String): Boolean {
+        val session = _uiState.value.session
+        if (!session.isLoggedIn || session.username.isBlank()) return false
+        return accountKey.isBlank() || accountKey == session.username
+    }
+
+    /** Records the active session owns, i.e. the only ones it is allowed to act on. */
+    private fun ownedUploadTransfers(): List<UploadTransfer> =
+        uploadTransfers.filter { isOwnedByActiveSession(it.accountKey) }
+
+    /** Records belonging to another account: left completely untouched for their owner. */
+    private fun foreignUploadTransfers(): List<UploadTransfer> =
+        uploadTransfers.filterNot { isOwnedByActiveSession(it.accountKey) }
 
     private suspend fun currentAccessToken(): String? {
         val stored = runCatching { preferencesStore.preferences.first() }.getOrNull()
@@ -1155,19 +1181,20 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * Releases persisted read permissions that no upload needs any more, for example the document of a
      * file that finished while the previous process was gone and is therefore never replayed in the UI.
      *
-     * Documents of pending work items, of persisted transfers and of the current upload candidates are
-     * kept, so a paused or failed file stays resumable. This cleanup is silent and idempotent.
+     * Documents of pending work items, of persisted transfers (including transfers owned by another
+     * account) and of the current upload candidates are kept, so a paused or failed file stays
+     * resumable. Returns the release failures of this pass; the cleanup itself is idempotent.
      */
-    private fun releaseUnusedUploadPermissions() {
+    private fun releaseUnusedUploadPermissions(): List<Throwable> {
         val neededUris = buildSet {
             _uiState.value.disk.uploadCandidates.forEach { candidate -> add(candidate.uriString) }
             uploadTransfers.forEach { transfer -> add(transfer.sourceUri) }
             uploadWorkInfos.filterNot { it.state.isFinished }
                 .forEach { info -> UploadWork.sourceUri(info)?.let(::add) }
         }
-        UploadUriPermissionManager.persistedReadPermissionUris(getApplication())
+        return UploadUriPermissionManager.persistedReadPermissionUris(getApplication())
             .filterNot { uriString -> uriString in neededUris }
-            .forEach { uriString -> releaseUploadCandidatePermission(uriString) }
+            .mapNotNull { uriString -> releaseUploadCandidatePermission(uriString) }
     }
 
     /**
@@ -1288,6 +1315,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
             UploadWorker.ERROR_KIND_MISSING_BASE_URL -> strings.common.baseUrlMissing
             UploadWorker.ERROR_KIND_FOREGROUND -> uploadBackgroundUnavailableMessage()
+            // The resumable task is preserved and must be cancelled explicitly; retrying would only
+            // ask the backend for the same moved target again.
+            UploadWorker.ERROR_KIND_TARGET_CHANGED -> strings.transfers.uploadTargetChanged
             else -> strings.common.networkError
         }
     }
@@ -1324,7 +1354,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             if (_uiState.value.disk.transferActionBusy) return@launch
 
             val existing = downloadTransfers.firstOrNull {
-                it.fileId == fileId && ownsTransfer(session, it.accountKey)
+                it.fileId == fileId && isOwnedByActiveSession(it.accountKey)
             }
             if (existing != null) {
                 resumeDownload(existing.transferId)
@@ -1368,6 +1398,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun pauseDownload(transferId: String) {
         viewModelScope.launch {
             val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
+            if (!isOwnedByActiveSession(transfer.accountKey)) return@launch
             if (transfer.phase != DownloadPhase.TRANSFERRING) return@launch
             setTransferActionBusy(true)
             transferStore.updateDownload(transferId) { current ->
@@ -1388,8 +1419,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
             val session = activeSession() ?: return@launch
-            if (!ownsTransfer(session, transfer.accountKey)) {
-                cancelDownloadInternal(transfer)
+            if (!isOwnedByActiveSession(transfer.accountKey)) {
+                // Not this session's transfer: leave its record and partial MediaStore item alone.
                 return@launch
             }
             setTransferActionBusy(true)
@@ -1401,7 +1432,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 }
             }
             markRecentlyEnqueued(listOf(transferId))
-            DownloadWork.enqueue(                context = getApplication(),
+            DownloadWork.enqueue(
+                context = getApplication(),
                 accessToken = session.accessToken,
                 transfers = listOf(transfer.copy(phase = DownloadPhase.TRANSFERRING)),
             )
@@ -1413,6 +1445,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun cancelDownload(transferId: String) {
         viewModelScope.launch {
             val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
+            if (!isOwnedByActiveSession(transfer.accountKey)) return@launch
             setTransferActionBusy(true)
             cancelDownloadInternal(transfer)
             setTransferActionBusy(false)
@@ -1679,6 +1712,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         if (welcomeBack) {
             sendSuccessMessage(strings().fileDisk.welcomeBack)
         }
+        // Transfers are projected per account: the records of the account that just signed in become
+        // visible now, and another account's records stay hidden.
+        refreshTransferUi()
         loadDiskPage(
             target = DiskTarget.Root(),
             showLoading = false,
@@ -2016,26 +2052,37 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun resetSessionAndContent() {
         val cacheFilesToDelete = _uiState.value.reading.activeCacheFiles
-        // Queued transfers belong to the session that just ended: their work is stopped, their remote
-        // multipart uploads are aborted best-effort and their local state is deleted, so nothing can
-        // ever run under the next account.
-        UploadWork.cancelAll(getApplication())
-        DownloadWork.cancelAll(getApplication())
+        val departingAccount = _uiState.value.session.username
+        // Only the departing account's transfers are cleaned up: their work is stopped, their remote
+        // multipart uploads are aborted best-effort and their local state is deleted. A transfer that
+        // belongs to another account stays exactly where it is, for that owner to handle later.
+        val uploads = transferStore.uploadsOnce().filter { belongsToDepartingAccount(it.accountKey, departingAccount) }
+        val downloads = transferStore.downloadsOnce()
+            .filter { belongsToDepartingAccount(it.accountKey, departingAccount) }
+
         uploadWorkStates.clear()
         overwriteWarnedUploads.clear()
         handledUploadWorkIds.clear()
         handledDownloadWorkIds.clear()
+        // Enqueue grace only guards a transfer that was just queued by this session; preserved
+        // foreign transfers are not reconciled by this session anyway.
         recentlyEnqueuedTransfers.clear()
         uploadBatchId = null
         uploadBatchTotalBytes = 0L
         uploadBatchWorkIds = emptySet()
 
-        val uploads = transferStore.uploadsOnce()
-        val downloads = transferStore.downloadsOnce()
+        awaitWorkCancellations(
+            UploadWork.cancelTransfers(getApplication(), uploads.map(UploadTransfer::transferId))
+        )
+        downloads.forEach { transfer ->
+            awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transfer.transferId))
+        }
         transferStore.removeUploads(uploads.map(UploadTransfer::transferId))
         transferStore.removeDownloads(downloads.map(DownloadTransfer::transferId))
-        uploadTransfers = emptyList()
-        downloadTransfers = emptyList()
+        uploadTransfers = uploadTransfers.filterNot { transfer -> uploads.any { it.transferId == transfer.transferId } }
+        downloadTransfers = downloadTransfers.filterNot { transfer ->
+            downloads.any { it.transferId == transfer.transferId }
+        }
 
         withContext(Dispatchers.IO) {
             withTimeoutOrNull(LOGOUT_ABORT_TIMEOUT_MILLIS) {
@@ -2072,7 +2119,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             downloads.forEach { transferRepository.deleteDownloadDestination(it.destinationUri) }
         }
 
-        val releaseFailures = UploadUriPermissionManager.releaseAllPersistedReadPermissions(getApplication())
+        // Permissions the departing account no longer needs are released here; a preserved foreign
+        // transfer keeps the read permission of its document.
+        val releaseFailures = releaseUnusedUploadPermissions()
         cleanupPreviewCacheFiles(cacheFilesToDelete)
         previewRepository.clearAllPreviewCache()
         invalidateDiskRequests()
@@ -2097,6 +2146,15 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             )
         }
     }
+
+    /**
+     * True when a record belongs to the session that is being ended.
+     *
+     * Ownerless records come from an older app version and are cleaned up together with the account
+     * that is currently active, because nothing else can attribute or recover them.
+     */
+    private fun belongsToDepartingAccount(accountKey: String, departingAccount: String): Boolean =
+        accountKey.isBlank() || accountKey == departingAccount
 
     private fun cleanupPreviewCacheFiles(paths: Collection<String>) {
         if (paths.isEmpty()) return

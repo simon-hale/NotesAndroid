@@ -32,6 +32,9 @@ class TransferStsCredentialProvider(
 
     private var ticket: OssStsToken = firstTicket
 
+    /** The OSS identity this task is frozen to; every refreshed ticket must stay inside it. */
+    private val frozenScope: UploadTargetScope = UploadTargetScope.of(firstTicket)
+
     /** Fetches a ticket through the shared OSS client factory so connection settings stay identical. */
     override fun getFederationToken(): OSSFederationToken = getValidFederationToken()
 
@@ -78,7 +81,7 @@ class TransferStsCredentialProvider(
             }
             return null
         }
-        validate(refreshed, previous)
+        validate(refreshed)
         ticket = refreshed
         return refreshed
     }
@@ -101,21 +104,15 @@ class TransferStsCredentialProvider(
 
     /**
      * A resumed upload keeps writing the same object, so a ticket that moved to another bucket,
-     * region or object key must never be used to continue it.
+     * region or object key must never be used to continue it. The check is the same one the worker
+     * applies to the first ticket, so the frozen scope holds for the whole lifetime of the task.
      */
-    private fun validate(refreshed: OssStsToken, previous: OssStsToken) {
+    private fun validate(refreshed: OssStsToken) {
         if (!refreshed.hasCredentials) {
             throw ClientException("Refreshed OSS credentials are incomplete")
         }
-        if (previous.bucket.isNotBlank() && refreshed.bucket != previous.bucket) {
-            throw ClientException("Refreshed OSS credentials changed the bucket")
-        }
-        if (previous.region.isNotBlank() && refreshed.region != previous.region) {
-            throw ClientException("Refreshed OSS credentials changed the region")
-        }
-        if (previous.objectKey.isNotBlank() && refreshed.objectKey != previous.objectKey) {
-            throw ClientException("Refreshed OSS credentials changed the object key")
-        }
+        val field = UploadScopeGuard.mismatch(frozenScope, refreshed) ?: return
+        throw ClientException("Refreshed OSS credentials changed the ${field.name.lowercase()}")
     }
 
     private companion object {

@@ -63,10 +63,16 @@ class DownloadWorker(
         }
         val account = TransferAccount.current(applicationContext)
         if (!account.owns(transfer.accountKey)) {
-            transferStore.removeDownload(transferId)
+            // Belongs to another signed-in account: do not download it and do not touch its record or
+            // its pending MediaStore item. Its owner cleans that up when the account is active again.
+            Log.w(TAG, "Download work is owned by another account; leaving it untouched")
             return Result.success(resultData(transferId, OUTCOME_CANCELED))
         }
-        val accessToken = account.accessTokenOr(inputData.getString(KEY_INPUT_ACCESS_TOKEN).orEmpty())
+        val accessToken = account.accessTokenFor(
+            fallback = inputData.getString(KEY_INPUT_ACCESS_TOKEN).orEmpty(),
+            transferAccountKey = transfer.accountKey,
+            workAccountKey = inputData.getString(KEY_INPUT_ACCOUNT_KEY).orEmpty(),
+        )
         if (accessToken.isBlank()) {
             return Result.success(failureData(transferId, IllegalStateException("Missing download session data")))
         }
@@ -121,26 +127,22 @@ class DownloadWorker(
                 when (DownloadResumePolicy.planForResponse(response.statusCode, run.downloadedBytes)) {
                     DownloadPlan.CONTINUE_FROM_OFFSET -> {
                         if (response.statusCode == HTTP_PARTIAL_CONTENT) {
-                            run.totalBytes = if (response.contentLength >= 0L) {
-                                run.downloadedBytes + response.contentLength
-                            } else {
-                                run.totalBytes
-                            }
-                        } else if (response.contentLength >= 0L) {
-                            run.totalBytes = response.contentLength
+                            run.takeResumedTotal(response.statusCode, response.contentLength)
+                        } else {
+                            run.takeFreshTotal(response.contentLength)
                         }
-                        if (response.etag.isNotBlank()) run.etag = response.etag
-                        run.restart = false
+                        run.takeETag(response.etag)
                     }
 
                     DownloadPlan.RESTART_FROM_ZERO -> {
                         if (response.statusCode == HTTP_OK && run.downloadedBytes > 0L) {
                             // The server ignored the Range header: never append, an old prefix must
-                            // not be combined with a new object's suffix.
+                            // not be combined with a new object's suffix. The new representation also
+                            // gets its own length and ETag.
                             Log.i(TAG, "Server ignored Range for ${transfer.fileName}; restarting")
                             run.resetForRestart(TransferNotice.RESTARTED_RANGE_IGNORED)
-                            if (response.contentLength >= 0L) run.totalBytes = response.contentLength
-                            if (response.etag.isNotBlank()) run.etag = response.etag
+                            run.takeFreshTotal(response.contentLength)
+                            run.takeETag(response.etag)
                         } else {
                             // The remote object changed or the range is unusable: discard the partial
                             // file and fetch the current object from byte zero.
@@ -161,7 +163,7 @@ class DownloadWorker(
                 if (retry) continue
 
                 if (run.downloadedBytes == 0L) {
-                    run.restart = true
+                    run.requestRestartFromZero()
                 }
                 val completed = streamIntoDestination(transfer, run, response)
                 if (!completed) {
@@ -191,9 +193,8 @@ class DownloadWorker(
         val sink = transferRepository.openDownloadSink(
             destinationUri = run.destinationUri,
             offset = run.downloadedBytes,
-            restart = run.restart,
+            restart = run.consumeRestartFromZero(),
         )
-        run.restart = false
         val buffer = ByteArray(COPY_BUFFER_BYTES)
         var lastPersistedAt = 0L
         var lastWorkProgressAt = 0L
@@ -203,13 +204,15 @@ class DownloadWorker(
                 if (isStopped) break
                 val read = response.inputStream.read(buffer)
                 if (read < 0) {
-                    // A clean EOF only counts as completion when the expected byte count arrived.
-                    completed = run.totalBytes <= 0L || run.downloadedBytes >= run.totalBytes
+                    // A clean EOF only counts as completion when the expected byte count arrived. The
+                    // expectation is always the length of the object currently being fetched, never
+                    // the length of a representation that was already discarded.
+                    completed = run.isCompleteAfterEndOfStream()
                     break
                 }
                 if (read == 0) continue
                 sink.write(buffer, 0, read)
-                run.downloadedBytes += read
+                run.recordBytesRead(read.toLong())
 
                 val now = System.currentTimeMillis()
                 if (now - lastWorkProgressAt >= WORK_PROGRESS_INTERVAL_MILLIS) {
@@ -332,29 +335,48 @@ class DownloadWorker(
         return ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
 
-    /** Mutable state of one download attempt; only non-secret fields reach the store. */
+    /**
+     * Mutable state of one download attempt; only non-secret fields reach the store.
+     *
+     * The byte/ETag/total accounting lives in [DownloadProgressState] so the restart rules stay pure
+     * and testable: a restart always discards the length of the previous representation.
+     */
     private class DownloadRun(transfer: DownloadTransfer) {
         val transferId: String = transfer.transferId
 
         var destinationUri: String = transfer.destinationUri
-        var downloadedBytes: Long = transfer.downloadedBytes
-        var totalBytes: Long = transfer.totalBytes
-        var etag: String = transfer.etag
-        var restart: Boolean = false
+
+        private val state = DownloadProgressState(
+            downloadedBytes = transfer.downloadedBytes,
+            totalBytes = transfer.totalBytes,
+            etag = transfer.etag,
+        )
 
         private var pendingNotice: TransferNotice = TransferNotice.NONE
 
-        val fraction: Float
-            get() = if (totalBytes > 0L) {
-                (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
-            } else {
-                0f
-            }
+        val downloadedBytes: Long get() = state.downloadedBytes
+        val totalBytes: Long get() = state.totalBytes
+        val etag: String get() = state.etag
+        val fraction: Float get() = state.fraction
+
+        fun recordBytesRead(count: Long) = state.recordBytesRead(count)
+
+        fun takeResumedTotal(statusCode: Int, contentLength: Long) =
+            state.takeResumedTotal(statusCode, contentLength, requestedOffset = state.downloadedBytes)
+
+        fun takeFreshTotal(contentLength: Long) = state.takeFreshTotal(contentLength)
+
+        fun takeETag(value: String) = state.takeETag(value)
+
+        fun isCompleteAfterEndOfStream(): Boolean = state.isCompleteAfterEndOfStream()
+
+        /** True while the destination still has to be truncated and written from byte zero. */
+        fun consumeRestartFromZero(): Boolean = state.consumeRestartFromZero()
+
+        fun requestRestartFromZero() = state.requestRestartFromZero()
 
         fun resetForRestart(notice: TransferNotice) {
-            downloadedBytes = 0L
-            etag = ""
-            restart = true
+            state.requestRestartFromZero()
             if (notice != TransferNotice.NONE) {
                 pendingNotice = notice
             }
@@ -396,6 +418,13 @@ class DownloadWorker(
     companion object {
         const val KEY_INPUT_TRANSFER_ID = "input_transfer_id"
         const val KEY_INPUT_ACCESS_TOKEN = "input_access_token"
+
+        /**
+         * Non-secret owner of the transfer this work was enqueued for. It binds the fallback session
+         * token to the account that created the work, so credentials of another signed-in account can
+         * never be used for it. No credentials are stored here.
+         */
+        const val KEY_INPUT_ACCOUNT_KEY = "input_account_key"
 
         const val KEY_PROGRESS_DOWNLOADED_BYTES = "progress_downloaded_bytes"
         const val KEY_PROGRESS_TOTAL_BYTES = "progress_total_bytes"

@@ -73,12 +73,17 @@ class UploadWorker(
 
         val account = TransferAccount.current(applicationContext)
         if (!account.owns(transfer.accountKey)) {
-            // Belongs to another signed-in account: never upload it here.
-            transferStore.removeUpload(transferId)
+            // Belongs to another signed-in account: do not upload it and do not touch its record,
+            // checkpoint or permissions. Its owner cleans it up when that account is active again.
+            Log.w(TAG, "Upload work is owned by another account; leaving it untouched")
             return Result.success(resultData(transfer, OUTCOME_CANCELED))
         }
 
-        val accessToken = account.accessTokenOr(inputData.getString(KEY_INPUT_ACCESS_TOKEN).orEmpty())
+        val accessToken = account.accessTokenFor(
+            fallback = inputData.getString(KEY_INPUT_ACCESS_TOKEN).orEmpty(),
+            transferAccountKey = transfer.accountKey,
+            workAccountKey = inputData.getString(KEY_INPUT_ACCOUNT_KEY).orEmpty(),
+        )
         if (accessToken.isBlank()) {
             return Result.success(
                 failureData(transfer, null, IllegalStateException("Missing upload session data"))
@@ -146,7 +151,6 @@ class UploadWorker(
         }
         setProgress(progress.toWorkData())
 
-        val sourceChanged = sourceChanged(transfer, stats)
         val ticket = backendService.requestOssSts(
             accessToken = accessToken,
             pathString = transfer.pathString,
@@ -159,48 +163,51 @@ class UploadWorker(
             progress.markOverwriteSameName()
         }
 
-        // A ticket for a different object can never continue this transfer's multipart upload.
-        val objectMoved = transfer.objectKey.isNotBlank() && ticket.objectKey != transfer.objectKey
+        // The OSS identity is frozen once and validated on every later attempt. A ticket that points
+        // somewhere else fails closed: the resumable task is preserved for explicit recovery or
+        // cancel, and nothing is deleted or re-uploaded under the new scope.
         val checkpointDirectory = transfer.checkpointDir.ifBlank {
             transferRepository.checkpointDirectoryPath(transfer.transferId)
         }
-
-        var working = transferStore.updateUpload(transfer.transferId) { current ->
-            current.copy(
-                bucket = ticket.bucket,
-                region = ticket.region,
-                objectKey = ticket.objectKey,
-                checkpointDir = checkpointDirectory,
-                uploadId = if (objectMoved) "" else current.uploadId,
-                notice = when {
-                    objectMoved -> current.notice
-                    sourceChanged -> TransferNotice.SOURCE_CHANGED
-                    else -> current.notice
-                },
-            )
-        } ?: transfer.copy(
-            bucket = ticket.bucket,
-            region = ticket.region,
-            objectKey = ticket.objectKey,
-            checkpointDir = checkpointDirectory,
+        val preparation = UploadSourceSnapshot.prepare(
+            current = transfer,
+            stats = stats,
+            ticket = ticket,
+            checkpointDirectory = checkpointDirectory,
         )
+        val plan = when (preparation) {
+            is UploadAttemptPreparation.Rejected -> {
+                Log.w(TAG, "OSS target changed for ${transfer.displayName}: ${preparation.field}")
+                return Result.success(
+                    failureData(
+                        transfer,
+                        progress,
+                        UploadTargetChangedException(
+                            preparation.field,
+                            "OSS target changed: ${preparation.field}",
+                        ),
+                    )
+                )
+            }
 
-        if (objectMoved) {
-            transferRepository.deleteCheckpointDirectory(checkpointDirectory)
+            is UploadAttemptPreparation.Accepted -> preparation.plan
         }
+        val persisted = transferStore.updateUpload(transfer.transferId) { current ->
+            // The plan was derived from this worker's own snapshot of the record, which is the only
+            // writer for this transfer while it runs; the phase stays whatever the store says so a
+            // queued pause is never reverted by a persistence step.
+            plan.transfer.copy(phase = current.phase)
+        } ?: plan.transfer
 
-        if (sourceChanged) {
+        if (plan.sourceChanged) {
             // The local file is not the one the checkpoint was built from: throw the old upload away
-            // instead of continuing it with bytes from a different revision.
+            // instead of continuing it with bytes from a different revision, and adopt the revision
+            // that is being uploaded now so the next resume of it is not invalidated again.
             Log.i(TAG, "Upload source changed for ${transfer.displayName}; restarting the upload")
-            abortQuietly(working, ticket, accessToken)
+            abortQuietly(transfer, ticket, accessToken)
             transferRepository.deleteCheckpointDirectory(checkpointDirectory)
-            working = transferStore.updateUpload(transfer.transferId) { current ->
-                current.copy(uploadId = "")
-            } ?: working
         }
 
-        val persisted = working
         val credentialProvider = TransferStsCredentialProvider(
             transfer = persisted,
             accessToken = accessToken,
@@ -222,7 +229,7 @@ class UploadWorker(
 
         // CompleteMultipartUpload returned: persist the metadata-pending phase before anything else,
         // so a retry after this point can only ever repeat the backend insert.
-        persistMetadataPending(persisted, ticket)
+        persistMetadataPending(persisted)
 
         transferRepository.deleteCheckpointDirectory(checkpointDirectory)
         uploadMetadata(persisted, accessToken)
@@ -290,17 +297,15 @@ class UploadWorker(
         }
     }
 
-    private suspend fun persistMetadataPending(transfer: UploadTransfer, ticket: OssStsToken) {
+    private suspend fun persistMetadataPending(transfer: UploadTransfer) {
         // NonCancellable: once completion was observed it must never be forgotten, not even when the
         // user cancels in this exact instant. The object is complete either way.
         withContext(NonCancellable) {
             transferStore.updateUpload(transfer.transferId) { current ->
                 current.copy(
                     phase = UploadPhase.METADATA_PENDING,
+                    // The multipart identity is done with, but the frozen OSS scope is kept as it is.
                     uploadId = "",
-                    bucket = ticket.bucket,
-                    region = ticket.region,
-                    objectKey = ticket.objectKey,
                     notice = TransferNotice.NONE,
                 )
             }
@@ -334,7 +339,11 @@ class UploadWorker(
                 language = AppLanguage.fromCode(transfer.language),
                 usage = OSS_USAGE_SINGLE_FILE_UPLOAD,
             )
-            abortQuietly(transfer, ticket, accessToken)
+            // Only abort inside the frozen scope: credentials for another object cannot abort this
+            // multipart upload, and issuing them would misreport the failure as "already gone".
+            if (UploadScopeGuard.mismatch(UploadTargetScope.of(transfer), ticket) == null) {
+                abortQuietly(transfer, ticket, accessToken)
+            }
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (throwable: Throwable) {
@@ -365,11 +374,6 @@ class UploadWorker(
         } catch (throwable: Throwable) {
             Log.w(TAG, "Unable to abort the multipart upload of ${transfer.displayName}", throwable)
         }
-    }
-
-    private fun sourceChanged(transfer: UploadTransfer, stats: UploadSourceStats): Boolean {
-        if (transfer.expectedSize > 0L && stats.size != transfer.expectedSize) return true
-        return transfer.lastModified > 0L && stats.lastModified > 0L && stats.lastModified != transfer.lastModified
     }
 
     /** Returns the failure when the worker could not be promoted, or `null` when it is safe to transfer. */
@@ -494,6 +498,7 @@ class UploadWorker(
 
     private fun Throwable.errorKind(): String = when (this) {
         is UploadForegroundException -> ERROR_KIND_FOREGROUND
+        is UploadTargetChangedException -> ERROR_KIND_TARGET_CHANGED
         is NotesServiceException.Business -> ERROR_KIND_BUSINESS
         is NotesServiceException.Http -> ERROR_KIND_HTTP
         is NotesServiceException.MissingBaseUrl -> ERROR_KIND_MISSING_BASE_URL
@@ -571,6 +576,13 @@ class UploadWorker(
         const val KEY_INPUT_TRANSFER_ID = "input_transfer_id"
         const val KEY_INPUT_ACCESS_TOKEN = "input_access_token"
 
+        /**
+         * Non-secret owner of the transfer this work was enqueued for. It binds the fallback session
+         * token to the account that created the work, so credentials of another signed-in account can
+         * never be used for it. No credentials are stored here.
+         */
+        const val KEY_INPUT_ACCOUNT_KEY = "input_account_key"
+
         const val KEY_PROGRESS_BATCH_ID = "progress_batch_id"
         const val KEY_PROGRESS_FILE_BYTES = "progress_file_bytes"
         const val KEY_PROGRESS_BATCH_TOTAL_BYTES = "progress_batch_total_bytes"
@@ -598,6 +610,7 @@ class UploadWorker(
         const val ERROR_KIND_BUSINESS = "business"
         const val ERROR_KIND_HTTP = "http"
         const val ERROR_KIND_MISSING_BASE_URL = "missingBaseUrl"
+        const val ERROR_KIND_TARGET_CHANGED = "targetChanged"
         const val ERROR_KIND_OTHER = "other"
 
         private const val TAG = "UploadWorker"

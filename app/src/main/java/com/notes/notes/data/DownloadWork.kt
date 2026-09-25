@@ -50,6 +50,9 @@ object DownloadWork {
                     workDataOf(
                         DownloadWorker.KEY_INPUT_TRANSFER_ID to transfer.transferId,
                         DownloadWorker.KEY_INPUT_ACCESS_TOKEN to accessToken,
+                        // Binds the fallback token to the owner that enqueued this work. No credentials
+                        // beyond the session token are ever placed in WorkManager data.
+                        DownloadWorker.KEY_INPUT_ACCOUNT_KEY to transfer.accountKey,
                     )
                 )
                 .setConstraints(
