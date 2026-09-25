@@ -297,11 +297,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun chooseUploadCandidates(candidates: List<UploadCandidate>) {
         // One upload batch must be resolved before files for the next one are picked. A file-picker
         // callback can arrive after the sheet was closed or after a batch started, so the rule cannot
-        // live in the UI alone. The ViewModel's own transfer state is authoritative here: the UI
-        // mirror in DiskScreenState is only updated asynchronously by the store collector, so it can
-        // still be empty for a moment after a batch was persisted. Foreign-account records are
-        // filtered out by `ownedUploadTransfers()` and never block the signed-in user.
-        if (ownedUploadTransfers().isNotEmpty()) {
+        // live in the UI alone. Two independent barriers apply: `isUploading` covers the window in
+        // which the batch was accepted but its transfer records are not persisted yet, and
+        // `ownedUploadTransfers()` covers persisted, paused and metadata-pending batches. The
+        // ViewModel's own transfer state is authoritative for the second one, because the UI mirror in
+        // DiskScreenState is only updated asynchronously by the store collector. Foreign-account
+        // records are filtered out by `ownedUploadTransfers()` and never block the signed-in user.
+        if (_uiState.value.disk.isUploading || ownedUploadTransfers().isNotEmpty()) {
             sendWarningMessage(strings().transfers.resolveBatchFirst)
             return
         }
@@ -653,56 +655,101 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             val fileBytes = candidates.map { it.sizeBytes.coerceAtLeast(1L) }
             val batchTotalBytes = fileBytes.sum()
 
+            // A new batch is decided here, so the "one batch at a time" rule has to take effect before
+            // the first suspending step below: until the transfers are persisted and mirrored, a stale
+            // or very fast file-picker callback could otherwise still append candidates to a second
+            // batch. Nothing has been created yet, so a failure on the startup path rolls this back.
+            _uiState.update { it.copy(disk = it.disk.copy(isUploading = true, uploadProgress = 0f)) }
+
             // The transfer target is frozen here: every later credential refresh and metadata commit
             // reuses these values, never the directory the user happens to be browsing later.
-            val transfers = withContext(Dispatchers.IO) {
-                candidates.mapIndexed { index, candidate ->
-                    val sourceUri = Uri.parse(candidate.uriString)
-                    val transferId = UUID.randomUUID().toString()
-                    UploadTransfer(
-                        transferId = transferId,
-                        accountKey = session.username,
-                        sourceUri = candidate.uriString,
-                        displayName = candidate.displayName,
-                        expectedSize = candidate.sizeBytes,
-                        lastModified = transferRepository.resolveSourceLastModified(sourceUri),
-                        parentId = path.id,
-                        pathString = pathString,
-                        language = language.code,
-                        batchId = batchId,
-                        batchTotalBytes = batchTotalBytes,
-                        fileBytes = fileBytes[index],
-                        checkpointDir = transferRepository.checkpointDirectoryPath(transferId),
-                        phase = UploadPhase.TRANSFERRING,
-                        bucket = "",
-                        region = "",
-                        objectKey = "",
-                        uploadId = "",
-                        notice = TransferNotice.NONE,
-                        createdAt = createdAt,
-                        transferredBytes = 0L,
-                    )
+            val transfers = try {
+                withContext(Dispatchers.IO) {
+                    candidates.mapIndexed { index, candidate ->
+                        val sourceUri = Uri.parse(candidate.uriString)
+                        val transferId = UUID.randomUUID().toString()
+                        UploadTransfer(
+                            transferId = transferId,
+                            accountKey = session.username,
+                            sourceUri = candidate.uriString,
+                            displayName = candidate.displayName,
+                            expectedSize = candidate.sizeBytes,
+                            lastModified = transferRepository.resolveSourceLastModified(sourceUri),
+                            parentId = path.id,
+                            pathString = pathString,
+                            language = language.code,
+                            batchId = batchId,
+                            batchTotalBytes = batchTotalBytes,
+                            fileBytes = fileBytes[index],
+                            checkpointDir = transferRepository.checkpointDirectoryPath(transferId),
+                            phase = UploadPhase.TRANSFERRING,
+                            bucket = "",
+                            region = "",
+                            objectKey = "",
+                            uploadId = "",
+                            notice = TransferNotice.NONE,
+                            createdAt = createdAt,
+                            transferredBytes = 0L,
+                        )
+                    }
                 }
+            } catch (cancellation: CancellationException) {
+                rollBackUploadStartup()
+                throw cancellation
+            } catch (throwable: Throwable) {
+                rollBackUploadStartup()
+                sendThrowableMessage(throwable)
+                return@launch
             }
 
             // Marked before the record is stored: until the work item shows up, a missing work item
             // must not be mistaken for "stopped".
             markRecentlyEnqueued(transfers.map { it.transferId })
             // Persisted before the work is enqueued, so a crash cannot leave untracked uploads.
-            transferStore.addUploads(transfers)
+            try {
+                transferStore.addUploads(transfers)
+            } catch (cancellation: CancellationException) {
+                rollBackUploadStartup()
+                throw cancellation
+            } catch (throwable: Throwable) {
+                // Nothing was persisted, so no batch exists and no partial in-memory state was set.
+                rollBackUploadStartup()
+                sendThrowableMessage(throwable)
+                return@launch
+            }
             // Mirrored immediately so permission cleanup never believes these documents are unused.
             uploadTransfers = uploadTransfers + transfers
             uploadBatchId = batchId
             uploadBatchTotalBytes = batchTotalBytes
-            _uiState.update { it.copy(disk = it.disk.copy(isUploading = true, uploadProgress = 0f)) }
             // WorkManager owns the transfer from here on, so it survives backgrounding and process death.
-            val batch = UploadWork.enqueue(
-                context = getApplication(),
-                accessToken = session.accessToken,
-                transfers = transfers,
-            )
+            val batch = try {
+                UploadWork.enqueue(
+                    context = getApplication(),
+                    accessToken = session.accessToken,
+                    transfers = transfers,
+                )
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                // The records are persisted, so the batch stays as a recoverable, resumable transfer;
+                // only the "uploading right now" claim is rolled back instead of hiding it.
+                rollBackUploadStartup()
+                sendThrowableMessage(throwable)
+                return@launch
+            }
             uploadBatchWorkIds = batch?.workIds.orEmpty()
         }
+    }
+
+    /**
+     * Undoes the optimistic uploading state of a batch that could not be established.
+     *
+     * Only the progress flags are restored: persisted transfers, their mirror and the frozen batch
+     * identity are never discarded here, because they are exactly what makes a failed batch
+     * recoverable.
+     */
+    private fun rollBackUploadStartup() {
+        _uiState.update { it.copy(disk = it.disk.copy(isUploading = false, uploadProgress = 0f)) }
     }
 
     /** Pauses every transfer of the current upload batch. Pausing never aborts the multipart upload. */
