@@ -633,7 +633,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             val strings = strings()
             val state = _uiState.value
-            if (state.disk.transferActionBusy) return@launch
+            if (state.disk.transferActionBusy || state.disk.isUploading) return@launch
             if (state.disk.uploadTransfers.any { it.phase == UploadPhase.TRANSFERRING }) return@launch
             val session = activeSession() ?: return@launch
             val path = currentPath() ?: return@launch
@@ -731,9 +731,44 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (throwable: Throwable) {
-                // The records are persisted, so the batch stays as a recoverable, resumable transfer;
-                // only the "uploading right now" claim is rolled back instead of hiding it.
+                // The transfer records already exist, but WorkManager failed to take ownership.
+                // Stop any work that may have been partially enqueued, then expose the batch as PAUSED
+                // so the user can explicitly resume it later.
+                val transferIds = transfers.map(UploadTransfer::transferId)
+
+                runCatching {
+                    awaitWorkCancellations(
+                        UploadWork.cancelTransfers(
+                            getApplication(),
+                            transferIds,
+                        )
+                    )
+                }
+
+                transfers.forEach { transfer ->
+                    transferStore.updateUpload(transfer.transferId) { current ->
+                        if (current.phase == UploadPhase.TRANSFERRING) {
+                            current.copy(phase = UploadPhase.PAUSED)
+                        } else {
+                            current
+                        }
+                    }
+                }
+
+                val failedIds = transferIds.toSet()
+                uploadTransfers = uploadTransfers.map { current ->
+                    if (
+                        current.transferId in failedIds &&
+                        current.phase == UploadPhase.TRANSFERRING
+                    ) {
+                        current.copy(phase = UploadPhase.PAUSED)
+                    } else {
+                        current
+                    }
+                }
+
                 rollBackUploadStartup()
+                refreshTransferUi()
                 sendThrowableMessage(throwable)
                 return@launch
             }

@@ -884,7 +884,7 @@ private fun UploadBottomSheet(
                         SecondaryActionButton(
                             label = strings.fileDisk.clearSelectedFiles,
                             modifier = Modifier.weight(1f),
-                            enabled = !transferActionBusy,
+                            enabled = !transferActionBusy && !isUploading,
                             onClick = onClearCandidates,
                         )
                     }
@@ -907,7 +907,7 @@ private fun UploadBottomSheet(
                         PrimaryActionButton(
                             label = strings.common.upload,
                             modifier = Modifier.weight(2f),
-                            enabled = !transferActionBusy,
+                            enabled = !transferActionBusy && !isUploading,
                             onClick = onUpload,
                         )
                     }
