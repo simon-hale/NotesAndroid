@@ -115,6 +115,18 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      */
     private val recentlyEnqueuedTransfers = mutableMapOf<String, Long>()
 
+    /**
+     * Prevents transfer reconciliation from recreating work while the current account is being torn
+     * down by logout, password change, account deletion or rejected automatic login.
+     */
+    private var sessionResetInProgress = false
+
+    /**
+     * WorkManager and TransferStore collectors can both notice the same orphaned METADATA_PENDING record.
+     * Only one recovery pass may enqueue replacement work at a time.
+     */
+    private var metadataRecoveryInProgress = false
+
     private val handledDownloadWorkIds = mutableSetOf<UUID>()
     private val downloadWorkStates = mutableMapOf<UUID, WorkInfo.State>()
 
@@ -126,6 +138,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 preferencesStore.preferences.collect { applyStoredPreferences(it) }
             }
             cleanupStaleUploadUriPermissions()
+            cleanupStaleDownloadDestinations()
             bootstrap(initial.savedUsername, initial.savedAccessToken)
         }
         observeUploadWork()
@@ -1384,102 +1397,128 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * again.
      */
     private suspend fun recoverMetadataPendingUploads() {
-        val session =
-            activeSession()
-                ?: return
-
-        val candidates =
-            transferStore.uploadsOnce()
-                .filter { transfer ->
-                    isOwnedByActiveSession(
-                        transfer.accountKey
-                    ) &&
-                            transfer.phase ==
-                            UploadPhase.METADATA_PENDING
-                }
-
-        if (candidates.isEmpty()) {
-            return
-        }
-
         /*
-         * Read WorkManager directly rather than relying only on the ViewModel's asynchronously updated
-         * snapshot. This avoids enqueueing a duplicate merely because the collector has not delivered the
-         * latest WorkInfo yet.
+         * Never recreate background work while this account is deliberately being torn down.
+         *
+         * Also serialize recovery passes: both WorkManager and TransferStore observers can notice the same
+         * missing worker nearly simultaneously.
          */
-        val liveTransferIds =
-            UploadWork.workInfos(
-                getApplication()
-            )
-                .first()
-                .filterNot { info ->
-                    info.state.isFinished
-                }
-                .mapNotNull(
-                    UploadWork::transferId
-                )
-                .toSet()
-
-        val missingWork =
-            candidates.filter { transfer ->
-                transfer.transferId !in
-                        liveTransferIds
-            }
-
-        if (missingWork.isEmpty()) {
+        if (
+            sessionResetInProgress ||
+            metadataRecoveryInProgress
+        ) {
             return
         }
 
-        val transferIds =
-            missingWork.map(
-                UploadTransfer::transferId
-            )
-
-        markRecentlyEnqueued(
-            transferIds
-        )
+        metadataRecoveryInProgress = true
 
         try {
-            val enqueued =
-                UploadWork.enqueue(
-                    context = getApplication(),
-                    accessToken =
-                        session.accessToken,
-                    transfers = missingWork,
-                )
+            val session =
+                activeSession()
+                    ?: return
 
-            if (enqueued != null) {
-                uploadBatchWorkIds =
-                    uploadBatchWorkIds +
-                            enqueued.workIds
+            val candidates =
+                transferStore.uploadsOnce()
+                    .filter { transfer ->
+                        isOwnedByActiveSession(
+                            transfer.accountKey
+                        ) &&
+                                transfer.phase ==
+                                UploadPhase.METADATA_PENDING
+                    }
+
+            if (candidates.isEmpty()) {
+                return
             }
-        } catch (cancellation: CancellationException) {
-            transferIds.forEach { transferId ->
-                recentlyEnqueuedTransfers.remove(
-                    transferId
-                )
-            }
-            throw cancellation
-        } catch (throwable: Throwable) {
+
             /*
-             * Keep the METADATA_PENDING records untouched. They remain the recovery source and another
-             * login/reconciliation pass may retry them.
+             * Read WorkManager directly instead of relying on the asynchronously updated ViewModel mirror.
+             * A metadata worker that already exists must never be unnecessarily replaced.
              */
-            transferIds.forEach { transferId ->
-                recentlyEnqueuedTransfers.remove(
-                    transferId
+            val liveTransferIds =
+                UploadWork.workInfos(
+                    getApplication()
                 )
+                    .first()
+                    .filterNot { info ->
+                        info.state.isFinished
+                    }
+                    .mapNotNull(
+                        UploadWork::transferId
+                    )
+                    .toSet()
+
+            val missingWork =
+                candidates.filter { transfer ->
+                    transfer.transferId !in
+                            liveTransferIds
+                }
+
+            if (missingWork.isEmpty()) {
+                return
             }
 
-            Log.w(
-                TAG,
-                "Unable to restore metadata-pending upload work",
-                throwable,
+            val transferIds =
+                missingWork.map(
+                    UploadTransfer::transferId
+                )
+
+            markRecentlyEnqueued(
+                transferIds
             )
+
+            try {
+                val enqueued =
+                    UploadWork.enqueue(
+                        context = getApplication(),
+                        accessToken =
+                            session.accessToken,
+                        transfers = missingWork,
+                    )
+
+                if (enqueued != null) {
+                    uploadBatchWorkIds =
+                        uploadBatchWorkIds +
+                                enqueued.workIds
+                }
+            } catch (cancellation: CancellationException) {
+                transferIds.forEach { transferId ->
+                    recentlyEnqueuedTransfers.remove(
+                        transferId
+                    )
+                }
+                throw cancellation
+            } catch (throwable: Throwable) {
+                /*
+                 * Keep every METADATA_PENDING record. A future reconciliation/login can retry metadata-only
+                 * recovery without ever uploading the OSS object again.
+                 */
+                transferIds.forEach { transferId ->
+                    recentlyEnqueuedTransfers.remove(
+                        transferId
+                    )
+                }
+
+                Log.w(
+                    TAG,
+                    "Unable to restore metadata-pending upload work",
+                    throwable,
+                )
+            }
+        } finally {
+            metadataRecoveryInProgress = false
         }
     }
 
     private fun reconcileUploadPhases() {
+        /*
+         * WorkManager cancellation itself emits new snapshots. While a session reset is deliberately
+         * cancelling work, those snapshots must not be interpreted as missing work requiring recovery.
+         */
+        if (sessionResetInProgress) {
+            return
+        }
+
         val now =
             System.currentTimeMillis()
 
@@ -2996,280 +3035,293 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         departingAccountOverride: String? = null,
         attemptRemoteAbort: Boolean = true,
     ) {
-        val cacheFilesToDelete =
-            _uiState.value.reading.activeCacheFiles
-
-        val departingAccount =
-            departingAccountOverride
-                ?.takeIf { it.isNotBlank() }
-                ?: _uiState.value.session.username
-
-        /*
-         * Capture the current in-memory token before SessionState is reset. This is useful for normal
-         * local logout. During rejected auto-login cleanup attemptRemoteAbort is false.
-         */
-        val departingAccessToken =
-            _uiState.value.session.accessToken
-                .takeIf { it.isNotBlank() }
-
-        /*
-         * Read from persistent storage rather than from the UI mirror, because startup cleanup may happen
-         * before collectors have projected these records.
-         */
-        val uploadSnapshot =
-            transferStore.uploadsOnce()
-                .filter { transfer ->
-                    belongsToDepartingAccount(
-                        transfer.accountKey,
-                        departingAccount,
-                    )
-                }
-
-        val downloadSnapshot =
-            transferStore.downloadsOnce()
-                .filter { transfer ->
-                    belongsToDepartingAccount(
-                        transfer.accountKey,
-                        departingAccount,
-                    )
-                }
-
-        uploadWorkStates.clear()
-        overwriteWarnedUploads.clear()
-        handledUploadWorkIds.clear()
-        handledDownloadWorkIds.clear()
-        recentlyEnqueuedTransfers.clear()
-
-        uploadBatchId = null
-        uploadBatchTotalBytes = 0L
-        uploadBatchWorkIds = emptySet()
-
-        /*
-         * Stop every departing WorkManager item first, including metadata-only uploads.
-         *
-         * The atomic DataStore phase check happens only after workers have been asked to stop, which
-         * greatly narrows the completion race.
-         */
-        awaitWorkCancellations(
-            UploadWork.cancelTransfers(
-                getApplication(),
-                uploadSnapshot.map(
-                    UploadTransfer::transferId
-                ),
-            )
-        )
-
-        downloadSnapshot.forEach { transfer ->
-            awaitDownloadCancellation(
-                DownloadWork.cancelTransfer(
-                    getApplication(),
-                    transfer.transferId,
-                )
-            )
+        if (sessionResetInProgress) {
+            return
         }
 
-        /*
-         * Re-check CURRENT upload phase inside DataStore.
-         *
-         * A transfer that changed to METADATA_PENDING while cancellation was racing is preserved rather
-         * than accidentally removed.
-         */
-        val removedUploads =
-            transferStore.removeCancellableUploads(
-                uploadSnapshot.map(
-                    UploadTransfer::transferId
+        sessionResetInProgress = true
+
+        try {
+            val cacheFilesToDelete =
+                _uiState.value.reading.activeCacheFiles
+
+            val departingAccount =
+                departingAccountOverride
+                    ?.takeIf { it.isNotBlank() }
+                    ?: _uiState.value.session.username
+
+            /*
+             * Capture the current in-memory token before SessionState is reset. This is useful for normal
+             * local logout. During rejected auto-login cleanup attemptRemoteAbort is false.
+             */
+            val departingAccessToken =
+                _uiState.value.session.accessToken
+                    .takeIf { it.isNotBlank() }
+
+            /*
+             * Read from persistent storage rather than from the UI mirror, because startup cleanup may happen
+             * before collectors have projected these records.
+             */
+            val uploadSnapshot =
+                transferStore.uploadsOnce()
+                    .filter { transfer ->
+                        belongsToDepartingAccount(
+                            transfer.accountKey,
+                            departingAccount,
+                        )
+                    }
+
+            val downloadSnapshot =
+                transferStore.downloadsOnce()
+                    .filter { transfer ->
+                        belongsToDepartingAccount(
+                            transfer.accountKey,
+                            departingAccount,
+                        )
+                    }
+
+            uploadWorkStates.clear()
+            overwriteWarnedUploads.clear()
+            handledUploadWorkIds.clear()
+            handledDownloadWorkIds.clear()
+            recentlyEnqueuedTransfers.clear()
+
+            uploadBatchId = null
+            uploadBatchTotalBytes = 0L
+            uploadBatchWorkIds = emptySet()
+
+            /*
+             * Stop every departing WorkManager item first, including metadata-only uploads.
+             *
+             * The atomic DataStore phase check happens only after workers have been asked to stop, which
+             * greatly narrows the completion race.
+             */
+            awaitWorkCancellations(
+                UploadWork.cancelTransfers(
+                    getApplication(),
+                    uploadSnapshot.map(
+                        UploadTransfer::transferId
+                    ),
                 )
             )
 
-        /*
-         * Downloads have no equivalent metadata-only state. The returned list matters: a download that
-         * completed and removed its record just before cancellation is now a completed user file and must
-         * not be deleted as though it were still a temporary download.
-         */
-        val removedDownloads =
-            transferStore.removeDownloads(
-                downloadSnapshot.map(
-                    DownloadTransfer::transferId
+            downloadSnapshot.forEach { transfer ->
+                awaitDownloadCancellation(
+                    DownloadWork.cancelTransfer(
+                        getApplication(),
+                        transfer.transferId,
+                    )
                 )
-            )
-
-        /*
-         * Reload the authoritative store after mutation. This retains foreign-account transfers and any
-         * newly preserved METADATA_PENDING record.
-         */
-        uploadTransfers =
-            transferStore.uploadsOnce()
-
-        downloadTransfers =
-            transferStore.downloadsOnce()
-
-        val preservedMetadataUploads =
-            uploadTransfers.filter { transfer ->
-                belongsToDepartingAccount(
-                    transfer.accountKey,
-                    departingAccount,
-                ) &&
-                        transfer.phase ==
-                        UploadPhase.METADATA_PENDING
             }
 
-        withContext(Dispatchers.IO) {
             /*
-             * Normal logout may still have a usable token and can clean the remote multipart immediately.
+             * Re-check CURRENT upload phase inside DataStore.
              *
-             * Rejected auto-login skips this because the token is known invalid. Local deletion remains
-             * authoritative and the incomplete-multipart lifecycle rule handles any remote leftovers.
+             * A transfer that changed to METADATA_PENDING while cancellation was racing is preserved rather
+             * than accidentally removed.
              */
-            if (
-                attemptRemoteAbort &&
-                !departingAccessToken.isNullOrBlank()
-            ) {
-                withTimeoutOrNull(
-                    LOGOUT_ABORT_TIMEOUT_MILLIS
+            val removedUploads =
+                transferStore.removeCancellableUploads(
+                    uploadSnapshot.map(
+                        UploadTransfer::transferId
+                    )
+                )
+
+            /*
+             * Downloads have no equivalent metadata-only state. The returned list matters: a download that
+             * completed and removed its record just before cancellation is now a completed user file and must
+             * not be deleted as though it were still a temporary download.
+             */
+            val removedDownloads =
+                transferStore.removeDownloads(
+                    downloadSnapshot.map(
+                        DownloadTransfer::transferId
+                    )
+                )
+
+            /*
+             * Reload the authoritative store after mutation. This retains foreign-account transfers and any
+             * newly preserved METADATA_PENDING record.
+             */
+            uploadTransfers =
+                transferStore.uploadsOnce()
+
+            downloadTransfers =
+                transferStore.downloadsOnce()
+
+            val preservedMetadataUploads =
+                uploadTransfers.filter { transfer ->
+                    belongsToDepartingAccount(
+                        transfer.accountKey,
+                        departingAccount,
+                    ) &&
+                            transfer.phase ==
+                            UploadPhase.METADATA_PENDING
+                }
+
+            withContext(Dispatchers.IO) {
+                /*
+                 * Normal logout may still have a usable token and can clean the remote multipart immediately.
+                 *
+                 * Rejected auto-login skips this because the token is known invalid. Local deletion remains
+                 * authoritative and the incomplete-multipart lifecycle rule handles any remote leftovers.
+                 */
+                if (
+                    attemptRemoteAbort &&
+                    !departingAccessToken.isNullOrBlank()
                 ) {
-                    removedUploads.forEach { transfer ->
-                        if (
-                            transfer.uploadId.isBlank() ||
-                            transfer.objectKey.isBlank()
-                        ) {
-                            return@forEach
-                        }
+                    withTimeoutOrNull(
+                        LOGOUT_ABORT_TIMEOUT_MILLIS
+                    ) {
+                        removedUploads.forEach { transfer ->
+                            if (
+                                transfer.uploadId.isBlank() ||
+                                transfer.objectKey.isBlank()
+                            ) {
+                                return@forEach
+                            }
 
-                        try {
-                            val ticket =
-                                backendService.requestOssSts(
-                                    accessToken =
-                                        departingAccessToken,
-                                    pathString =
-                                        transfer.pathString,
-                                    filename =
-                                        transfer.displayName,
-                                    parentId =
-                                        transfer.parentId,
-                                    language =
-                                        AppLanguage.fromCode(
-                                            transfer.language
-                                        ),
-                                    usage =
-                                        OSS_USAGE_SINGLE_FILE_UPLOAD,
-                                )
-
-                            transferRepository.abortMultipartUpload(
-                                ticket = ticket,
-                                objectKey =
-                                    transfer.objectKey,
-                                uploadId =
-                                    transfer.uploadId,
-                                credentialProvider =
-                                    TransferStsCredentialProvider(
-                                        transfer =
-                                            transfer,
+                            try {
+                                val ticket =
+                                    backendService.requestOssSts(
                                         accessToken =
                                             departingAccessToken,
-                                        backendService =
-                                            backendService,
-                                        firstTicket =
-                                            ticket,
-                                    ),
-                            )
-                        } catch (cancellation: CancellationException) {
-                            throw cancellation
-                        } catch (throwable: Throwable) {
-                            Log.w(
-                                TAG,
-                                "Best-effort multipart cleanup failed while ending session for ${transfer.displayName}",
-                                throwable,
-                            )
+                                        pathString =
+                                            transfer.pathString,
+                                        filename =
+                                            transfer.displayName,
+                                        parentId =
+                                            transfer.parentId,
+                                        language =
+                                            AppLanguage.fromCode(
+                                                transfer.language
+                                            ),
+                                        usage =
+                                            OSS_USAGE_SINGLE_FILE_UPLOAD,
+                                    )
+
+                                transferRepository.abortMultipartUpload(
+                                    ticket = ticket,
+                                    objectKey =
+                                        transfer.objectKey,
+                                    uploadId =
+                                        transfer.uploadId,
+                                    credentialProvider =
+                                        TransferStsCredentialProvider(
+                                            transfer =
+                                                transfer,
+                                            accessToken =
+                                                departingAccessToken,
+                                            backendService =
+                                                backendService,
+                                            firstTicket =
+                                                ticket,
+                                        ),
+                                )
+                            } catch (cancellation: CancellationException) {
+                                throw cancellation
+                            } catch (throwable: Throwable) {
+                                Log.w(
+                                    TAG,
+                                    "Best-effort multipart cleanup failed while ending session for ${transfer.displayName}",
+                                    throwable,
+                                )
+                            }
                         }
                     }
                 }
+
+                /*
+                 * Local resumable state always disappears for transfers that were actually removed.
+                 */
+                removedUploads.forEach { transfer ->
+                    transferRepository
+                        .deleteCheckpointDirectory(
+                            transfer.checkpointDir
+                        )
+                }
+
+                /*
+                 * A metadata-pending record no longer needs its OSS checkpoint. Keep only the tiny recovery
+                 * record itself.
+                 */
+                preservedMetadataUploads.forEach { transfer ->
+                    transferRepository
+                        .deleteCheckpointDirectory(
+                            transfer.checkpointDir
+                        )
+                }
+
+                /*
+                 * Delete only destinations whose persistent transfer records were actually removed.
+                 *
+                 * If a download completed just before cancellation and its worker already removed the record,
+                 * its published local file is deliberately left untouched.
+                 */
+                removedDownloads.forEach { transfer ->
+                    transferRepository
+                        .deleteDownloadDestination(
+                            transfer.destinationUri
+                        )
+                }
             }
 
             /*
-             * Local resumable state always disappears for transfers that were actually removed.
+             * Reset every user-visible account/session state. Theme/language stay because they are device
+             * preferences rather than authenticated account content.
              */
-            removedUploads.forEach { transfer ->
-                transferRepository
-                    .deleteCheckpointDirectory(
-                        transfer.checkpointDir
-                    )
-            }
-
-            /*
-             * A metadata-pending record no longer needs its OSS checkpoint. Keep only the tiny recovery
-             * record itself.
-             */
-            preservedMetadataUploads.forEach { transfer ->
-                transferRepository
-                    .deleteCheckpointDirectory(
-                        transfer.checkpointDir
-                    )
-            }
-
-            /*
-             * Delete only destinations whose persistent transfer records were actually removed.
-             *
-             * If a download completed just before cancellation and its worker already removed the record,
-             * its published local file is deliberately left untouched.
-             */
-            removedDownloads.forEach { transfer ->
-                transferRepository
-                    .deleteDownloadDestination(
-                        transfer.destinationUri
-                    )
-            }
-        }
-
-        /*
-         * Reset every user-visible account/session state. Theme/language stay because they are device
-         * preferences rather than authenticated account content.
-         */
-        _uiState.update { state ->
-            state.copy(
-                bootstrapping = false,
-                accountBusy = false,
-                session = SessionState(),
-                currentTab = AppTab.ACCOUNT,
-                tabBackStack = emptyList(),
-                settingsSubPage =
-                    SettingsSubPage.ROOT,
-                disk = DiskScreenState(),
-                reading =
-                    ReadingScreenState(),
-            )
-        }
-
-        /*
-         * Work snapshots from the departed session must no longer keep SAF permissions alive.
-         */
-        uploadWorkInfos = emptyList()
-        downloadWorkInfos = emptyList()
-
-        /*
-         * Source permissions of deleted transfers and picker candidates are now released. Foreign
-         * transfers still present in uploadTransfers continue protecting their own source documents.
-         */
-        val releaseFailures =
-            releaseUnusedUploadPermissions()
-
-        cleanupPreviewCacheFiles(
-            cacheFilesToDelete
-        )
-
-        previewRepository
-            .clearAllPreviewCache()
-
-        invalidateDiskRequests()
-
-        if (releaseFailures.isNotEmpty()) {
-            sendErrorMessage(
-                bulkReleaseUploadPermissionFailedMessage(
-                    count =
-                        releaseFailures.size,
-                    throwable =
-                        releaseFailures.first(),
+            _uiState.update { state ->
+                state.copy(
+                    bootstrapping = false,
+                    accountBusy = false,
+                    session = SessionState(),
+                    currentTab = AppTab.ACCOUNT,
+                    tabBackStack = emptyList(),
+                    settingsSubPage =
+                        SettingsSubPage.ROOT,
+                    disk = DiskScreenState(),
+                    reading =
+                        ReadingScreenState(),
                 )
+            }
+
+            /*
+             * Work snapshots from the departed session must no longer keep SAF permissions alive.
+             */
+            uploadWorkInfos = emptyList()
+            downloadWorkInfos = emptyList()
+
+            /*
+             * Source permissions of deleted transfers and picker candidates are now released. Foreign
+             * transfers still present in uploadTransfers continue protecting their own source documents.
+             */
+            val releaseFailures =
+                releaseUnusedUploadPermissions()
+
+            cleanupPreviewCacheFiles(
+                cacheFilesToDelete
             )
+
+            previewRepository
+                .clearAllPreviewCache()
+
+            invalidateDiskRequests()
+
+            if (releaseFailures.isNotEmpty()) {
+                sendErrorMessage(
+                    bulkReleaseUploadPermissionFailedMessage(
+                        count =
+                            releaseFailures.size,
+                        throwable =
+                            releaseFailures.first(),
+                    )
+                )
+            }
+        } finally {
+            /*
+             * Re-enable normal reconciliation even when one of the best-effort cleanup operations throws.
+             */
+            sessionResetInProgress = false
         }
     }
 
@@ -3328,6 +3380,40 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 staleUploadPermissionCleanupFailedMessage(
                     throwable = failures.first(),
                 )
+            )
+        }
+    }
+
+    /**
+     * Reconciles pending MediaStore downloads against the persistent DownloadTransfer store.
+     *
+     * A referenced pending destination is resumable and must stay. An unreferenced pending destination
+     * cannot be resumed by any worker and is safe to remove.
+     */
+    private suspend fun cleanupStaleDownloadDestinations() {
+        val referencedDestinationUris =
+            transferStore.downloadsOnce()
+                .mapTo(
+                    mutableSetOf(),
+                    DownloadTransfer::destinationUri,
+                )
+
+        val failureCount =
+            withContext(Dispatchers.IO) {
+                transferRepository
+                    .cleanupOrphanPendingDownloadDestinations(
+                        referencedDestinationUris
+                    )
+            }
+
+        if (failureCount > 0) {
+            /*
+             * Do not bother the user during startup for a hidden temporary-file cleanup failure.
+             * The same rows remain pending and are retried automatically next launch.
+             */
+            Log.w(
+                TAG,
+                "Unable to clean $failureCount orphan pending download destination(s)",
             )
         }
     }

@@ -405,7 +405,9 @@ class DownloadWorker(
                 .build()
 
         return ForegroundInfo(
-            NOTIFICATION_ID,
+            notificationId(
+                transfer.transferId
+            ),
             notification,
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
         )
@@ -552,7 +554,17 @@ class DownloadWorker(
         private const val WORK_PROGRESS_INTERVAL_MILLIS = 500L
         private const val FOREGROUND_PROMOTION_TIMEOUT_MILLIS = 30_000L
         private const val NOTIFICATION_CHANNEL_ID = "notes-file-download"
-        private const val NOTIFICATION_ID = 1002
+
+        private fun notificationId(
+            transferId: String,
+        ): Int =
+            DOWNLOAD_NOTIFICATION_NAMESPACE or
+                    (
+                            transferId.hashCode() and
+                                    NOTIFICATION_ID_MASK
+                            )
+        private const val DOWNLOAD_NOTIFICATION_NAMESPACE = 0x20000000
+        private const val NOTIFICATION_ID_MASK = 0x0FFFFFFF
         private const val PROGRESS_MAX = 100
         private const val MAX_ERROR_DETAIL_LENGTH = 200
     }

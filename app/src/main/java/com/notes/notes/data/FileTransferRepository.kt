@@ -526,6 +526,111 @@ class FileTransferRepository(
         }.getOrDefault(false)
     }
 
+    /**
+     * Removes app-owned pending Download/Notes MediaStore rows that no longer have a persistent
+     * DownloadTransfer referring to them.
+     *
+     * This is the final fallback for cases such as:
+     * - process death after MediaStore insertion but before TransferStore persistence;
+     * - MediaStore deletion temporarily failing after a transfer record was already removed;
+     * - an older buggy client leaving a pending row behind.
+     *
+     * Completed downloads are never touched because only IS_PENDING = 1 rows are considered.
+     *
+     * Returns the number of orphan rows that could not be removed. Those rows remain pending and will be
+     * retried on a later app startup.
+     */
+    fun cleanupOrphanPendingDownloadDestinations(
+        referencedDestinationUris: Set<String>,
+    ): Int {
+        val resolver =
+            context.contentResolver
+
+        val projection =
+            arrayOf(
+                MediaStore.Downloads._ID,
+            )
+
+        val queryArgs =
+            Bundle().apply {
+                putString(
+                    ContentResolver
+                        .QUERY_ARG_SQL_SELECTION,
+                    "${MediaStore.Downloads.RELATIVE_PATH} LIKE ? AND " +
+                            "${MediaStore.Downloads.IS_PENDING} = 1",
+                )
+
+                putStringArray(
+                    ContentResolver
+                        .QUERY_ARG_SQL_SELECTION_ARGS,
+                    arrayOf(
+                        "$downloadRelativePath%"
+                    ),
+                )
+
+                /*
+                 * Pending rows are normally hidden by MediaStore. Explicitly include them so app-owned
+                 * unfinished destinations can be reconciled.
+                 */
+                putInt(
+                    MediaStore.QUERY_ARG_MATCH_PENDING,
+                    MediaStore.MATCH_INCLUDE,
+                )
+            }
+
+        /*
+         * Collect first and close the query before deleting rows. Some providers do not behave well when
+         * their active cursor is mutated underneath them.
+         */
+        val orphanUris =
+            runCatching {
+                resolver.query(
+                    MediaStore.Downloads
+                        .EXTERNAL_CONTENT_URI,
+                    projection,
+                    queryArgs,
+                    null,
+                )?.use { cursor ->
+                    val idIndex =
+                        cursor.getColumnIndexOrThrow(
+                            MediaStore.Downloads._ID
+                        )
+
+                    buildList {
+                        while (cursor.moveToNext()) {
+                            val uri =
+                                ContentUris
+                                    .withAppendedId(
+                                        MediaStore.Downloads
+                                            .EXTERNAL_CONTENT_URI,
+                                        cursor.getLong(
+                                            idIndex
+                                        ),
+                                    )
+                                    .toString()
+
+                            if (
+                                uri !in
+                                referencedDestinationUris
+                            ) {
+                                add(uri)
+                            }
+                        }
+                    }
+                }.orEmpty()
+            }.getOrElse {
+                /*
+                 * A failed reconciliation query must never make startup destructive. Simply retry on the
+                 * next launch.
+                 */
+                return 0
+            }
+
+        return orphanUris.count { uri ->
+            !deleteDownloadDestination(uri)
+        }
+    }
+
     suspend fun listDownloadedFiles(): List<DownloadedFileEntry> = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
         val projection = arrayOf(

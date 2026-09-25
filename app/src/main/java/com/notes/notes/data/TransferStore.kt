@@ -167,6 +167,78 @@ class TransferStore(private val context: Context) {
 
         return removed
     }
+
+    /**
+     * Persists the irreversible transition that follows a successful CompleteMultipartUpload.
+     *
+     * If the transfer still exists, its latest record is promoted to METADATA_PENDING.
+     * If a destructive action removed the record in the tiny window after OSS completion but before
+     * this state was persisted, the worker restores a metadata-only recovery record from [snapshot].
+     *
+     * Once OSS completion has succeeded, losing this record would leave a complete object with no
+     * backend file row and no local recovery path.
+     */
+    suspend fun markMetadataPendingOrRestore(
+        snapshot: UploadTransfer,
+    ): UploadTransfer {
+        var result =
+            snapshot.copy(
+                phase = UploadPhase.METADATA_PENDING,
+                uploadId = "",
+                notice = TransferNotice.NONE,
+            )
+
+        context.transfersDataStore.edit { preferences ->
+            val current =
+                decodeUploads(
+                    preferences[Keys.uploads]
+                )
+
+            val index =
+                current.indexOfFirst { transfer ->
+                    transfer.transferId ==
+                            snapshot.transferId
+                }
+
+            if (index >= 0) {
+                /*
+                 * Preserve the newest persisted fields, including transferred bytes and any source
+                 * snapshot updates made by the running worker.
+                 */
+                val updated =
+                    current[index].copy(
+                        phase =
+                            UploadPhase.METADATA_PENDING,
+                        uploadId = "",
+                        notice =
+                            TransferNotice.NONE,
+                    )
+
+                result = updated
+
+                preferences[Keys.uploads] =
+                    encodeUploads(
+                        current
+                            .toMutableList()
+                            .apply {
+                                this[index] =
+                                    updated
+                            }
+                    )
+            } else {
+                /*
+                 * The object is already complete in OSS. A concurrent delete/logout may have removed the
+                 * old resumable record, but the metadata recovery record must now be recreated.
+                 */
+                preferences[Keys.uploads] =
+                    encodeUploads(
+                        current + result
+                    )
+            }
+        }
+
+        return result
+    }
     suspend fun removeUploadsForAccount(accountKey: String): List<UploadTransfer> {
         var removed: List<UploadTransfer> = emptyList()
         context.transfersDataStore.edit { preferences ->

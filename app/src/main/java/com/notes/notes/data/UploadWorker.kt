@@ -40,7 +40,7 @@ class UploadForegroundException(cause: Throwable?) :
 /**
  * Runs one logical upload transfer.
  *
- * The worker is a step of the sequential WorkManager upload chain and runs as a long-running job
+ * The worker owns one independent logical upload scheduled through WorkManager and runs as a long-running job
  * promoted to a `dataSync` foreground service, so an upload started by the user keeps running while
  * the app is backgrounded or the screen is locked.
  *
@@ -322,21 +322,31 @@ class UploadWorker(
         }
     }
 
-    private suspend fun persistMetadataPending(transfer: UploadTransfer) {
-        // NonCancellable: once completion was observed it must never be forgotten, not even when the
-        // user cancels in this exact instant. The object is complete either way.
-        withContext(NonCancellable) {
-            transferStore.updateUpload(transfer.transferId) { current ->
-                current.copy(
-                    phase = UploadPhase.METADATA_PENDING,
-                    // The multipart identity is done with, but the frozen OSS scope is kept as it is.
-                    uploadId = "",
-                    notice = TransferNotice.NONE,
-                )
+    private suspend fun persistMetadataPending(
+        transfer: UploadTransfer,
+    ) {
+        /*
+         * CompleteMultipartUpload has already succeeded at this point.
+         *
+         * From now on the metadata recovery record is mandatory. Even if a delete/logout removed the old
+         * TRANSFERRING record in the tiny completion race, TransferStore recreates a METADATA_PENDING
+         * record rather than allowing a complete OSS object to become orphaned.
+         */
+        val metadataPending =
+            withContext(NonCancellable) {
+                transferStore
+                    .markMetadataPendingOrRestore(
+                        transfer
+                    )
             }
-            Unit
-        }
-        setProgress(TransferProgress(transfer).apply { markFinalizing() }.toWorkData())
+
+        setProgress(
+            TransferProgress(
+                metadataPending
+            ).apply {
+                markFinalizing()
+            }.toWorkData()
+        )
     }
 
     private suspend fun uploadMetadata(transfer: UploadTransfer, accessToken: String) {
@@ -472,7 +482,13 @@ class UploadWorker(
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
-        return ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        return ForegroundInfo(
+            notificationId(
+                transfer.transferId
+            ),
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
     }
 
     private fun resultData(transfer: UploadTransfer, outcome: String): Data = resultData(
@@ -648,7 +664,17 @@ class UploadWorker(
         private const val PROGRESS_PERSIST_INTERVAL_MILLIS = 2_000L
         private const val FOREGROUND_PROMOTION_TIMEOUT_MILLIS = 30_000L
         private const val NOTIFICATION_CHANNEL_ID = "notes-file-upload"
-        private const val NOTIFICATION_ID = 1001
+
+        private fun notificationId(
+            transferId: String,
+        ): Int =
+            UPLOAD_NOTIFICATION_NAMESPACE or
+                    (
+                            transferId.hashCode() and
+                                    NOTIFICATION_ID_MASK
+                            )
+        private const val UPLOAD_NOTIFICATION_NAMESPACE = 0x10000000
+        private const val NOTIFICATION_ID_MASK = 0x0FFFFFFF
         private const val PROGRESS_MAX = 100
 
         /** Keeps the last percent reserved for the metadata commit. */
