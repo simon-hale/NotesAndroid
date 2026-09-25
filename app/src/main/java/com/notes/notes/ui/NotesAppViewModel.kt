@@ -297,8 +297,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     fun chooseUploadCandidates(candidates: List<UploadCandidate>) {
         // One upload batch must be resolved before files for the next one are picked. A file-picker
         // callback can arrive after the sheet was closed or after a batch started, so the rule cannot
-        // live in the UI alone.
-        if (_uiState.value.disk.uploadTransfers.isNotEmpty()) {
+        // live in the UI alone. The ViewModel's own transfer state is authoritative here: the UI
+        // mirror in DiskScreenState is only updated asynchronously by the store collector, so it can
+        // still be empty for a moment after a batch was persisted. Foreign-account records are
+        // filtered out by `ownedUploadTransfers()` and never block the signed-in user.
+        if (ownedUploadTransfers().isNotEmpty()) {
             sendWarningMessage(strings().transfers.resolveBatchFirst)
             return
         }

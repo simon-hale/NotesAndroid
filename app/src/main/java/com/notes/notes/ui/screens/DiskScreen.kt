@@ -872,7 +872,11 @@ private fun UploadBottomSheet(
                         label = strings.fileDisk.pickFiles,
                         modifier = Modifier.weight(1f),
                         // One batch must be resolved before files for the next one are picked.
-                        enabled = !transferActionBusy && !transfersInFlight,
+                        // `isUploading` closes the short window in which a batch was already started
+                        // but its transfers are not projected into the UI state yet; the
+                        // `transfersInFlight` check keeps a paused or metadata-pending batch blocking
+                        // even though nothing is uploading at that moment.
+                        enabled = !transferActionBusy && !isUploading && !transfersInFlight,
                         onClick = onPickFiles,
                     )
 
