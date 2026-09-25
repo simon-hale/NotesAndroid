@@ -295,6 +295,14 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun chooseUploadCandidates(candidates: List<UploadCandidate>) {
+        // One upload batch must be resolved before files for the next one are picked. A file-picker
+        // callback can arrive after the sheet was closed or after a batch started, so the rule cannot
+        // live in the UI alone.
+        if (_uiState.value.disk.uploadTransfers.isNotEmpty()) {
+            sendWarningMessage(strings().transfers.resolveBatchFirst)
+            return
+        }
+
         val existingUris = _uiState.value.disk.uploadCandidates
             .mapTo(mutableSetOf(), UploadCandidate::uriString)
         val newCandidates = candidates.filter { candidate ->
@@ -755,7 +763,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * Destructive cancel of the current upload batch.
      *
      * Unlike pause this aborts the multipart upload, deletes the SDK checkpoint and drops the transfer
-     * record. A transfer whose object is already complete keeps its object: nothing is deleted from OSS.
+     * record. Transfers whose object is already complete in OSS are not part of a destructive cancel:
+     * they keep their record so the metadata insert can still be retried.
      */
     fun cancelUploads() {
         cancelUploadTransfers(ownedUploadTransfers())
@@ -766,12 +775,21 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         cancelUploadTransfers(ownedUploadTransfers().filter { it.transferId == transferId })
     }
 
+    /**
+     * Destructively cancels [targets].
+     *
+     * `METADATA_PENDING` transfers are filtered out defensively, whatever the caller passed: their
+     * object already exists in OSS, so removing the record would create a complete object with no
+     * database row and no local recovery state. When nothing is left to cancel this returns without
+     * removing, aborting or deleting anything.
+     */
     private fun cancelUploadTransfers(targets: List<UploadTransfer>) {
-        if (targets.isEmpty()) return
+        val abortable = UploadTransfer.destructivelyCancelable(targets)
+        if (abortable.isEmpty()) return
         viewModelScope.launch {
             setTransferActionBusy(true)
             // State is removed first so the finishing worker cannot commit metadata for a cancelled task.
-            val removed = transferStore.removeUploads(targets.map(UploadTransfer::transferId))
+            val removed = transferStore.removeUploads(abortable.map(UploadTransfer::transferId))
             // Mirrored immediately so the permission cleanup below sees the up-to-date need list.
             val removedIds = removed.mapTo(mutableSetOf(), UploadTransfer::transferId)
             uploadTransfers = uploadTransfers.filterNot { it.transferId in removedIds }
@@ -1188,7 +1206,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun releaseUnusedUploadPermissions(): List<Throwable> {
         val neededUris = buildSet {
             _uiState.value.disk.uploadCandidates.forEach { candidate -> add(candidate.uriString) }
-            uploadTransfers.forEach { transfer -> add(transfer.sourceUri) }
+            // A metadata-pending upload no longer reads its document: only its recovery record stays.
+            addAll(UploadTransfer.sourceDocumentsInUse(uploadTransfers))
             uploadWorkInfos.filterNot { it.state.isFinished }
                 .forEach { info -> UploadWork.sourceUri(info)?.let(::add) }
         }
@@ -1656,6 +1675,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 sendWarningMessage(requiredFieldsMessage())
                 return@launch
             }
+            // The backend deletes the account's objects by enumerating its existing file rows, and a
+            // metadata-pending object has no row yet: deleting the account now would orphan a complete
+            // object in the bucket. Refuse locally and keep the recovery record.
+            if (hasMetadataPendingUploads(session)) {
+                sendErrorMessage(strings().transfers.metadataPendingBlocksDeletion)
+                return@launch
+            }
             setAccountBusy(true)
             runCatching {
                 backendService.deleteAccount(
@@ -1671,6 +1697,19 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             setAccountBusy(false)
         }
     }
+
+    /**
+     * True when the signed-in owner still has a completed-but-unregistered upload.
+     *
+     * The store is read directly instead of the UI mirror so a record that is not projected right now
+     * (for example while the session is still bootstrapping) still blocks a destructive account
+     * deletion.
+     */
+    private suspend fun hasMetadataPendingUploads(session: SessionState): Boolean =
+        transferStore.uploadsOnce().any { transfer ->
+            transfer.isMetadataPending &&
+                (transfer.accountKey.isBlank() || transfer.accountKey == session.username)
+        }
 
     private suspend fun bootstrap(savedUsername: String, savedAccessToken: String) {
         if (savedUsername.isBlank() || savedAccessToken.isBlank()) {
@@ -2060,6 +2099,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         val downloads = transferStore.downloadsOnce()
             .filter { belongsToDepartingAccount(it.accountKey, departingAccount) }
 
+        // A completed-but-unregistered object must survive the session: its record is the only local
+        // recovery state for the pending `/api/file/insert/`, and the complete object can no longer be
+        // cleaned up by the bucket lifecycle policy. Only unfinished multipart uploads are removed.
+        val abortableUploads = UploadTransfer.destructivelyCancelable(uploads)
+        val metadataPendingUploads = UploadTransfer.metadataPending(uploads)
+
         uploadWorkStates.clear()
         overwriteWarnedUploads.clear()
         handledUploadWorkIds.clear()
@@ -2071,24 +2116,26 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         uploadBatchTotalBytes = 0L
         uploadBatchWorkIds = emptySet()
 
+        // Every departing transfer stops running, including the metadata-only ones: the old session
+        // must not keep operating after logout.
         awaitWorkCancellations(
             UploadWork.cancelTransfers(getApplication(), uploads.map(UploadTransfer::transferId))
         )
         downloads.forEach { transfer ->
             awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transfer.transferId))
         }
-        transferStore.removeUploads(uploads.map(UploadTransfer::transferId))
+        transferStore.removeUploads(abortableUploads.map(UploadTransfer::transferId))
         transferStore.removeDownloads(downloads.map(DownloadTransfer::transferId))
-        uploadTransfers = uploadTransfers.filterNot { transfer -> uploads.any { it.transferId == transfer.transferId } }
+        val removedUploadIds = abortableUploads.mapTo(mutableSetOf(), UploadTransfer::transferId)
+        uploadTransfers = uploadTransfers.filterNot { it.transferId in removedUploadIds }
         downloadTransfers = downloadTransfers.filterNot { transfer ->
             downloads.any { it.transferId == transfer.transferId }
         }
 
         withContext(Dispatchers.IO) {
             withTimeoutOrNull(LOGOUT_ABORT_TIMEOUT_MILLIS) {
-                uploads.forEach { transfer ->
+                abortableUploads.forEach { transfer ->
                     runCatching {
-                        if (transfer.phase == UploadPhase.METADATA_PENDING) return@runCatching
                         if (transfer.uploadId.isBlank() || transfer.objectKey.isBlank()) return@runCatching
                         val accessToken = currentAccessToken() ?: return@runCatching
                         val ticket = backendService.requestOssSts(
@@ -2114,17 +2161,16 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 }
             }
             // Local checkpoints and unfinished MediaStore items are always removed, even when the
-            // best-effort abort above timed out.
-            uploads.forEach { transferRepository.deleteCheckpointDirectory(it.checkpointDir) }
+            // best-effort abort above timed out. A metadata-pending checkpoint is inert after Complete,
+            // so its directory is cleaned too — the transfer record itself is what is preserved.
+            abortableUploads.forEach { transferRepository.deleteCheckpointDirectory(it.checkpointDir) }
+            metadataPendingUploads.forEach { transferRepository.deleteCheckpointDirectory(it.checkpointDir) }
             downloads.forEach { transferRepository.deleteDownloadDestination(it.destinationUri) }
         }
 
-        // Permissions the departing account no longer needs are released here; a preserved foreign
-        // transfer keeps the read permission of its document.
-        val releaseFailures = releaseUnusedUploadPermissions()
-        cleanupPreviewCacheFiles(cacheFilesToDelete)
-        previewRepository.clearAllPreviewCache()
-        invalidateDiskRequests()
+        // The session ends before the permission sweep: the departing file selection no longer holds
+        // document permissions, and the preserved metadata-only records do not need any either. The
+        // work snapshot is cleared because the departing work was cancelled just above.
         _uiState.update { state ->
             state.copy(
                 bootstrapping = false,
@@ -2137,6 +2183,16 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 reading = ReadingScreenState(),
             )
         }
+        uploadWorkInfos = emptyList()
+        downloadWorkInfos = emptyList()
+
+        // Permissions the departing account no longer needs are released here; a preserved foreign
+        // transfer keeps the read permission of its document, and a metadata-pending record no longer
+        // counts as a consumer at all.
+        val releaseFailures = releaseUnusedUploadPermissions()
+        cleanupPreviewCacheFiles(cacheFilesToDelete)
+        previewRepository.clearAllPreviewCache()
+        invalidateDiskRequests()
         if (releaseFailures.isNotEmpty()) {
             sendErrorMessage(
                 bulkReleaseUploadPermissionFailedMessage(
@@ -2168,9 +2224,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun releaseUploadCandidatePermission(uriString: String): Throwable? {
-        // A persisted read permission is kept for as long as any transfer, pending work item or
-        // selected candidate still refers to the document.
-        val stillNeeded = uploadTransfers.any { it.sourceUri == uriString } ||
+        // A persisted read permission is kept only while some upload still has to read the document,
+        // while a pending work item needs it, or while it is still a selected candidate. A
+        // metadata-pending transfer already uploaded everything and does not count as a consumer.
+        val stillNeeded = uriString in UploadTransfer.sourceDocumentsInUse(uploadTransfers) ||
             uploadWorkInfos.any { !it.state.isFinished && UploadWork.sourceUri(it) == uriString } ||
             _uiState.value.disk.uploadCandidates.any { it.uriString == uriString }
         if (stillNeeded) return null
@@ -2190,8 +2247,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 .forEach { directory -> runCatching { directory.deleteRecursively() } }
         }
 
-        // Recoverable transfers and uploads restored by WorkManager still need their document.
-        if (transfers.isNotEmpty()) return
+        // Recoverable transfers and uploads restored by WorkManager still need their document. A
+        // metadata-pending record is recovery state only: it no longer consumes the SAF permission.
+        if (UploadTransfer.sourceDocumentsInUse(transfers).isNotEmpty()) return
         if (UploadWork.hasPendingUploads(getApplication())) return
 
         val failures = UploadUriPermissionManager.releaseAllPersistedReadPermissions(getApplication())

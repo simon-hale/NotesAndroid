@@ -871,7 +871,8 @@ private fun UploadBottomSheet(
                     SecondaryActionButton(
                         label = strings.fileDisk.pickFiles,
                         modifier = Modifier.weight(1f),
-                        enabled = !transferActionBusy,
+                        // One batch must be resolved before files for the next one are picked.
+                        enabled = !transferActionBusy && !transfersInFlight,
                         onClick = onPickFiles,
                     )
 
@@ -917,7 +918,10 @@ private fun UploadBottomSheet(
  *
  * Every row exposes the transfer's own state: a transferring file can be paused, a paused file
  * resumed, and a file whose OSS upload already completed is shown as finalizing its metadata with
- * pausing disabled, because there is no OSS transfer left to pause.
+ * pausing disabled, because there is no OSS transfer left to pause. Such a row offers only a retry of
+ * the metadata insert — its object is already complete in OSS, so a destructive cancel would leave an
+ * orphan object with no database row, and the batch action disappears entirely when nothing is left
+ * to abort.
  */
 @Composable
 private fun UploadTransferPanel(
@@ -986,17 +990,25 @@ private fun UploadTransferPanel(
                     )
                 }
                 if (transfers.any { it.phase != UploadPhase.TRANSFERRING }) {
+                    // When nothing is left but completed objects waiting for their metadata row, the
+                    // action is a metadata-only retry rather than a resume of an OSS transfer.
+                    val metadataOnly = transfers.all { it.phase == UploadPhase.METADATA_PENDING }
                     SecondaryActionButton(
-                        label = strings.transfers.resume,
+                        label = if (metadataOnly) strings.common.retry else strings.transfers.resume,
                         modifier = Modifier.weight(1f),
                         onClick = onResume,
                     )
                 }
-                SecondaryActionButton(
-                    label = strings.transfers.cancelTransfer,
-                    modifier = Modifier.weight(1f),
-                    onClick = onCancel,
-                )
+                // Only transfers whose multipart upload can still be aborted are destructively
+                // cancellable; a metadata-pending transfer is preserved and must not be represented
+                // as cancelable.
+                if (transfers.any { it.phase != UploadPhase.METADATA_PENDING }) {
+                    SecondaryActionButton(
+                        label = strings.transfers.cancelTransfer,
+                        modifier = Modifier.weight(1f),
+                        onClick = onCancel,
+                    )
+                }
             }
         }
     }
@@ -1027,24 +1039,24 @@ private fun UploadTransferPanel(
                 icon = Icons.AutoMirrored.Outlined.Article,
                 scrollableTitle = true,
                 trailing = {
-                    if (transfer.phase == UploadPhase.TRANSFERRING) {
-                        RowActionButton(icon = Icons.Outlined.Pause, onClick = onPause)
+                    if (transfer.phase == UploadPhase.METADATA_PENDING) {
+                        // The OSS object is already complete: retrying only repeats the metadata
+                        // insert, and a destructive cancel is not offered because removing the
+                        // record would orphan a complete object with no database row.
+                        RowActionButton(icon = Icons.Outlined.Refresh, onClick = onResume)
                     } else {
+                        if (transfer.phase == UploadPhase.TRANSFERRING) {
+                            RowActionButton(icon = Icons.Outlined.Pause, onClick = onPause)
+                        } else {
+                            RowActionButton(icon = Icons.Outlined.PlayArrow, onClick = onResume)
+                        }
                         RowActionButton(
-                            icon = if (transfer.phase == UploadPhase.METADATA_PENDING) {
-                                Icons.Outlined.Refresh
-                            } else {
-                                Icons.Outlined.PlayArrow
-                            },
-                            onClick = onResume,
+                            icon = Icons.Outlined.Close,
+                            onClick = { onCancelTransfer(transfer.transferId) },
+                            tint = MaterialTheme.colorScheme.error,
+                            containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
                         )
                     }
-                    RowActionButton(
-                        icon = Icons.Outlined.Close,
-                        onClick = { onCancelTransfer(transfer.transferId) },
-                        tint = MaterialTheme.colorScheme.error,
-                        containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
-                    )
                 },
             )
             if (index < transfers.lastIndex) {

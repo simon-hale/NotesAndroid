@@ -83,6 +83,38 @@ data class UploadTransfer(
     val transferredBytes: Long,
 ) {
     val isMetadataPending: Boolean get() = phase == UploadPhase.METADATA_PENDING
+
+    companion object {
+        /**
+         * The transfers a destructive cancel may remove: those whose multipart upload can still be
+         * aborted.
+         *
+         * A `METADATA_PENDING` transfer is deliberately excluded. Its object is already complete in
+         * OSS, so deleting the record would leave a complete object with no database row and no local
+         * recovery state — an orphan the `AbortIncompleteMultipartUpload` lifecycle rule cannot clean
+         * up, because nothing is incomplete any more. Such a transfer stays persisted until
+         * `/api/file/insert/` succeeds.
+         */
+        fun destructivelyCancelable(transfers: List<UploadTransfer>): List<UploadTransfer> =
+            transfers.filterNot { it.isMetadataPending }
+
+        /** The transfers whose OSS object is complete and whose metadata insert is still outstanding. */
+        fun metadataPending(transfers: List<UploadTransfer>): List<UploadTransfer> =
+            transfers.filter { it.isMetadataPending }
+
+        /**
+         * Source documents that still have to stay readable.
+         *
+         * Only uploads that have not completed their OSS transfer need their picked document: a
+         * metadata-pending upload already uploaded everything and only keeps a small recovery record.
+         */
+        fun sourceDocumentsInUse(transfers: List<UploadTransfer>): Set<String> =
+            transfers.asSequence()
+                .filterNot { it.isMetadataPending }
+                .map { it.sourceUri }
+                .filter { it.isNotEmpty() }
+                .toSet()
+    }
 }
 
 /**
