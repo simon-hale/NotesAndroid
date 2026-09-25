@@ -60,7 +60,6 @@ class UploadWorker(
     override suspend fun doWork(): Result {
         val transferId = inputData.getString(KEY_INPUT_TRANSFER_ID).orEmpty()
         if (transferId.isBlank()) {
-            // Work enqueued by an older app version; it has no resumable identity to work with.
             Log.w(TAG, "Upload work enqueued without a transfer id")
             return Result.success()
         }
@@ -73,8 +72,6 @@ class UploadWorker(
 
         val account = TransferAccount.current(applicationContext)
         if (!account.owns(transfer.accountKey)) {
-            // Belongs to another signed-in account: do not upload it and do not touch its record,
-            // checkpoint or permissions. Its owner cleans it up when that account is active again.
             Log.w(TAG, "Upload work is owned by another account; leaving it untouched")
             return Result.success(resultData(transfer, OUTCOME_CANCELED))
         }
@@ -86,8 +83,18 @@ class UploadWorker(
         )
         if (accessToken.isBlank()) {
             return Result.success(
-                failureData(transfer, null, IllegalStateException("Missing upload session data"))
+                failureData(
+                    transfer,
+                    null,
+                    IllegalStateException("Missing upload session data"),
+                )
             )
+        }
+
+        // A pause is persisted before WorkManager cancellation is requested. If the worker happens to
+        // start inside that very small race window, fail closed instead of starting OSS traffic.
+        if (transfer.phase == UploadPhase.PAUSED) {
+            return Result.success(resultData(transfer, OUTCOME_CANCELED))
         }
 
         return try {
@@ -97,7 +104,7 @@ class UploadWorker(
                 runTransfer(transfer, accessToken)
             }
         } catch (cancellation: CancellationException) {
-            // Pause or cancel: the resumable state is already persisted by the repository.
+            // Pause/delete: resumable state has already been handled by the owner of the action.
             throw cancellation
         } catch (throwable: Throwable) {
             Log.w(TAG, "Upload failed for ${transfer.displayName}", throwable)
@@ -109,20 +116,22 @@ class UploadWorker(
      * `METADATA_PENDING`: the object is already complete in OSS, only the backend row is missing.
      * The file must never be uploaded again from this state.
      */
-    private suspend fun finalizeMetadata(transfer: UploadTransfer, accessToken: String): Result {
-        val progress = TransferProgress(transfer).apply { markFinalizing() }
-        val foregroundFailure = promoteToForeground(transfer, progress)
-        if (foregroundFailure != null) {
-            return Result.success(failureData(transfer, progress, UploadForegroundException(foregroundFailure)))
-        }
-
+    private suspend fun finalizeMetadata(
+        transfer: UploadTransfer,
+        accessToken: String,
+    ): Result {
+        // The OSS object already exists. This step is only a short backend metadata request, so there is
+        // no need to promote it to another long-running foreground transfer.
         try {
             uploadMetadata(transfer, accessToken)
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (throwable: Throwable) {
-            Log.w(TAG, "Metadata insert failed for ${transfer.displayName}", throwable)
-            return Result.success(failureData(transfer, progress, throwable))
+            Log.w(TAG, "Metadata insert failed for ${transfer.displayName}; retrying", throwable)
+
+            // The backend insert path is idempotent/convergent. Keep METADATA_PENDING persisted and let
+            // WorkManager retry with backoff rather than exposing another UI action.
+            return Result.retry()
         }
 
         completeTransfer(transfer)
@@ -227,12 +236,28 @@ class UploadWorker(
             progress = progress,
         )
 
-        // CompleteMultipartUpload returned: persist the metadata-pending phase before anything else,
-        // so a retry after this point can only ever repeat the backend insert.
+        // CompleteMultipartUpload returned successfully. Persist this transition before performing any
+// backend bookkeeping so this object can never be uploaded a second time.
         persistMetadataPending(persisted)
 
+// Multipart is complete, therefore its local checkpoint is no longer useful.
         transferRepository.deleteCheckpointDirectory(checkpointDirectory)
-        uploadMetadata(persisted, accessToken)
+
+        try {
+            uploadMetadata(persisted, accessToken)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (throwable: Throwable) {
+            Log.w(
+                TAG,
+                "Metadata insert failed for ${persisted.displayName}; retrying metadata only",
+                throwable,
+            )
+
+            // The object is already complete. Never restart OSS upload from here.
+            return Result.retry()
+        }
+
         completeTransfer(persisted)
         return Result.success(resultData(persisted, OUTCOME_SUCCESS))
     }
@@ -499,6 +524,7 @@ class UploadWorker(
     private fun Throwable.errorKind(): String = when (this) {
         is UploadForegroundException -> ERROR_KIND_FOREGROUND
         is UploadTargetChangedException -> ERROR_KIND_TARGET_CHANGED
+        is UploadSourceUnavailableException -> ERROR_KIND_SOURCE_UNAVAILABLE
         is NotesServiceException.Business -> ERROR_KIND_BUSINESS
         is NotesServiceException.Http -> ERROR_KIND_HTTP
         is NotesServiceException.MissingBaseUrl -> ERROR_KIND_MISSING_BASE_URL
@@ -612,6 +638,8 @@ class UploadWorker(
         const val ERROR_KIND_MISSING_BASE_URL = "missingBaseUrl"
         const val ERROR_KIND_TARGET_CHANGED = "targetChanged"
         const val ERROR_KIND_OTHER = "other"
+
+        const val ERROR_KIND_SOURCE_UNAVAILABLE = "sourceUnavailable"
 
         private const val TAG = "UploadWorker"
         private const val OSS_USAGE_SINGLE_FILE_UPLOAD = "SINGLE_FILE_UPLOAD"

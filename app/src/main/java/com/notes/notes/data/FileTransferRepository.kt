@@ -28,6 +28,9 @@ import java.io.Closeable
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.channels.FileChannel
+import android.content.ContentResolver
+import android.os.Bundle
+import java.util.Locale
 
 /** Raised when the picked document cannot be uploaded as-is, for example when its size is unknown. */
 class UploadSourceException(message: String) : Exception(message)
@@ -43,6 +46,11 @@ data class UploadSourceStats(
 
 /** A downloadable destination that no longer exists, for example an expired pending MediaStore item. */
 class DownloadDestinationMissingException(message: String) : Exception(message)
+
+data class DownloadDestination(
+    val uri: Uri,
+    val displayName: String,
+)
 
 /**
  * Seekable write handle on a MediaStore download destination.
@@ -262,21 +270,164 @@ class FileTransferRepository(
     // ---------------------------------------------------------------------------------------------
 
     /** Creates the pending MediaStore entry a download writes into, hidden until it completes. */
-    fun createPendingDownloadDestination(fileName: String): Uri {
-        val extension = fileName.substringAfterLast('.', missingDelimiterValue = "").lowercase()
+    /**
+     * Creates a hidden MediaStore destination using a deterministic non-overwriting local name.
+     *
+     * Example:
+     *   file.pdf
+     *   file (1).pdf
+     *   file (2).pdf
+     *
+     * Both completed files and this app's pending MediaStore entries are considered. [reservedNames]
+     * additionally protects names that already belong to another persistent DownloadTransfer.
+     */
+    fun createPendingDownloadDestination(
+        fileName: String,
+        reservedNames: Set<String> = emptySet(),
+    ): DownloadDestination {
+        val requestedName = fileName.trim().ifBlank { "download" }
+
+        val usedNames = existingDownloadNames()
+            .asSequence()
+            .plus(reservedNames.asSequence())
+            .mapTo(mutableSetOf()) { it.lowercase(Locale.ROOT) }
+
+        val availableName = chooseAvailableDownloadName(
+            requestedName = requestedName,
+            usedNames = usedNames,
+        )
+
+        val extension = availableName
+            .substringAfterLast('.', missingDelimiterValue = "")
+            .lowercase(Locale.ROOT)
+
         val mimeType = MimeTypeMap.getSingleton()
             .getMimeTypeFromExtension(extension)
             ?: "application/octet-stream"
 
         val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+            put(MediaStore.Downloads.DISPLAY_NAME, availableName)
             put(MediaStore.Downloads.MIME_TYPE, mimeType)
             put(MediaStore.Downloads.RELATIVE_PATH, downloadRelativePath)
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
-        return context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("Unable to create download destination")
+
+        val uri = context.contentResolver.insert(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            values,
+        ) ?: error("Unable to create download destination")
+
+        // Keep the provider's actual final display name. This also covers an OEM/provider making a
+        // last-second name adjustment despite our own collision check.
+        val actualName = readDownloadDisplayName(uri)
+            ?.takeIf { it.isNotBlank() }
+            ?: availableName
+
+        return DownloadDestination(
+            uri = uri,
+            displayName = actualName,
+        )
     }
+
+    /**
+     * Returns names already present in Download/Notes.
+     *
+     * Pending rows are explicitly included because MediaStore filters them out by default. Since the app
+     * owns its unfinished destinations, including them prevents a second transfer from choosing the same
+     * local display name even after a process restart.
+     */
+    private fun existingDownloadNames(): Set<String> {
+        val resolver = context.contentResolver
+        val projection = arrayOf(MediaStore.Downloads.DISPLAY_NAME)
+
+        val queryArgs = Bundle().apply {
+            putString(
+                ContentResolver.QUERY_ARG_SQL_SELECTION,
+                "${MediaStore.Downloads.RELATIVE_PATH} LIKE ?",
+            )
+            putStringArray(
+                ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                arrayOf("$downloadRelativePath%"),
+            )
+            putInt(
+                MediaStore.QUERY_ARG_MATCH_PENDING,
+                MediaStore.MATCH_INCLUDE,
+            )
+        }
+
+        return resolver.query(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            projection,
+            queryArgs,
+            null,
+        )?.use { cursor ->
+            val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DISPLAY_NAME)
+            buildSet {
+                while (cursor.moveToNext()) {
+                    cursor.getString(nameIndex)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let(::add)
+                }
+            }
+        }.orEmpty()
+    }
+
+    private fun chooseAvailableDownloadName(
+        requestedName: String,
+        usedNames: Set<String>,
+    ): String {
+        if (requestedName.lowercase(Locale.ROOT) !in usedNames) {
+            return requestedName
+        }
+
+        val lastDot = requestedName.lastIndexOf('.')
+        val hasExtension =
+            lastDot > 0 &&
+                    lastDot < requestedName.lastIndex
+
+        val stem = if (hasExtension) {
+            requestedName.substring(0, lastDot)
+        } else {
+            requestedName
+        }
+
+        val extension = if (hasExtension) {
+            requestedName.substring(lastDot)
+        } else {
+            ""
+        }
+
+        var index = 1
+        while (true) {
+            val candidate = "$stem ($index)$extension"
+            if (candidate.lowercase(Locale.ROOT) !in usedNames) {
+                return candidate
+            }
+            index++
+        }
+    }
+
+    private fun readDownloadDisplayName(uri: Uri): String? =
+        runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Downloads.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) {
+                    null
+                } else {
+                    val index = cursor.getColumnIndex(MediaStore.Downloads.DISPLAY_NAME)
+                    if (index >= 0 && !cursor.isNull(index)) {
+                        cursor.getString(index)
+                    } else {
+                        null
+                    }
+                }
+            }
+        }.getOrNull()
 
     /**
      * Size of the partial download destination, or `null` when the MediaStore item is gone.
@@ -326,9 +477,53 @@ class FileTransferRepository(
         context.contentResolver.update(uri, values, null, null)
     }
 
-    fun deleteDownloadDestination(destinationUri: String) {
-        val uri = runCatching { Uri.parse(destinationUri) }.getOrNull() ?: return
-        runCatching { context.contentResolver.delete(uri, null, null) }
+    /**
+     * Idempotently removes one download destination.
+     *
+     * Returns true when the row was deleted or was already gone. False means the MediaStore row still
+     * appears to exist or the provider rejected the cleanup.
+     */
+    fun deleteDownloadDestination(
+        destinationUri: String,
+    ): Boolean {
+        if (destinationUri.isBlank()) {
+            return true
+        }
+
+        val uri =
+            runCatching {
+                Uri.parse(destinationUri)
+            }.getOrNull()
+                ?: return true
+
+        return runCatching {
+            val deleted =
+                context.contentResolver.delete(
+                    uri,
+                    null,
+                    null,
+                )
+
+            if (deleted > 0) {
+                return@runCatching true
+            }
+
+            /*
+             * delete() returning zero also means "already gone" on many providers. Verify whether the
+             * destination can still be opened before treating it as cleanup failure.
+             */
+            val stillExists =
+                runCatching {
+                    context.contentResolver
+                        .openFileDescriptor(uri, "r")
+                        ?.use {
+                            true
+                        }
+                        ?: false
+                }.getOrDefault(true)
+
+            !stillExists
+        }.getOrDefault(false)
     }
 
     suspend fun listDownloadedFiles(): List<DownloadedFileEntry> = withContext(Dispatchers.IO) {

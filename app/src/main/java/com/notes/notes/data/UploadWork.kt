@@ -1,6 +1,7 @@
 package com.notes.notes.data
 
 import android.content.Context
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
@@ -16,8 +17,11 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
- * Identifies a batch of upload work this app just enqueued: its [batchId] groups the work items for
- * progress accounting and [workIds] lets the UI watch exactly the completions of this batch.
+ * Identifies a group of upload work items created together.
+ *
+ * batchId is retained only for progress/result bookkeeping. Every logical file is scheduled as an
+ * independent unique WorkManager work item, so pause/resume/delete of one file can never cancel the
+ * work of another file in the same batch.
  */
 data class EnqueuedUploadBatch(
     val batchId: String,
@@ -26,39 +30,42 @@ data class EnqueuedUploadBatch(
 )
 
 /**
- * Owns the upload queue in WorkManager so that transfers outlive the ViewModel (backgrounding, screen
- * lock, rotation) and are restored after a process restart.
+ * Owns persistent upload work.
  *
- * Every work item carries the id of the logical transfer it belongs to. That id is what Pause,
- * Resume and Cancel act on: cancelling by transfer tag stops exactly the intended chain and leaves
- * unrelated transfers alone.
+ * Every logical transfer gets its own unique work name derived from transferId. Files selected in one
+ * picker operation still belong to the same logical batch and target directory, but their WorkManager
+ * lifecycles are independent.
  */
 object UploadWork {
 
     const val TAG = "notes-file-upload"
 
-    private const val UNIQUE_WORK_NAME = "notes-file-upload-queue"
-
-    /** Every work item is tagged with the document it uploads, so orphaned permissions can be found. */
     private const val URI_TAG_PREFIX = "upload-uri:"
-
-    /** Tag that ties one work item to one persistent transfer record. */
     private const val TRANSFER_TAG_PREFIX = "upload-transfer:"
 
-    /** The document uploaded by [info], or `null` for work items enqueued without a tagged uri. */
+    private fun uniqueWorkName(transferId: String): String =
+        "notes-file-upload-$transferId"
+
+    /** The source document associated with this work item. */
     fun sourceUri(info: WorkInfo): String? =
-        info.tags.firstOrNull { it.startsWith(URI_TAG_PREFIX) }?.removePrefix(URI_TAG_PREFIX)
+        info.tags
+            .firstOrNull { it.startsWith(URI_TAG_PREFIX) }
+            ?.removePrefix(URI_TAG_PREFIX)
 
-    /** The logical transfer uploaded by [info], or `null` for pre-transfer work items. */
+    /** The persistent transfer record associated with this work item. */
     fun transferId(info: WorkInfo): String? =
-        info.tags.firstOrNull { it.startsWith(TRANSFER_TAG_PREFIX) }?.removePrefix(TRANSFER_TAG_PREFIX)
+        info.tags
+            .firstOrNull { it.startsWith(TRANSFER_TAG_PREFIX) }
+            ?.removePrefix(TRANSFER_TAG_PREFIX)
 
-    fun transferWorkTag(transferId: String): String = "$TRANSFER_TAG_PREFIX$transferId"
+    fun transferWorkTag(transferId: String): String =
+        "$TRANSFER_TAG_PREFIX$transferId"
 
     /**
-     * Enqueues [transfers] as one sequential chain, or returns `null` when there is nothing to do.
+     * Enqueues every transfer independently.
      *
-     * Files stay serialised exactly as before: a new file only starts after the previous one settled.
+     * ExistingWorkPolicy.KEEP protects a currently running instance from accidental duplicate enqueue.
+     * Pause waits for cancellation before resume enqueues another instance with the same unique name.
      */
     fun enqueue(
         context: Context,
@@ -66,15 +73,16 @@ object UploadWork {
         transfers: List<UploadTransfer>,
     ): EnqueuedUploadBatch? {
         if (transfers.isEmpty()) return null
+
         val workManager = WorkManager.getInstance(context)
-        val requests = transfers.map { transfer ->
-            OneTimeWorkRequestBuilder<UploadWorker>()
+        val workIds = mutableSetOf<UUID>()
+
+        transfers.forEach { transfer ->
+            val request = OneTimeWorkRequestBuilder<UploadWorker>()
                 .setInputData(
                     workDataOf(
                         UploadWorker.KEY_INPUT_TRANSFER_ID to transfer.transferId,
                         UploadWorker.KEY_INPUT_ACCESS_TOKEN to accessToken,
-                        // Binds the fallback token to the owner that enqueued this work. No credentials
-                        // beyond the session token are ever placed in WorkManager data.
                         UploadWorker.KEY_INPUT_ACCOUNT_KEY to transfer.accountKey,
                     )
                 )
@@ -83,48 +91,63 @@ object UploadWork {
                         .setRequiredNetworkType(NetworkType.CONNECTED)
                         .build()
                 )
+                // Used by METADATA_PENDING automatic retries. The real OSS transfer does not normally
+                // depend on this backoff because the OSS SDK performs its own request-level retries.
+                .setBackoffCriteria(
+                    BackoffPolicy.EXPONENTIAL,
+                    30L,
+                    TimeUnit.SECONDS,
+                )
                 .addTag(TAG)
                 .addTag("$URI_TAG_PREFIX${transfer.sourceUri}")
                 .addTag(transferWorkTag(transfer.transferId))
                 .build()
-        }
 
-        var continuation = workManager.beginUniqueWork(
-            UNIQUE_WORK_NAME,
-            // A cancelled (paused) chain is finished work, so enqueuing a resume creates a new chain.
-            ExistingWorkPolicy.KEEP,
-            requests.first(),
-        )
-        requests.drop(1).forEach { request ->
-            continuation = continuation.then(request)
+            workIds += request.id
+
+            workManager.enqueueUniqueWork(
+                uniqueWorkName(transfer.transferId),
+                // A transfer is enqueued only when it is newly created or explicitly resumed.
+                // REPLACE removes a stale/cancelling instance left by the previous pause so one
+                // tap on Resume is always sufficient.
+                ExistingWorkPolicy.REPLACE,
+                request,
+            )
         }
-        continuation.enqueue()
 
         return EnqueuedUploadBatch(
             batchId = transfers.first().batchId,
-            workIds = requests.mapTo(mutableSetOf()) { request -> request.id },
-            transferIds = transfers.mapTo(mutableSetOf()) { transfer -> transfer.transferId },
+            workIds = workIds,
+            transferIds = transfers.mapTo(mutableSetOf()) { it.transferId },
         )
     }
 
     /**
-     * Stops the work of the given transfers. Pausing and cancelling both use this.
+     * Stops only the requested logical transfers.
      *
-     * Returns the cancellation operations so callers can wait for the stop to be persisted before,
-     * for example, deleting a checkpoint the running worker still holds open.
+     * There are no dependency chains, therefore cancelling transfer A cannot affect B/C/D.
      */
-    fun cancelTransfers(context: Context, transferIds: Collection<String>): List<Operation> {
+    fun cancelTransfers(
+        context: Context,
+        transferIds: Collection<String>,
+    ): List<Operation> {
         if (transferIds.isEmpty()) return emptyList()
+
         val workManager = WorkManager.getInstance(context)
         return transferIds.map { transferId ->
-            workManager.cancelAllWorkByTag(transferWorkTag(transferId))
+            workManager.cancelUniqueWork(uniqueWorkName(transferId))
         }
     }
 
-    /** Blocks until the given cancellations are persisted, bounded by [timeoutMillis]. */
-    fun awaitCancellations(operations: List<Operation>, timeoutMillis: Long) {
+    /** Waits until cancellation requests have been persisted, with a bounded wait per transfer. */
+    fun awaitCancellations(
+        operations: List<Operation>,
+        timeoutMillis: Long,
+    ) {
         operations.forEach { operation ->
-            runCatching { operation.result.get(timeoutMillis, TimeUnit.MILLISECONDS) }
+            runCatching {
+                operation.result.get(timeoutMillis, TimeUnit.MILLISECONDS)
+            }
         }
     }
 
@@ -135,7 +158,6 @@ object UploadWork {
     fun workInfos(context: Context): Flow<List<WorkInfo>> =
         WorkManager.getInstance(context).getWorkInfosByTagFlow(TAG)
 
-    /** True while an upload is still queued or running, for example after a process restart. */
     suspend fun hasPendingUploads(context: Context): Boolean =
         workInfos(context).first().any { !it.state.isFinished }
 }

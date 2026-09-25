@@ -21,7 +21,7 @@ import com.notes.notes.core.DownloadTransfer
 import com.notes.notes.core.TransferNotice
 import com.notes.notes.core.stringsFor
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
+import com.notes.notes.core.DownloadPhase
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
@@ -56,40 +56,58 @@ class DownloadWorker(
             Log.w(TAG, "Download work enqueued without a transfer id")
             return Result.success()
         }
+
         val transfer = transferStore.download(transferId)
         if (transfer == null) {
             Log.w(TAG, "Download work for an unknown transfer")
             return Result.success()
         }
+
         val account = TransferAccount.current(applicationContext)
         if (!account.owns(transfer.accountKey)) {
-            // Belongs to another signed-in account: do not download it and do not touch its record or
-            // its pending MediaStore item. Its owner cleans that up when the account is active again.
             Log.w(TAG, "Download work is owned by another account; leaving it untouched")
             return Result.success(resultData(transferId, OUTCOME_CANCELED))
         }
+
+        // Same protection as upload: a pause is persisted before WorkManager cancellation. If this work
+        // starts in that race window, do not perform any network or file I/O.
+        if (transfer.phase == DownloadPhase.PAUSED) {
+            return Result.success(resultData(transferId, OUTCOME_CANCELED))
+        }
+
         val accessToken = account.accessTokenFor(
             fallback = inputData.getString(KEY_INPUT_ACCESS_TOKEN).orEmpty(),
             transferAccountKey = transfer.accountKey,
             workAccountKey = inputData.getString(KEY_INPUT_ACCOUNT_KEY).orEmpty(),
         )
         if (accessToken.isBlank()) {
-            return Result.success(failureData(transferId, IllegalStateException("Missing download session data")))
+            return Result.success(
+                failureData(
+                    transferId,
+                    IllegalStateException("Missing download session data"),
+                )
+            )
         }
 
         val run = DownloadRun(transfer)
+
         return try {
             val foregroundFailure = promoteToForeground(transfer, run)
             if (foregroundFailure != null) {
-                return Result.success(failureData(transferId, DownloadForegroundException(foregroundFailure)))
+                return Result.success(
+                    failureData(
+                        transferId,
+                        DownloadForegroundException(foregroundFailure),
+                    )
+                )
             }
+
             transferFile(transfer, accessToken, run)
         } catch (cancellation: CancellationException) {
-            // Pause: the partial bytes and the pending MediaStore item are kept for a later resume.
             persistRun(run)
             throw cancellation
         } catch (throwable: Throwable) {
-            Log.w(TAG, "Download failed for ${transfer.fileName}", throwable)
+            Log.w(TAG, "Download failed for ${run.fileName}", throwable)
             persistRun(run)
             Result.success(failureData(transferId, throwable))
         }
@@ -238,21 +256,58 @@ class DownloadWorker(
      * transfer recorded. Pending items are not permanent, so a missing or shortened destination
      * restarts cleanly instead of failing or appending at a wrong offset.
      */
-    private suspend fun prepareDestination(transfer: DownloadTransfer, run: DownloadRun) {
+    private suspend fun prepareDestination(
+        transfer: DownloadTransfer,
+        run: DownloadRun,
+    ) {
         val destinationSize = transferRepository.downloadDestinationSize(run.destinationUri)
+
         val plan = DownloadResumePolicy.planForDestination(
             destinationExists = destinationSize != null,
             destinationSize = destinationSize ?: 0L,
             recordedBytes = run.downloadedBytes,
         )
-        if (plan == DownloadPlan.CONTINUE_FROM_OFFSET) return
 
-        val hadPartialFile = run.downloadedBytes > 0L || destinationSize != null
-        if (hadPartialFile) {
-            Log.i(TAG, "Partial download of ${transfer.fileName} is gone; starting over")
+        if (plan == DownloadPlan.CONTINUE_FROM_OFFSET) {
+            return
         }
-        run.destinationUri = transferRepository.createPendingDownloadDestination(transfer.fileName).toString()
-        run.resetForRestart(if (hadPartialFile) TransferNotice.RESTARTED_PARTIAL_MISSING else TransferNotice.NONE)
+
+        val hadPartialFile =
+            run.downloadedBytes > 0L ||
+                    destinationSize != null
+
+        if (hadPartialFile) {
+            Log.i(TAG, "Partial download of ${run.fileName} is unusable; starting over")
+        }
+
+        // If the old MediaStore row still exists but is inconsistent with our persisted byte count,
+        // remove it before creating the replacement. A missing row simply needs no deletion.
+        if (destinationSize != null) {
+            transferRepository.deleteDownloadDestination(run.destinationUri)
+        }
+
+        val reservedNames = transferStore.downloadsOnce()
+            .asSequence()
+            .filterNot { it.transferId == transfer.transferId }
+            .map { it.fileName }
+            .toSet()
+
+        val destination = transferRepository.createPendingDownloadDestination(
+            fileName = run.fileName,
+            reservedNames = reservedNames,
+        )
+
+        run.destinationUri = destination.uri.toString()
+        run.fileName = destination.displayName
+
+        run.resetForRestart(
+            if (hadPartialFile) {
+                TransferNotice.RESTARTED_PARTIAL_MISSING
+            } else {
+                TransferNotice.NONE
+            }
+        )
+
         persistRun(run)
     }
 
@@ -261,6 +316,7 @@ class DownloadWorker(
         withContext(NonCancellable) {
             transferStore.updateDownload(run.transferId) { current ->
                 current.copy(
+                    fileName = run.fileName,
                     destinationUri = run.destinationUri,
                     downloadedBytes = run.downloadedBytes,
                     totalBytes = run.totalBytes,
@@ -295,12 +351,19 @@ class DownloadWorker(
         }
     }
 
-    private fun createForegroundInfo(transfer: DownloadTransfer, run: DownloadRun): ForegroundInfo {
+    private fun createForegroundInfo(
+        transfer: DownloadTransfer,
+        run: DownloadRun,
+    ): ForegroundInfo {
         val context = applicationContext
         val strings = stringsFor(AppLanguage.fromCode(transfer.language))
         val title = strings.common.download
+
         val notificationManager = context.getSystemService(NotificationManager::class.java)
-        if (notificationManager != null && notificationManager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
+        if (
+            notificationManager != null &&
+            notificationManager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null
+        ) {
             notificationManager.createNotificationChannel(
                 NotificationChannel(
                     NOTIFICATION_CHANNEL_ID,
@@ -309,30 +372,43 @@ class DownloadWorker(
                 )
             )
         }
+
         val fraction = run.fraction
         val percent = (fraction * PROGRESS_MAX).roundToInt()
+
         val text = if (run.totalBytes > 0L) {
-            "${transfer.fileName} · $percent% · ${strings.transfers.downloading}"
+            "${run.fileName} · $percent% · ${strings.transfers.downloading}"
         } else {
-            "${transfer.fileName} · ${strings.transfers.downloading}"
+            "${run.fileName} · ${strings.transfers.downloading}"
         }
-        val notification: Notification = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_download_notification)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setContentIntent(
-                PendingIntent.getActivity(
-                    context,
-                    0,
-                    Intent(context, MainActivity::class.java),
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+
+        val notification: Notification =
+            NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_download_notification)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setContentIntent(
+                    PendingIntent.getActivity(
+                        context,
+                        0,
+                        Intent(context, MainActivity::class.java),
+                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                    )
                 )
-            )
-            .setProgress(PROGRESS_MAX, if (run.totalBytes > 0L) percent else 0, run.totalBytes <= 0L)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .build()
-        return ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                .setProgress(
+                    PROGRESS_MAX,
+                    if (run.totalBytes > 0L) percent else 0,
+                    run.totalBytes <= 0L,
+                )
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .build()
+
+        return ForegroundInfo(
+            NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
     }
 
     /**
@@ -344,6 +420,7 @@ class DownloadWorker(
     private class DownloadRun(transfer: DownloadTransfer) {
         val transferId: String = transfer.transferId
 
+        var fileName: String = transfer.fileName
         var destinationUri: String = transfer.destinationUri
 
         private val state = DownloadProgressState(
@@ -354,46 +431,65 @@ class DownloadWorker(
 
         private var pendingNotice: TransferNotice = TransferNotice.NONE
 
-        val downloadedBytes: Long get() = state.downloadedBytes
-        val totalBytes: Long get() = state.totalBytes
-        val etag: String get() = state.etag
-        val fraction: Float get() = state.fraction
+        val downloadedBytes: Long
+            get() = state.downloadedBytes
 
-        fun recordBytesRead(count: Long) = state.recordBytesRead(count)
+        val totalBytes: Long
+            get() = state.totalBytes
 
-        fun takeResumedTotal(statusCode: Int, contentLength: Long) =
-            state.takeResumedTotal(statusCode, contentLength, requestedOffset = state.downloadedBytes)
+        val etag: String
+            get() = state.etag
 
-        fun takeFreshTotal(contentLength: Long) = state.takeFreshTotal(contentLength)
+        val fraction: Float
+            get() = state.fraction
 
-        fun takeETag(value: String) = state.takeETag(value)
+        fun recordBytesRead(count: Long) =
+            state.recordBytesRead(count)
 
-        fun isCompleteAfterEndOfStream(): Boolean = state.isCompleteAfterEndOfStream()
+        fun takeResumedTotal(
+            statusCode: Int,
+            contentLength: Long,
+        ) = state.takeResumedTotal(
+            statusCode,
+            contentLength,
+            requestedOffset = state.downloadedBytes,
+        )
 
-        /** True while the destination still has to be truncated and written from byte zero. */
-        fun consumeRestartFromZero(): Boolean = state.consumeRestartFromZero()
+        fun takeFreshTotal(contentLength: Long) =
+            state.takeFreshTotal(contentLength)
 
-        fun requestRestartFromZero() = state.requestRestartFromZero()
+        fun takeETag(value: String) =
+            state.takeETag(value)
+
+        fun isCompleteAfterEndOfStream(): Boolean =
+            state.isCompleteAfterEndOfStream()
+
+        fun consumeRestartFromZero(): Boolean =
+            state.consumeRestartFromZero()
+
+        fun requestRestartFromZero() =
+            state.requestRestartFromZero()
 
         fun resetForRestart(notice: TransferNotice) {
             state.requestRestartFromZero()
+
             if (notice != TransferNotice.NONE) {
                 pendingNotice = notice
             }
         }
 
-        /** Returns the notice to store, clearing it once it has been written down. */
         fun consumeNotice(current: TransferNotice): TransferNotice {
             val notice = pendingNotice
             pendingNotice = TransferNotice.NONE
             return notice.takeIf { it != TransferNotice.NONE } ?: current
         }
 
-        fun toWorkData(): Data = workDataOf(
-            KEY_PROGRESS_DOWNLOADED_BYTES to downloadedBytes,
-            KEY_PROGRESS_TOTAL_BYTES to totalBytes,
-            KEY_PROGRESS_FRACTION to fraction,
-        )
+        fun toWorkData(): Data =
+            workDataOf(
+                KEY_PROGRESS_DOWNLOADED_BYTES to downloadedBytes,
+                KEY_PROGRESS_TOTAL_BYTES to totalBytes,
+                KEY_PROGRESS_FRACTION to fraction,
+            )
     }
 
     private fun resultData(transferId: String, outcome: String): Data = workDataOf(

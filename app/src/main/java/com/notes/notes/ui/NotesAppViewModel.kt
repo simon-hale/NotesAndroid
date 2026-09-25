@@ -68,6 +68,7 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import kotlin.plus
 
 class NotesAppViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -633,18 +634,28 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             val strings = strings()
             val state = _uiState.value
-            if (state.disk.transferActionBusy || state.disk.isUploading) return@launch
-            if (state.disk.uploadTransfers.any { it.phase == UploadPhase.TRANSFERRING }) return@launch
+
+            if (
+                state.disk.transferActionBusy ||
+                state.disk.isUploading
+            ) {
+                return@launch
+            }
+
+// An existing transfer record always belongs to the current unresolved batch. This includes the
+// all-paused case and METADATA_PENDING, so a second batch can never be created before the first one
+// has completely disappeared.
+            if (ownedUploadTransfers().isNotEmpty()) {
+                sendWarningMessage(strings.transfers.resolveBatchFirst)
+                return@launch
+            }
+
             val session = activeSession() ?: return@launch
             val path = currentPath() ?: return@launch
             val candidates = state.disk.uploadCandidates
+
             if (candidates.isEmpty()) {
                 sendWarningMessage(strings.fileDisk.noFileSelected)
-                return@launch
-            }
-            // Resume anything left over instead of starting a second parallel batch.
-            if (state.disk.uploadTransfers.isNotEmpty()) {
-                resumeUploads()
                 return@launch
             }
 
@@ -718,7 +729,18 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 return@launch
             }
             // Mirrored immediately so permission cleanup never believes these documents are unused.
-            uploadTransfers = uploadTransfers + transfers
+            val newTransferIds =
+                transfers.mapTo(mutableSetOf(), UploadTransfer::transferId)
+
+            /*
+             * The DataStore collector may already have projected these records before execution
+             * returns here. Replace by transferId instead of blindly appending, otherwise the UI
+             * briefly renders the batch twice.
+             */
+            uploadTransfers =
+                uploadTransfers.filterNot { current ->
+                    current.transferId in newTransferIds
+                } + transfers
             uploadBatchId = batchId
             uploadBatchTotalBytes = batchTotalBytes
             // WorkManager owns the transfer from here on, so it survives backgrounding and process death.
@@ -787,111 +809,308 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(disk = it.disk.copy(isUploading = false, uploadProgress = 0f)) }
     }
 
-    /** Pauses every transfer of the current upload batch. Pausing never aborts the multipart upload. */
-    fun pauseUploads() {
+    /** Pauses exactly one upload. The remote multipart upload and local checkpoint are preserved. */
+    fun pauseUpload(transferId: String) {
         viewModelScope.launch {
-            val targets = ownedUploadTransfers().filter { it.phase == UploadPhase.TRANSFERRING }
-            if (targets.isEmpty()) return@launch
+            if (_uiState.value.disk.transferActionBusy) return@launch
+
+            val transfer = ownedUploadTransfers()
+                .firstOrNull { it.transferId == transferId }
+                ?: return@launch
+
+            if (transfer.phase != UploadPhase.TRANSFERRING) {
+                return@launch
+            }
+
             setTransferActionBusy(true)
-            // The phase is persisted before the work is stopped, so the worker can never report the
-            // transfer as failed for a pause the user asked for.
-            targets.forEach { transfer ->
-                transferStore.updateUpload(transfer.transferId) { current ->
+
+            try {
+                val updated = transferStore.updateUpload(transferId) { current ->
                     if (current.phase == UploadPhase.TRANSFERRING) {
                         current.copy(phase = UploadPhase.PAUSED)
                     } else {
                         current
                     }
+                } ?: return@launch
+
+                uploadTransfers = uploadTransfers.map { current ->
+                    if (current.transferId == transferId) {
+                        updated
+                    } else {
+                        current
+                    }
                 }
+                refreshTransferUi()
+
+                awaitWorkCancellations(
+                    UploadWork.cancelTransfers(
+                        getApplication(),
+                        listOf(transferId),
+                    )
+                )
+
+                sendInfoMessage(strings().transfers.paused)
+            } finally {
+                setTransferActionBusy(false)
             }
-            UploadWork.cancelTransfers(getApplication(), targets.map { it.transferId })
-                .let { operations -> awaitWorkCancellations(operations) }
-            setTransferActionBusy(false)
-            sendInfoMessage(strings().transfers.paused)
         }
     }
 
-    /** Resumes paused uploads and retries metadata-only transfers of the current account. */
-    fun resumeUploads() {
+    /** Resumes exactly one paused upload from its own persisted checkpoint. */
+    fun resumeUpload(transferId: String) {
         viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) return@launch
+
             val session = activeSession() ?: return@launch
-            // Only this account's transfers: a foreign record is never resumed, cancelled or deleted
-            // merely because another user is signed in.
-            val owned = ownedUploadTransfers().filter { it.phase != UploadPhase.TRANSFERRING }
-            if (owned.isEmpty()) return@launch
+
+            val transfer = ownedUploadTransfers()
+                .firstOrNull { it.transferId == transferId }
+                ?: return@launch
+
+            if (transfer.phase != UploadPhase.PAUSED) {
+                return@launch
+            }
+
             setTransferActionBusy(true)
 
-            owned.filter { it.phase == UploadPhase.PAUSED }.forEach { transfer ->
-                transferStore.updateUpload(transfer.transferId) { current ->
+            try {
+                val updated = transferStore.updateUpload(transferId) { current ->
                     if (current.phase == UploadPhase.PAUSED) {
                         current.copy(phase = UploadPhase.TRANSFERRING)
                     } else {
                         current
                     }
+                } ?: return@launch
+
+                uploadTransfers = uploadTransfers.map { current ->
+                    if (current.transferId == transferId) {
+                        updated
+                    } else {
+                        current
+                    }
                 }
+                refreshTransferUi()
+
+                uploadBatchId = updated.batchId
+                uploadBatchTotalBytes = updated.batchTotalBytes
+
+                markRecentlyEnqueued(listOf(transferId))
+
+                try {
+                    val enqueued = UploadWork.enqueue(
+                        context = getApplication(),
+                        accessToken = session.accessToken,
+                        transfers = listOf(updated),
+                    )
+
+                    if (enqueued != null) {
+                        uploadBatchWorkIds =
+                            uploadBatchWorkIds + enqueued.workIds
+                    }
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (throwable: Throwable) {
+                    // WorkManager did not take ownership. Restore PAUSED so the UI never claims that a
+                    // transfer is running when nothing can actually continue it.
+                    val paused = transferStore.updateUpload(transferId) { current ->
+                        if (current.phase == UploadPhase.TRANSFERRING) {
+                            current.copy(phase = UploadPhase.PAUSED)
+                        } else {
+                            current
+                        }
+                    }
+
+                    if (paused != null) {
+                        uploadTransfers = uploadTransfers.map { current ->
+                            if (current.transferId == transferId) {
+                                paused
+                            } else {
+                                current
+                            }
+                        }
+                    }
+
+                    refreshTransferUi()
+                    sendThrowableMessage(throwable)
+                }
+            } finally {
+                setTransferActionBusy(false)
             }
-            // Metadata-only transfers stay METADATA_PENDING: their object is already complete.
-            uploadBatchId = owned.first().batchId
-            uploadBatchTotalBytes = owned.first().batchTotalBytes
-            markRecentlyEnqueued(owned.map { it.transferId })
-            val batch = UploadWork.enqueue(
-                context = getApplication(),
-                accessToken = session.accessToken,
-                transfers = owned,
-            )
-            uploadBatchWorkIds = batch?.workIds.orEmpty()
-            setTransferActionBusy(false)
         }
     }
 
     /**
-     * Destructive cancel of the current upload batch.
+     * Deletes every safely destructible upload owned by the active account.
      *
-     * Unlike pause this aborts the multipart upload, deletes the SDK checkpoint and drops the transfer
-     * record. Transfers whose object is already complete in OSS are not part of a destructive cancel:
-     * they keep their record so the metadata insert can still be retried.
+     * METADATA_PENDING is deliberately preserved: its OSS object is already complete and deleting the
+     * recovery record would orphan that object without a backend file row.
      */
-    fun cancelUploads() {
-        cancelUploadTransfers(ownedUploadTransfers())
+    fun deleteAllUploads() {
+        if (_uiState.value.disk.transferActionBusy) return
+
+        cancelUploadTransfers(
+            ownedUploadTransfers()
+        )
     }
 
     /** Destructive cancel of a single transfer, for example from its row in the upload sheet. */
     fun cancelUpload(transferId: String) {
-        cancelUploadTransfers(ownedUploadTransfers().filter { it.transferId == transferId })
+        if (_uiState.value.disk.transferActionBusy) return
+
+        cancelUploadTransfers(
+            ownedUploadTransfers().filter { it.transferId == transferId }
+        )
     }
 
     /**
-     * Destructively cancels [targets].
+     * Destructively deletes the requested unfinished uploads.
      *
-     * `METADATA_PENDING` transfers are filtered out defensively, whatever the caller passed: their
-     * object already exists in OSS, so removing the record would create a complete object with no
-     * database row and no local recovery state. When nothing is left to cancel this returns without
-     * removing, aborting or deleting anything.
+     * The final phase decision is performed atomically by TransferStore rather than trusting the UI
+     * snapshot passed into this method. A transfer that reached METADATA_PENDING immediately before the
+     * delete operation is therefore preserved automatically.
      */
-    private fun cancelUploadTransfers(targets: List<UploadTransfer>) {
-        val abortable = UploadTransfer.destructivelyCancelable(targets)
-        if (abortable.isEmpty()) return
-        viewModelScope.launch {
-            setTransferActionBusy(true)
-            // State is removed first so the finishing worker cannot commit metadata for a cancelled task.
-            val removed = transferStore.removeUploads(abortable.map(UploadTransfer::transferId))
-            // Mirrored immediately so the permission cleanup below sees the up-to-date need list.
-            val removedIds = removed.mapTo(mutableSetOf(), UploadTransfer::transferId)
-            uploadTransfers = uploadTransfers.filterNot { it.transferId in removedIds }
-            // Waiting for the cancellation to be persisted guarantees the stopped worker no longer
-            // holds the checkpoint directory that is deleted below.
-            awaitWorkCancellations(
-                UploadWork.cancelTransfers(getApplication(), removed.map(UploadTransfer::transferId))
+    private fun cancelUploadTransfers(
+        targets: List<UploadTransfer>,
+    ) {
+        val requestedIds =
+            targets.mapTo(
+                mutableSetOf(),
+                UploadTransfer::transferId,
             )
-            releaseUnusedUploadPermissions()
-            withContext(Dispatchers.IO) {
-                // Best effort only: an unreachable backend must never block the UI or a logout.
-                withTimeoutOrNull(CANCEL_ABORT_TIMEOUT_MILLIS) {
-                    removed.forEach { transfer -> abortAndCleanCheckpoint(transfer) }
-                }
+
+        if (requestedIds.isEmpty()) {
+            return
+        }
+
+        viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
             }
-            setTransferActionBusy(false)
-            sendInfoMessage(strings().transfers.transferCanceled)
+
+            setTransferActionBusy(true)
+
+            try {
+                /*
+                 * Important: the store re-checks each transfer's CURRENT phase inside the same atomic
+                 * DataStore edit that removes it.
+                 *
+                 * If CompleteMultipartUpload just succeeded and the worker changed the record to
+                 * METADATA_PENDING, that record is not returned and is not deleted.
+                 */
+                val removed =
+                    transferStore.removeCancellableUploads(
+                        requestedIds
+                    )
+
+                if (removed.isEmpty()) {
+                    // Most commonly this means every requested item became METADATA_PENDING.
+                    refreshTransferUi()
+                    return@launch
+                }
+
+                val removedIds =
+                    removed.mapTo(
+                        mutableSetOf(),
+                        UploadTransfer::transferId,
+                    )
+
+                val removedSourceUris =
+                    removed.mapTo(
+                        mutableSetOf(),
+                        UploadTransfer::sourceUri,
+                    )
+
+                /*
+                 * Update the in-memory mirror immediately instead of waiting for the DataStore collector,
+                 * otherwise deleted rows can briefly flash back into the sheet.
+                 */
+                uploadTransfers =
+                    uploadTransfers.filterNot { transfer ->
+                        transfer.transferId in removedIds
+                    }
+
+                /*
+                 * Delete means "do not upload this source again". Remove its original picker candidate too.
+                 */
+                _uiState.update { state ->
+                    state.copy(
+                        disk = state.disk.copy(
+                            uploadCandidates =
+                                state.disk.uploadCandidates.filterNot { candidate ->
+                                    candidate.uriString in removedSourceUris
+                                }
+                        )
+                    )
+                }
+
+                removedIds.forEach { transferId ->
+                    recentlyEnqueuedTransfers.remove(
+                        transferId
+                    )
+                }
+
+                refreshTransferUi()
+
+                /*
+                 * Stop OSS SDK activity before AbortMultipartUpload.
+                 */
+                awaitWorkCancellations(
+                    UploadWork.cancelTransfers(
+                        context = getApplication(),
+                        transferIds = removedIds,
+                    )
+                )
+
+                /*
+                 * Permission cleanup is idempotent. A URI still required by another transfer is retained.
+                 */
+                val permissionFailures =
+                    releaseUnusedUploadPermissions()
+
+                /*
+                 * One failed remote abort must not stop cleanup of other files.
+                 * abortAndCleanCheckpoint() always deletes the local checkpoint in finally.
+                 */
+                val deferredRemoteCleanup =
+                    withContext(Dispatchers.IO) {
+                        removed.filterNot { transfer ->
+                            abortAndCleanCheckpoint(
+                                transfer
+                            )
+                        }
+                    }
+
+                if (permissionFailures.isNotEmpty()) {
+                    Log.w(
+                        TAG,
+                        "One or more upload source permissions could not be released",
+                        permissionFailures.first(),
+                    )
+                }
+
+                if (deferredRemoteCleanup.isNotEmpty()) {
+                    sendWarningMessage(
+                        uploadDeleteDeferredCleanupMessage(
+                            deferredRemoteCleanup.size
+                        )
+                    )
+                } else {
+                    sendInfoMessage(
+                        strings().transfers.transferCanceled
+                    )
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                Log.w(
+                    TAG,
+                    "Unable to delete upload transfers",
+                    throwable,
+                )
+                sendThrowableMessage(throwable)
+            } finally {
+                setTransferActionBusy(false)
+            }
         }
     }
 
@@ -904,52 +1123,101 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Aborts the multipart upload of [transfer] when it is still abortable, then removes its checkpoint.
-     * The bucket lifecycle policy cleans up parts that could not be aborted here.
+     * Tries to remove the unfinished multipart upload and always drops local resumable state.
+     *
+     * Returns true when there was no remote multipart state to clean, or AbortMultipartUpload succeeded.
+     * A false result means local deletion is still complete, while abandoned remote parts are left for
+     * the bucket's incomplete-multipart lifecycle rule.
      */
-    private suspend fun abortAndCleanCheckpoint(transfer: UploadTransfer) {
-        if (transfer.phase != UploadPhase.METADATA_PENDING &&
-            transfer.uploadId.isNotBlank() &&
-            transfer.objectKey.isNotBlank()
-        ) {
-            try {
-                val accessToken = currentAccessToken()
-                if (accessToken != null) {
-                    val ticket = backendService.requestOssSts(
-                        accessToken = accessToken,
-                        pathString = transfer.pathString,
-                        filename = transfer.displayName,
-                        parentId = transfer.parentId,
-                        language = AppLanguage.fromCode(transfer.language),
-                        usage = OSS_USAGE_SINGLE_FILE_UPLOAD,
-                    )
-                    // Let the stopped SDK task release the checkpoint file before it is deleted.
-                    delay(CHECKPOINT_RELEASE_DELAY_MILLIS)
-                    transferRepository.abortMultipartUpload(
-                        ticket = ticket,
-                        objectKey = transfer.objectKey,
-                        uploadId = transfer.uploadId,
-                        credentialProvider = TransferStsCredentialProvider(
-                            transfer = transfer,
-                            accessToken = accessToken,
-                            backendService = backendService,
-                            firstTicket = ticket,
-                        ),
-                    )
-                }
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (throwable: Throwable) {
-                // Local state is removed either way; the lifecycle policy handles abandoned parts.
-                Log.w(TAG, "Best-effort multipart abort failed for ${transfer.displayName}", throwable)
+    private suspend fun abortAndCleanCheckpoint(
+        transfer: UploadTransfer,
+    ): Boolean {
+        var remoteClean = true
+
+        try {
+            if (
+                transfer.phase != UploadPhase.METADATA_PENDING &&
+                transfer.uploadId.isNotBlank() &&
+                transfer.objectKey.isNotBlank()
+            ) {
+                remoteClean =
+                    withTimeoutOrNull(
+                        CANCEL_ABORT_TIMEOUT_MILLIS
+                    ) {
+                        try {
+                            val accessToken =
+                                currentAccessToken()
+                                    ?: return@withTimeoutOrNull false
+
+                            val ticket =
+                                backendService.requestOssSts(
+                                    accessToken = accessToken,
+                                    pathString = transfer.pathString,
+                                    filename = transfer.displayName,
+                                    parentId = transfer.parentId,
+                                    language =
+                                        AppLanguage.fromCode(
+                                            transfer.language
+                                        ),
+                                    usage =
+                                        OSS_USAGE_SINGLE_FILE_UPLOAD,
+                                )
+
+                            /*
+                             * WorkManager cancellation was already issued. Leave a short window for the
+                             * SDK task to release its checkpoint before aborting and deleting it.
+                             */
+                            delay(
+                                CHECKPOINT_RELEASE_DELAY_MILLIS
+                            )
+
+                            transferRepository.abortMultipartUpload(
+                                ticket = ticket,
+                                objectKey = transfer.objectKey,
+                                uploadId = transfer.uploadId,
+                                credentialProvider =
+                                    TransferStsCredentialProvider(
+                                        transfer = transfer,
+                                        accessToken = accessToken,
+                                        backendService = backendService,
+                                        firstTicket = ticket,
+                                    ),
+                            )
+                        } catch (cancellation: CancellationException) {
+                            throw cancellation
+                        } catch (throwable: Throwable) {
+                            Log.w(
+                                TAG,
+                                "Best-effort multipart abort failed for ${transfer.displayName}",
+                                throwable,
+                            )
+                            false
+                        }
+                    } ?: false
             }
+        } finally {
+            /*
+             * Local resumable state must disappear regardless of:
+             * - STS failure
+             * - network failure
+             * - OSS abort failure
+             * - abort timeout
+             *
+             * Any directory the OS temporarily refuses to remove is also covered by the existing orphan
+             * checkpoint sweep on a later app startup.
+             */
+            transferRepository.deleteCheckpointDirectory(
+                transfer.checkpointDir
+            )
         }
-        transferRepository.deleteCheckpointDirectory(transfer.checkpointDir)
+
+        return remoteClean
     }
 
     private fun observeUploadWork() {
         viewModelScope.launch {
-            UploadWork.workInfos(getApplication()).collect(::applyUploadWorkInfos)
+            UploadWork.workInfos(getApplication())
+                .collect(::applyUploadWorkInfos)
         }
     }
 
@@ -971,6 +1239,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun applyUploadRecords(records: List<UploadTransfer>) {
         val previous = uploadTransfers.associateBy(UploadTransfer::transferId)
         uploadTransfers = records
+
+        // Covers completion/source-loss cleanup even when the corresponding WorkInfo transition happened
+        // while the process was dead. Only documents still referenced by candidates/transfers/live work
+        // retain a persistable SAF permission.
+        releaseUnusedUploadPermissions()
         records
             // Another account's notices are not this session's to surface or to clear.
             .filter { isOwnedByActiveSession(it.accountKey) }
@@ -1060,9 +1333,39 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 )
             }
         // Enqueue grace entries of settled transfers are no longer needed.
-        val knownTransferIds = uploadTransfers.mapTo(mutableSetOf(), UploadTransfer::transferId)
-        downloadTransfers.forEach { knownTransferIds += it.transferId }
-        recentlyEnqueuedTransfers.keys.retainAll(knownTransferIds)
+        val knownTransferIds =
+            uploadTransfers.mapTo(
+                mutableSetOf(),
+                UploadTransfer::transferId,
+            ).apply {
+                downloadTransfers.forEach { transfer ->
+                    add(transfer.transferId)
+                }
+            }
+
+        val liveWorkTransferIds = buildSet {
+            uploadWorkInfos
+                .filterNot { it.state.isFinished }
+                .mapNotNullTo(this, UploadWork::transferId)
+
+            downloadWorkInfos
+                .filterNot { it.state.isFinished }
+                .mapNotNullTo(this, DownloadWork::transferId)
+        }
+
+        /*
+         * Do not immediately remove a freshly-created enqueue marker merely because neither
+         * TransferStore nor WorkManager has delivered its asynchronous update yet.
+         *
+         * That exact race used to make a brand-new download look orphaned and reconcile it
+         * from TRANSFERRING to PAUSED before its Worker could start.
+         */
+        val now = System.currentTimeMillis()
+        recentlyEnqueuedTransfers.entries.removeAll { entry ->
+            entry.key !in knownTransferIds &&
+                    entry.key !in liveWorkTransferIds &&
+                    now - entry.value >= ENQUEUE_GRACE_MILLIS
+        }
         _uiState.update { state ->
             state.copy(
                 disk = state.disk.copy(
@@ -1074,29 +1377,183 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * A transfer recorded as transferring without any live work item can only continue if the user
-     * resumes it, for example after the system stopped the worker while the app was gone.
+     * Restores metadata-only upload work that disappeared from WorkManager.
+     *
+     * METADATA_PENDING means the OSS object already exists. Re-enqueuing the transfer is safe because
+     * UploadWorker detects this phase and performs only /api/file/insert/; it never uploads the object
+     * again.
      */
+    private suspend fun recoverMetadataPendingUploads() {
+        val session =
+            activeSession()
+                ?: return
+
+        val candidates =
+            transferStore.uploadsOnce()
+                .filter { transfer ->
+                    isOwnedByActiveSession(
+                        transfer.accountKey
+                    ) &&
+                            transfer.phase ==
+                            UploadPhase.METADATA_PENDING
+                }
+
+        if (candidates.isEmpty()) {
+            return
+        }
+
+        /*
+         * Read WorkManager directly rather than relying only on the ViewModel's asynchronously updated
+         * snapshot. This avoids enqueueing a duplicate merely because the collector has not delivered the
+         * latest WorkInfo yet.
+         */
+        val liveTransferIds =
+            UploadWork.workInfos(
+                getApplication()
+            )
+                .first()
+                .filterNot { info ->
+                    info.state.isFinished
+                }
+                .mapNotNull(
+                    UploadWork::transferId
+                )
+                .toSet()
+
+        val missingWork =
+            candidates.filter { transfer ->
+                transfer.transferId !in
+                        liveTransferIds
+            }
+
+        if (missingWork.isEmpty()) {
+            return
+        }
+
+        val transferIds =
+            missingWork.map(
+                UploadTransfer::transferId
+            )
+
+        markRecentlyEnqueued(
+            transferIds
+        )
+
+        try {
+            val enqueued =
+                UploadWork.enqueue(
+                    context = getApplication(),
+                    accessToken =
+                        session.accessToken,
+                    transfers = missingWork,
+                )
+
+            if (enqueued != null) {
+                uploadBatchWorkIds =
+                    uploadBatchWorkIds +
+                            enqueued.workIds
+            }
+        } catch (cancellation: CancellationException) {
+            transferIds.forEach { transferId ->
+                recentlyEnqueuedTransfers.remove(
+                    transferId
+                )
+            }
+            throw cancellation
+        } catch (throwable: Throwable) {
+            /*
+             * Keep the METADATA_PENDING records untouched. They remain the recovery source and another
+             * login/reconciliation pass may retry them.
+             */
+            transferIds.forEach { transferId ->
+                recentlyEnqueuedTransfers.remove(
+                    transferId
+                )
+            }
+
+            Log.w(
+                TAG,
+                "Unable to restore metadata-pending upload work",
+                throwable,
+            )
+        }
+    }
+
     private fun reconcileUploadPhases() {
-        val now = System.currentTimeMillis()
-        val liveTransferIds = uploadWorkInfos
-            .filterNot { it.state.isFinished }
-            .mapNotNull(UploadWork::transferId)
-            .toSet()
-        ownedUploadTransfers()
-            .filter { it.phase == UploadPhase.TRANSFERRING && it.transferId !in liveTransferIds }
-            .filter { isEnqueueSettled(it.transferId, now) }
+        val now =
+            System.currentTimeMillis()
+
+        val liveTransferIds =
+            uploadWorkInfos
+                .filterNot { info ->
+                    info.state.isFinished
+                }
+                .mapNotNull(
+                    UploadWork::transferId
+                )
+                .toSet()
+
+        val ownedTransfers =
+            ownedUploadTransfers()
+
+        /*
+         * A normal unfinished multipart transfer whose WorkManager item disappeared cannot safely be
+         * assumed to still be running. Preserve all resumable state and expose it as PAUSED.
+         */
+        ownedTransfers
+            .filter { transfer ->
+                transfer.phase ==
+                        UploadPhase.TRANSFERRING &&
+                        transfer.transferId !in
+                        liveTransferIds
+            }
+            .filter { transfer ->
+                isEnqueueSettled(
+                    transfer.transferId,
+                    now,
+                )
+            }
             .forEach { record ->
                 viewModelScope.launch {
-                    transferStore.updateUpload(record.transferId) { current ->
-                        if (current.phase == UploadPhase.TRANSFERRING) {
-                            current.copy(phase = UploadPhase.PAUSED)
+                    transferStore.updateUpload(
+                        record.transferId
+                    ) { current ->
+                        if (
+                            current.phase ==
+                            UploadPhase.TRANSFERRING
+                        ) {
+                            current.copy(
+                                phase =
+                                    UploadPhase.PAUSED
+                            )
                         } else {
                             current
                         }
                     }
                 }
             }
+
+        /*
+         * METADATA_PENDING is different: no user intervention is useful here because the object has
+         * already been uploaded. If its Worker disappeared, automatically restore metadata-only work.
+         */
+        val orphanedMetadata =
+            ownedTransfers.any { transfer ->
+                transfer.phase ==
+                        UploadPhase.METADATA_PENDING &&
+                        transfer.transferId !in
+                        liveTransferIds &&
+                        isEnqueueSettled(
+                            transfer.transferId,
+                            now,
+                        )
+            }
+
+        if (orphanedMetadata) {
+            viewModelScope.launch {
+                recoverMetadataPendingUploads()
+            }
+        }
     }
 
     private fun reconcileDownloadPhases() {
@@ -1353,24 +1810,86 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun handleUploadWorkFinished(info: WorkInfo) {
         val strings = strings()
         val language = _uiState.value.settings.language
-        val displayName = info.outputData.getString(UploadWorker.KEY_RESULT_DISPLAY_NAME).orEmpty()
-        val uriString = info.outputData.getString(UploadWorker.KEY_RESULT_URI).orEmpty()
-        val candidate = _uiState.value.disk.uploadCandidates
-            .firstOrNull { uriString.isNotEmpty() && it.uriString == uriString }
-        val outcome = info.outputData.getString(UploadWorker.KEY_RESULT_OUTCOME)
-        // Paused or cancelled work reports nothing: the transfer record carries that state instead.
-        if (outcome == UploadWorker.OUTCOME_CANCELED) return
 
-        val succeeded = info.state == WorkInfo.State.SUCCEEDED &&
-            outcome == UploadWorker.OUTCOME_SUCCESS
+        val displayName =
+            info.outputData.getString(UploadWorker.KEY_RESULT_DISPLAY_NAME).orEmpty()
+
+        val uriString =
+            info.outputData.getString(UploadWorker.KEY_RESULT_URI).orEmpty()
+
+        val candidate = _uiState.value.disk.uploadCandidates
+            .firstOrNull {
+                uriString.isNotEmpty() &&
+                        it.uriString == uriString
+            }
+
+        val outcome =
+            info.outputData.getString(UploadWorker.KEY_RESULT_OUTCOME)
+
+        if (outcome == UploadWorker.OUTCOME_CANCELED) {
+            return
+        }
+
+        val errorKind =
+            info.outputData.getString(UploadWorker.KEY_RESULT_ERROR_KIND)
+
+        /*
+         * The Worker has already discarded this transfer:
+         *   - best-effort AbortMultipartUpload
+         *   - checkpoint deletion
+         *   - TransferStore removal
+         *
+         * Complete the client-side cleanup by removing the picker item and releasing its SAF grant.
+         */
+        if (
+            outcome == UploadWorker.OUTCOME_FAILED &&
+            errorKind == UploadWorker.ERROR_KIND_SOURCE_UNAVAILABLE
+        ) {
+            val permissionFailures = mutableListOf<Throwable>()
+
+            when {
+                candidate != null -> {
+                    removeUploadCandidateInternal(candidate)
+                        ?.let(permissionFailures::add)
+                }
+
+                uriString.isNotBlank() -> {
+                    releaseUploadCandidatePermission(uriString)
+                        ?.let(permissionFailures::add)
+                }
+            }
+
+            permissionFailures += releaseUnusedUploadPermissions()
+
+            if (permissionFailures.isNotEmpty()) {
+                Log.w(
+                    TAG,
+                    "Unable to release one or more upload source permissions",
+                    permissionFailures.first(),
+                )
+            }
+
+            sendErrorMessage(
+                uploadSourceUnavailableMessage(displayName)
+            )
+            return
+        }
+
+        val succeeded =
+            info.state == WorkInfo.State.SUCCEEDED &&
+                    outcome == UploadWorker.OUTCOME_SUCCESS
+
         if (succeeded) {
-            // Removing the candidate also releases the persisted read permission when it is unused.
             val releaseFailure = if (candidate != null) {
                 removeUploadCandidateInternal(candidate)
-            } else {
+            } else if (uriString.isNotBlank()) {
                 releaseUploadCandidatePermission(uriString)
+            } else {
+                null
             }
+
             releaseUnusedUploadPermissions()
+
             if (releaseFailure == null) {
                 sendSuccessMessage(
                     strings.format(
@@ -1390,12 +1909,21 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             return
         }
 
-        if (info.state != WorkInfo.State.SUCCEEDED && info.state != WorkInfo.State.FAILED) return
+        if (
+            info.state != WorkInfo.State.SUCCEEDED &&
+            info.state != WorkInfo.State.FAILED
+        ) {
+            return
+        }
 
-        // A failed file stays in the pending list, so its read permission is still needed for a retry.
-        if (candidate == null && uriString.isNotEmpty() && info.state == WorkInfo.State.FAILED) {
+        if (
+            candidate == null &&
+            uriString.isNotEmpty() &&
+            info.state == WorkInfo.State.FAILED
+        ) {
             releaseUploadCandidatePermission(uriString)
         }
+
         if (displayName.isNotEmpty()) {
             sendErrorMessage(
                 strings.format(
@@ -1405,8 +1933,28 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 )
             )
         }
+
         sendErrorMessage(uploadWorkFailureMessage(info.outputData))
     }
+
+    private fun uploadSourceUnavailableMessage(fileName: String): String =
+        when (_uiState.value.settings.language) {
+            AppLanguage.ZH_CN -> {
+                if (fileName.isBlank()) {
+                    "本地源文件已被删除或无法访问，未完成上传已清理"
+                } else {
+                    "本地文件“$fileName”已被删除或无法访问，未完成上传已清理"
+                }
+            }
+
+            AppLanguage.EN_US -> {
+                if (fileName.isBlank()) {
+                    "The local source file is missing or inaccessible. The unfinished upload was cleaned up."
+                } else {
+                    "The local file \"$fileName\" is missing or inaccessible. The unfinished upload was cleaned up."
+                }
+            }
+        }
 
     private fun uploadWorkFailureMessage(data: Data): String {
         val strings = strings()
@@ -1452,28 +2000,58 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * The MediaStore entry is created up front with `IS_PENDING = 1`, and the presigned URL is only
      * requested by the worker: it is short lived and must never be persisted as transfer state.
      */
-    private fun startDownload(fileId: Long, fileName: String) {
+    private fun startDownload(
+        fileId: Long,
+        fileName: String,
+    ) {
         viewModelScope.launch {
-            val session = activeSession() ?: return@launch
-            if (_uiState.value.disk.transferActionBusy) return@launch
-
-            val existing = downloadTransfers.firstOrNull {
-                it.fileId == fileId && isOwnedByActiveSession(it.accountKey)
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
             }
+
+            val session = activeSession() ?: return@launch
+
+            /*
+             * Repeated taps on the same cloud file while it already has an unfinished transfer do not
+             * create another local destination.
+             */
+            val existing = downloadTransfers.firstOrNull {
+                it.fileId == fileId &&
+                        isOwnedByActiveSession(it.accountKey)
+            }
+
             if (existing != null) {
-                resumeDownload(existing.transferId)
+                if (existing.phase == DownloadPhase.PAUSED) {
+                    resumeDownload(existing.transferId)
+                }
                 return@launch
             }
 
             setTransferActionBusy(true)
-            val transfer = withContext(Dispatchers.IO) {
-                runCatching {
+
+            var transfer: DownloadTransfer? = null
+
+            try {
+                val reservedNames = downloadTransfers
+                    .asSequence()
+                    .filter { isOwnedByActiveSession(it.accountKey) }
+                    .map { it.fileName }
+                    .toSet()
+
+                transfer = withContext(Dispatchers.IO) {
+                    val destination =
+                        transferRepository.createPendingDownloadDestination(
+                            fileName = fileName,
+                            reservedNames = reservedNames,
+                        )
+
                     DownloadTransfer(
                         transferId = UUID.randomUUID().toString(),
                         accountKey = session.username,
                         fileId = fileId,
-                        fileName = fileName,
-                        destinationUri = transferRepository.createPendingDownloadDestination(fileName).toString(),
+                        // Persist the actual local name, including "(1)" if needed.
+                        fileName = destination.displayName,
+                        destinationUri = destination.uri.toString(),
                         downloadedBytes = 0L,
                         totalBytes = 0L,
                         etag = "",
@@ -1483,85 +2061,248 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         createdAt = System.currentTimeMillis(),
                     )
                 }
-            }.getOrElse { throwable ->
-                setTransferActionBusy(false)
-                sendThrowableMessage(throwable)
-                return@launch
-            }
 
-            markRecentlyEnqueued(listOf(transfer.transferId))
-            transferStore.addDownload(transfer)
-            downloadTransfers = downloadTransfers + transfer
-            DownloadWork.enqueue(getApplication(), session.accessToken, listOf(transfer))
-            setTransferActionBusy(false)
-            emitMessage(strings().fileDisk.downloadStarted, MessageTone.INFO)
+                markRecentlyEnqueued(listOf(transfer.transferId))
+
+                try {
+                    transferStore.addDownload(transfer)
+                } catch (throwable: Throwable) {
+                    withContext(Dispatchers.IO) {
+                        transferRepository.deleteDownloadDestination(
+                            transfer.destinationUri
+                        )
+                    }
+                    throw throwable
+                }
+
+                downloadTransfers =
+                    downloadTransfers.filterNot { current ->
+                        current.transferId == transfer.transferId
+                    } + transfer
+                refreshTransferUi()
+
+                try {
+                    DownloadWork.enqueue(
+                        context = getApplication(),
+                        accessToken = session.accessToken,
+                        transfers = listOf(transfer),
+                    )
+                } catch (throwable: Throwable) {
+                    transferStore.removeDownload(transfer.transferId)
+                    downloadTransfers = downloadTransfers.filterNot {
+                        it.transferId == transfer.transferId
+                    }
+                    refreshTransferUi()
+
+                    withContext(Dispatchers.IO) {
+                        transferRepository.deleteDownloadDestination(
+                            transfer.destinationUri
+                        )
+                    }
+
+                    throw throwable
+                }
+
+                emitMessage(
+                    strings().fileDisk.downloadStarted,
+                    MessageTone.INFO,
+                )
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                sendThrowableMessage(throwable)
+            } finally {
+                setTransferActionBusy(false)
+            }
         }
     }
 
     /** Pauses a download without losing its partial bytes; the pending MediaStore item is kept. */
     fun pauseDownload(transferId: String) {
         viewModelScope.launch {
-            val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
-            if (!isOwnedByActiveSession(transfer.accountKey)) return@launch
-            if (transfer.phase != DownloadPhase.TRANSFERRING) return@launch
-            setTransferActionBusy(true)
-            transferStore.updateDownload(transferId) { current ->
-                if (current.phase == DownloadPhase.TRANSFERRING) {
-                    current.copy(phase = DownloadPhase.PAUSED)
-                } else {
-                    current
-                }
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
             }
-            awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transferId))
-            setTransferActionBusy(false)
-            sendInfoMessage(strings().transfers.paused)
+
+            val transfer = downloadTransfers
+                .firstOrNull { it.transferId == transferId }
+                ?: return@launch
+
+            if (!isOwnedByActiveSession(transfer.accountKey)) {
+                return@launch
+            }
+
+            if (transfer.phase != DownloadPhase.TRANSFERRING) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            try {
+                val updated = transferStore.updateDownload(transferId) { current ->
+                    if (current.phase == DownloadPhase.TRANSFERRING) {
+                        current.copy(phase = DownloadPhase.PAUSED)
+                    } else {
+                        current
+                    }
+                } ?: return@launch
+
+                downloadTransfers = downloadTransfers.map { current ->
+                    if (current.transferId == transferId) {
+                        updated
+                    } else {
+                        current
+                    }
+                }
+                refreshTransferUi()
+
+                awaitDownloadCancellation(
+                    DownloadWork.cancelTransfer(
+                        getApplication(),
+                        transferId,
+                    )
+                )
+
+                sendInfoMessage(strings().transfers.paused)
+            } finally {
+                setTransferActionBusy(false)
+            }
         }
     }
 
     /** Resumes a paused download. The worker always asks for a new presigned URL before continuing. */
     fun resumeDownload(transferId: String) {
         viewModelScope.launch {
-            val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
-            val session = activeSession() ?: return@launch
-            if (!isOwnedByActiveSession(transfer.accountKey)) {
-                // Not this session's transfer: leave its record and partial MediaStore item alone.
+            if (_uiState.value.disk.transferActionBusy) {
                 return@launch
             }
-            setTransferActionBusy(true)
-            transferStore.updateDownload(transferId) { current ->
-                if (current.phase == DownloadPhase.PAUSED) {
-                    current.copy(phase = DownloadPhase.TRANSFERRING)
-                } else {
-                    current
-                }
+
+            val transfer = downloadTransfers
+                .firstOrNull { it.transferId == transferId }
+                ?: return@launch
+
+            val session = activeSession() ?: return@launch
+
+            if (!isOwnedByActiveSession(transfer.accountKey)) {
+                return@launch
             }
-            markRecentlyEnqueued(listOf(transferId))
-            DownloadWork.enqueue(
-                context = getApplication(),
-                accessToken = session.accessToken,
-                transfers = listOf(transfer.copy(phase = DownloadPhase.TRANSFERRING)),
-            )
-            setTransferActionBusy(false)
+
+            if (transfer.phase != DownloadPhase.PAUSED) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            try {
+                val updated = transferStore.updateDownload(transferId) { current ->
+                    if (current.phase == DownloadPhase.PAUSED) {
+                        current.copy(phase = DownloadPhase.TRANSFERRING)
+                    } else {
+                        current
+                    }
+                } ?: return@launch
+
+                downloadTransfers = downloadTransfers.map { current ->
+                    if (current.transferId == transferId) {
+                        updated
+                    } else {
+                        current
+                    }
+                }
+                refreshTransferUi()
+
+                markRecentlyEnqueued(listOf(transferId))
+
+                try {
+                    DownloadWork.enqueue(
+                        context = getApplication(),
+                        accessToken = session.accessToken,
+                        transfers = listOf(updated),
+                    )
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (throwable: Throwable) {
+                    val paused = transferStore.updateDownload(transferId) { current ->
+                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                            current.copy(phase = DownloadPhase.PAUSED)
+                        } else {
+                            current
+                        }
+                    }
+
+                    if (paused != null) {
+                        downloadTransfers = downloadTransfers.map { current ->
+                            if (current.transferId == transferId) {
+                                paused
+                            } else {
+                                current
+                            }
+                        }
+                    }
+
+                    refreshTransferUi()
+                    sendThrowableMessage(throwable)
+                }
+            } finally {
+                setTransferActionBusy(false)
+            }
         }
     }
 
     /** Destructive cancel: the unfinished MediaStore item and the transfer state are deleted. */
     fun cancelDownload(transferId: String) {
         viewModelScope.launch {
-            val transfer = downloadTransfers.firstOrNull { it.transferId == transferId } ?: return@launch
-            if (!isOwnedByActiveSession(transfer.accountKey)) return@launch
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
+            }
+
+            val transfer = downloadTransfers
+                .firstOrNull { it.transferId == transferId }
+                ?: return@launch
+
+            if (!isOwnedByActiveSession(transfer.accountKey)) {
+                return@launch
+            }
+
             setTransferActionBusy(true)
-            cancelDownloadInternal(transfer)
-            setTransferActionBusy(false)
-            sendInfoMessage(strings().transfers.transferCanceled)
+
+            try {
+                cancelDownloadInternal(transfer)
+                sendInfoMessage(strings().transfers.transferCanceled)
+            } finally {
+                setTransferActionBusy(false)
+            }
         }
     }
 
     private suspend fun cancelDownloadInternal(transfer: DownloadTransfer) {
-        transferStore.removeDownload(transfer.transferId)
-        awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transfer.transferId))
+        /*
+         * Stop the writer first. Unlike upload, there is no remote multipart state here and therefore no
+         * reason to delete the persistent record before the worker has finished unwinding.
+         *
+         * If the process dies during this sequence, keeping the record is safer than leaving an
+         * untracked pending MediaStore row.
+         */
+        awaitDownloadCancellation(
+            DownloadWork.cancelTransfer(
+                getApplication(),
+                transfer.transferId,
+            )
+        )
+
+        val removed =
+            transferStore.removeDownload(transfer.transferId)
+                ?: transfer
+
+        downloadTransfers = downloadTransfers.filterNot {
+            it.transferId == transfer.transferId
+        }
+        refreshTransferUi()
+
         withContext(Dispatchers.IO) {
-            transferRepository.deleteDownloadDestination(transfer.destinationUri)
+            transferRepository.deleteDownloadDestination(
+                removed.destinationUri
+            )
         }
     }
 
@@ -1796,21 +2537,86 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 (transfer.accountKey.isBlank() || transfer.accountKey == session.username)
         }
 
-    private suspend fun bootstrap(savedUsername: String, savedAccessToken: String) {
-        if (savedUsername.isBlank() || savedAccessToken.isBlank()) {
-            _uiState.update { it.copy(bootstrapping = false) }
+    /**
+     * Only an explicit authentication rejection proves that the saved credential is no longer usable.
+     *
+     * Connectivity failures and server-side 5xx responses are transient and must never trigger
+     * destructive transfer cleanup.
+     */
+    private fun Throwable.isAuthenticationFailure(): Boolean =
+        this is NotesServiceException.Http &&
+                (
+                        statusCode == 401 ||
+                                statusCode == 403
+                        )
+
+    private suspend fun bootstrap(
+        savedUsername: String,
+        savedAccessToken: String,
+    ) {
+        if (
+            savedUsername.isBlank() ||
+            savedAccessToken.isBlank()
+        ) {
+            _uiState.update {
+                it.copy(
+                    bootstrapping = false
+                )
+            }
             return
         }
-        runCatching {
-            backendService.autoLogin(savedAccessToken)
-            onLoginSucceeded(savedUsername, savedAccessToken, welcomeBack = false)
-        }.onFailure {
-            preferencesStore.clearCredentials()
-            _uiState.update { state ->
-                state.copy(
-                    bootstrapping = false,
-                    session = SessionState(),
+
+        try {
+            backendService.autoLogin(
+                savedAccessToken
+            )
+
+            onLoginSucceeded(
+                username = savedUsername,
+                accessToken = savedAccessToken,
+                welcomeBack = false,
+            )
+        } catch (throwable: Throwable) {
+            if (
+                throwable.isAuthenticationFailure()
+            ) {
+                /*
+                 * The server explicitly rejected the saved credential.
+                 *
+                 * Remove all destructible state owned by that account. METADATA_PENDING recovery records
+                 * are deliberately retained because their complete OSS objects cannot safely be discarded.
+                 *
+                 * Remote multipart abort is not attempted here because the credential was just proven
+                 * invalid. Local state is still removed and abandoned incomplete OSS parts are left to the
+                 * bucket lifecycle rule.
+                 */
+                preferencesStore.clearCredentials()
+
+                resetSessionAndContent(
+                    departingAccountOverride =
+                        savedUsername,
+                    attemptRemoteAbort = false,
                 )
+            } else {
+                /*
+                 * Network outage, timeout, 5xx, malformed temporary response, etc.
+                 *
+                 * Do NOT destroy credentials, checkpoints, partial downloads or transfer records merely
+                 * because the server could not be reached during app startup.
+                 */
+                Log.w(
+                    TAG,
+                    "Auto-login temporarily unavailable; preserving local session recovery state",
+                    throwable,
+                )
+
+                _uiState.update { state ->
+                    state.copy(
+                        bootstrapping = false,
+                        session =
+                            SessionState(),
+                    )
+                }
             }
         }
     }
@@ -1839,6 +2645,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         // Transfers are projected per account: the records of the account that just signed in become
         // visible now, and another account's records stay hidden.
         refreshTransferUi()
+        recoverMetadataPendingUploads()
         loadDiskPage(
             target = DiskTarget.Root(),
             showLoading = false,
@@ -2174,88 +2981,249 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(accountBusy = busy) }
     }
 
-    private suspend fun resetSessionAndContent() {
-        val cacheFilesToDelete = _uiState.value.reading.activeCacheFiles
-        val departingAccount = _uiState.value.session.username
-        // Only the departing account's transfers are cleaned up: their work is stopped, their remote
-        // multipart uploads are aborted best-effort and their local state is deleted. A transfer that
-        // belongs to another account stays exactly where it is, for that owner to handle later.
-        val uploads = transferStore.uploadsOnce().filter { belongsToDepartingAccount(it.accountKey, departingAccount) }
-        val downloads = transferStore.downloadsOnce()
-            .filter { belongsToDepartingAccount(it.accountKey, departingAccount) }
+    /**
+     * Ends one account's local session and removes all destructible transfer state.
+     *
+     * [departingAccountOverride] is used during startup when a saved credential was rejected before a
+     * SessionState could be established.
+     *
+     * [attemptRemoteAbort] must be false when the credential has already been proven invalid. Local
+     * cleanup still proceeds; abandoned incomplete OSS parts are then handled by the bucket lifecycle.
+     *
+     * METADATA_PENDING upload records are always preserved as recovery state.
+     */
+    private suspend fun resetSessionAndContent(
+        departingAccountOverride: String? = null,
+        attemptRemoteAbort: Boolean = true,
+    ) {
+        val cacheFilesToDelete =
+            _uiState.value.reading.activeCacheFiles
 
-        // A completed-but-unregistered object must survive the session: its record is the only local
-        // recovery state for the pending `/api/file/insert/`, and the complete object can no longer be
-        // cleaned up by the bucket lifecycle policy. Only unfinished multipart uploads are removed.
-        val abortableUploads = UploadTransfer.destructivelyCancelable(uploads)
-        val metadataPendingUploads = UploadTransfer.metadataPending(uploads)
+        val departingAccount =
+            departingAccountOverride
+                ?.takeIf { it.isNotBlank() }
+                ?: _uiState.value.session.username
+
+        /*
+         * Capture the current in-memory token before SessionState is reset. This is useful for normal
+         * local logout. During rejected auto-login cleanup attemptRemoteAbort is false.
+         */
+        val departingAccessToken =
+            _uiState.value.session.accessToken
+                .takeIf { it.isNotBlank() }
+
+        /*
+         * Read from persistent storage rather than from the UI mirror, because startup cleanup may happen
+         * before collectors have projected these records.
+         */
+        val uploadSnapshot =
+            transferStore.uploadsOnce()
+                .filter { transfer ->
+                    belongsToDepartingAccount(
+                        transfer.accountKey,
+                        departingAccount,
+                    )
+                }
+
+        val downloadSnapshot =
+            transferStore.downloadsOnce()
+                .filter { transfer ->
+                    belongsToDepartingAccount(
+                        transfer.accountKey,
+                        departingAccount,
+                    )
+                }
 
         uploadWorkStates.clear()
         overwriteWarnedUploads.clear()
         handledUploadWorkIds.clear()
         handledDownloadWorkIds.clear()
-        // Enqueue grace only guards a transfer that was just queued by this session; preserved
-        // foreign transfers are not reconciled by this session anyway.
         recentlyEnqueuedTransfers.clear()
+
         uploadBatchId = null
         uploadBatchTotalBytes = 0L
         uploadBatchWorkIds = emptySet()
 
-        // Every departing transfer stops running, including the metadata-only ones: the old session
-        // must not keep operating after logout.
+        /*
+         * Stop every departing WorkManager item first, including metadata-only uploads.
+         *
+         * The atomic DataStore phase check happens only after workers have been asked to stop, which
+         * greatly narrows the completion race.
+         */
         awaitWorkCancellations(
-            UploadWork.cancelTransfers(getApplication(), uploads.map(UploadTransfer::transferId))
+            UploadWork.cancelTransfers(
+                getApplication(),
+                uploadSnapshot.map(
+                    UploadTransfer::transferId
+                ),
+            )
         )
-        downloads.forEach { transfer ->
-            awaitDownloadCancellation(DownloadWork.cancelTransfer(getApplication(), transfer.transferId))
-        }
-        transferStore.removeUploads(abortableUploads.map(UploadTransfer::transferId))
-        transferStore.removeDownloads(downloads.map(DownloadTransfer::transferId))
-        val removedUploadIds = abortableUploads.mapTo(mutableSetOf(), UploadTransfer::transferId)
-        uploadTransfers = uploadTransfers.filterNot { it.transferId in removedUploadIds }
-        downloadTransfers = downloadTransfers.filterNot { transfer ->
-            downloads.any { it.transferId == transfer.transferId }
+
+        downloadSnapshot.forEach { transfer ->
+            awaitDownloadCancellation(
+                DownloadWork.cancelTransfer(
+                    getApplication(),
+                    transfer.transferId,
+                )
+            )
         }
 
+        /*
+         * Re-check CURRENT upload phase inside DataStore.
+         *
+         * A transfer that changed to METADATA_PENDING while cancellation was racing is preserved rather
+         * than accidentally removed.
+         */
+        val removedUploads =
+            transferStore.removeCancellableUploads(
+                uploadSnapshot.map(
+                    UploadTransfer::transferId
+                )
+            )
+
+        /*
+         * Downloads have no equivalent metadata-only state. The returned list matters: a download that
+         * completed and removed its record just before cancellation is now a completed user file and must
+         * not be deleted as though it were still a temporary download.
+         */
+        val removedDownloads =
+            transferStore.removeDownloads(
+                downloadSnapshot.map(
+                    DownloadTransfer::transferId
+                )
+            )
+
+        /*
+         * Reload the authoritative store after mutation. This retains foreign-account transfers and any
+         * newly preserved METADATA_PENDING record.
+         */
+        uploadTransfers =
+            transferStore.uploadsOnce()
+
+        downloadTransfers =
+            transferStore.downloadsOnce()
+
+        val preservedMetadataUploads =
+            uploadTransfers.filter { transfer ->
+                belongsToDepartingAccount(
+                    transfer.accountKey,
+                    departingAccount,
+                ) &&
+                        transfer.phase ==
+                        UploadPhase.METADATA_PENDING
+            }
+
         withContext(Dispatchers.IO) {
-            withTimeoutOrNull(LOGOUT_ABORT_TIMEOUT_MILLIS) {
-                abortableUploads.forEach { transfer ->
-                    runCatching {
-                        if (transfer.uploadId.isBlank() || transfer.objectKey.isBlank()) return@runCatching
-                        val accessToken = currentAccessToken() ?: return@runCatching
-                        val ticket = backendService.requestOssSts(
-                            accessToken = accessToken,
-                            pathString = transfer.pathString,
-                            filename = transfer.displayName,
-                            parentId = transfer.parentId,
-                            language = AppLanguage.fromCode(transfer.language),
-                            usage = OSS_USAGE_SINGLE_FILE_UPLOAD,
-                        )
-                        transferRepository.abortMultipartUpload(
-                            ticket = ticket,
-                            objectKey = transfer.objectKey,
-                            uploadId = transfer.uploadId,
-                            credentialProvider = TransferStsCredentialProvider(
-                                transfer = transfer,
-                                accessToken = accessToken,
-                                backendService = backendService,
-                                firstTicket = ticket,
-                            ),
-                        )
+            /*
+             * Normal logout may still have a usable token and can clean the remote multipart immediately.
+             *
+             * Rejected auto-login skips this because the token is known invalid. Local deletion remains
+             * authoritative and the incomplete-multipart lifecycle rule handles any remote leftovers.
+             */
+            if (
+                attemptRemoteAbort &&
+                !departingAccessToken.isNullOrBlank()
+            ) {
+                withTimeoutOrNull(
+                    LOGOUT_ABORT_TIMEOUT_MILLIS
+                ) {
+                    removedUploads.forEach { transfer ->
+                        if (
+                            transfer.uploadId.isBlank() ||
+                            transfer.objectKey.isBlank()
+                        ) {
+                            return@forEach
+                        }
+
+                        try {
+                            val ticket =
+                                backendService.requestOssSts(
+                                    accessToken =
+                                        departingAccessToken,
+                                    pathString =
+                                        transfer.pathString,
+                                    filename =
+                                        transfer.displayName,
+                                    parentId =
+                                        transfer.parentId,
+                                    language =
+                                        AppLanguage.fromCode(
+                                            transfer.language
+                                        ),
+                                    usage =
+                                        OSS_USAGE_SINGLE_FILE_UPLOAD,
+                                )
+
+                            transferRepository.abortMultipartUpload(
+                                ticket = ticket,
+                                objectKey =
+                                    transfer.objectKey,
+                                uploadId =
+                                    transfer.uploadId,
+                                credentialProvider =
+                                    TransferStsCredentialProvider(
+                                        transfer =
+                                            transfer,
+                                        accessToken =
+                                            departingAccessToken,
+                                        backendService =
+                                            backendService,
+                                        firstTicket =
+                                            ticket,
+                                    ),
+                            )
+                        } catch (cancellation: CancellationException) {
+                            throw cancellation
+                        } catch (throwable: Throwable) {
+                            Log.w(
+                                TAG,
+                                "Best-effort multipart cleanup failed while ending session for ${transfer.displayName}",
+                                throwable,
+                            )
+                        }
                     }
                 }
             }
-            // Local checkpoints and unfinished MediaStore items are always removed, even when the
-            // best-effort abort above timed out. A metadata-pending checkpoint is inert after Complete,
-            // so its directory is cleaned too — the transfer record itself is what is preserved.
-            abortableUploads.forEach { transferRepository.deleteCheckpointDirectory(it.checkpointDir) }
-            metadataPendingUploads.forEach { transferRepository.deleteCheckpointDirectory(it.checkpointDir) }
-            downloads.forEach { transferRepository.deleteDownloadDestination(it.destinationUri) }
+
+            /*
+             * Local resumable state always disappears for transfers that were actually removed.
+             */
+            removedUploads.forEach { transfer ->
+                transferRepository
+                    .deleteCheckpointDirectory(
+                        transfer.checkpointDir
+                    )
+            }
+
+            /*
+             * A metadata-pending record no longer needs its OSS checkpoint. Keep only the tiny recovery
+             * record itself.
+             */
+            preservedMetadataUploads.forEach { transfer ->
+                transferRepository
+                    .deleteCheckpointDirectory(
+                        transfer.checkpointDir
+                    )
+            }
+
+            /*
+             * Delete only destinations whose persistent transfer records were actually removed.
+             *
+             * If a download completed just before cancellation and its worker already removed the record,
+             * its published local file is deliberately left untouched.
+             */
+            removedDownloads.forEach { transfer ->
+                transferRepository
+                    .deleteDownloadDestination(
+                        transfer.destinationUri
+                    )
+            }
         }
 
-        // The session ends before the permission sweep: the departing file selection no longer holds
-        // document permissions, and the preserved metadata-only records do not need any either. The
-        // work snapshot is cleared because the departing work was cancelled just above.
+        /*
+         * Reset every user-visible account/session state. Theme/language stay because they are device
+         * preferences rather than authenticated account content.
+         */
         _uiState.update { state ->
             state.copy(
                 bootstrapping = false,
@@ -2263,26 +3231,43 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 session = SessionState(),
                 currentTab = AppTab.ACCOUNT,
                 tabBackStack = emptyList(),
-                settingsSubPage = SettingsSubPage.ROOT,
+                settingsSubPage =
+                    SettingsSubPage.ROOT,
                 disk = DiskScreenState(),
-                reading = ReadingScreenState(),
+                reading =
+                    ReadingScreenState(),
             )
         }
+
+        /*
+         * Work snapshots from the departed session must no longer keep SAF permissions alive.
+         */
         uploadWorkInfos = emptyList()
         downloadWorkInfos = emptyList()
 
-        // Permissions the departing account no longer needs are released here; a preserved foreign
-        // transfer keeps the read permission of its document, and a metadata-pending record no longer
-        // counts as a consumer at all.
-        val releaseFailures = releaseUnusedUploadPermissions()
-        cleanupPreviewCacheFiles(cacheFilesToDelete)
-        previewRepository.clearAllPreviewCache()
+        /*
+         * Source permissions of deleted transfers and picker candidates are now released. Foreign
+         * transfers still present in uploadTransfers continue protecting their own source documents.
+         */
+        val releaseFailures =
+            releaseUnusedUploadPermissions()
+
+        cleanupPreviewCacheFiles(
+            cacheFilesToDelete
+        )
+
+        previewRepository
+            .clearAllPreviewCache()
+
         invalidateDiskRequests()
+
         if (releaseFailures.isNotEmpty()) {
             sendErrorMessage(
                 bulkReleaseUploadPermissionFailedMessage(
-                    count = releaseFailures.size,
-                    throwable = releaseFailures.first(),
+                    count =
+                        releaseFailures.size,
+                    throwable =
+                        releaseFailures.first(),
                 )
             )
         }
@@ -2459,6 +3444,140 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         AppLanguage.EN_US -> "Registration succeeded. Switch back to Login."
     }
 
+    private fun uploadDeleteDeferredCleanupMessage(
+        count: Int,
+    ): String =
+        when (_uiState.value.settings.language) {
+            AppLanguage.ZH_CN ->
+                "已删除上传任务并清理本地断点，但有 $count 个 OSS 分片任务未能立即清理，将由存储生命周期规则继续兜底。"
+
+            AppLanguage.EN_US ->
+                "$count upload(s) were removed locally, but their OSS multipart data could not be cleaned immediately and will be handled by the storage lifecycle rule."
+        }
+
+    private fun downloadDeleteCleanupFailedMessage(
+        count: Int,
+    ): String =
+        when (_uiState.value.settings.language) {
+            AppLanguage.ZH_CN ->
+                "下载任务已停止，但有 $count 个本地临时文件未能确认删除，可稍后再次清理。"
+
+            AppLanguage.EN_US ->
+                "The downloads were stopped, but $count local temporary file(s) could not be confirmed as deleted."
+        }
+
+    /**
+     * Deletes every unfinished download owned by the active account.
+     *
+     * Each WorkManager writer is stopped first, then persistent state is removed, and finally every
+     * pending MediaStore destination is deleted.
+     */
+    fun deleteAllDownloads() {
+        viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
+            }
+
+            val targets =
+                downloadTransfers.filter { transfer ->
+                    isOwnedByActiveSession(
+                        transfer.accountKey
+                    )
+                }
+
+            if (targets.isEmpty()) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            try {
+                val targetIds =
+                    targets.mapTo(
+                        mutableSetOf(),
+                        DownloadTransfer::transferId,
+                    )
+
+                /*
+                 * Issue every cancellation before waiting for any one of them. This prevents a slow worker
+                 * from delaying cancellation of the remaining downloads.
+                 */
+                val cancellationOperations =
+                    targets.map { transfer ->
+                        DownloadWork.cancelTransfer(
+                            getApplication(),
+                            transfer.transferId,
+                        )
+                    }
+
+                withContext(Dispatchers.IO) {
+                    cancellationOperations.forEach { operation ->
+                        DownloadWork.awaitCancellation(
+                            operation,
+                            WORK_CANCELLATION_TIMEOUT_MILLIS,
+                        )
+                    }
+                }
+
+                /*
+                 * Now no normal worker should still own the destinations. Batch-remove the persistent
+                 * records atomically so process death cannot leave only half the list deleted.
+                 */
+                transferStore.removeDownloads(
+                    targetIds
+                )
+
+                downloadTransfers =
+                    downloadTransfers.filterNot { transfer ->
+                        transfer.transferId in targetIds
+                    }
+
+                targetIds.forEach { transferId ->
+                    recentlyEnqueuedTransfers.remove(transferId)
+                }
+
+                refreshTransferUi()
+
+                /*
+                 * Use the snapshot captured before cancellation rather than the records returned by the
+                 * store. A very fast worker may have completed and removed its own record during the
+                 * cancellation race; Delete all still means that destination should not remain locally.
+                 */
+                val cleanupFailures =
+                    withContext(Dispatchers.IO) {
+                        targets.filterNot { transfer ->
+                            transferRepository.deleteDownloadDestination(
+                                transfer.destinationUri
+                            )
+                        }
+                    }
+
+                if (cleanupFailures.isNotEmpty()) {
+                    sendWarningMessage(
+                        downloadDeleteCleanupFailedMessage(
+                            cleanupFailures.size
+                        )
+                    )
+                } else {
+                    sendInfoMessage(
+                        strings().transfers.transferCanceled
+                    )
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                Log.w(
+                    TAG,
+                    "Unable to delete all downloads",
+                    throwable,
+                )
+                sendThrowableMessage(throwable)
+            } finally {
+                setTransferActionBusy(false)
+            }
+        }
+    }
+
     private companion object {
         const val TAG = "NotesAppViewModel"
 
@@ -2485,4 +3604,333 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         /** Upper bound for waiting until WorkManager persisted a cancellation. */
         const val WORK_CANCELLATION_TIMEOUT_MILLIS = 5_000L
     }
+
+    fun pauseAllUploads() {
+        viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
+            }
+
+            val targets =
+                ownedUploadTransfers().filter {
+                    it.phase == UploadPhase.TRANSFERRING
+                }
+
+            if (targets.isEmpty()) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            try {
+                val updatedById = mutableMapOf<String, UploadTransfer>()
+
+                targets.forEach { transfer ->
+                    transferStore.updateUpload(transfer.transferId) { current ->
+                        if (current.phase == UploadPhase.TRANSFERRING) {
+                            current.copy(
+                                phase = UploadPhase.PAUSED
+                            )
+                        } else {
+                            current
+                        }
+                    }?.let { updated ->
+                        updatedById[updated.transferId] = updated
+                    }
+                }
+
+                uploadTransfers =
+                    uploadTransfers.map { current ->
+                        updatedById[current.transferId] ?: current
+                    }
+
+                refreshTransferUi()
+
+                awaitWorkCancellations(
+                    UploadWork.cancelTransfers(
+                        getApplication(),
+                        targets.map(UploadTransfer::transferId),
+                    )
+                )
+
+                sendInfoMessage(strings().transfers.paused)
+            } finally {
+                setTransferActionBusy(false)
+            }
+        }
+    }
+
+    fun resumeAllUploads() {
+        viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
+            }
+
+            val session = activeSession() ?: return@launch
+
+            val targets =
+                ownedUploadTransfers().filter {
+                    it.phase == UploadPhase.PAUSED
+                }
+
+            if (targets.isEmpty()) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            val resumed = mutableListOf<UploadTransfer>()
+
+            try {
+                targets.forEach { transfer ->
+                    transferStore.updateUpload(transfer.transferId) { current ->
+                        if (current.phase == UploadPhase.PAUSED) {
+                            current.copy(
+                                phase = UploadPhase.TRANSFERRING
+                            )
+                        } else {
+                            current
+                        }
+                    }?.let(resumed::add)
+                }
+
+                val resumedById =
+                    resumed.associateBy(UploadTransfer::transferId)
+
+                uploadTransfers =
+                    uploadTransfers.map { current ->
+                        resumedById[current.transferId] ?: current
+                    }
+
+                refreshTransferUi()
+
+                if (resumed.isEmpty()) {
+                    return@launch
+                }
+
+                uploadBatchId = resumed.first().batchId
+                uploadBatchTotalBytes = resumed.first().batchTotalBytes
+
+                markRecentlyEnqueued(
+                    resumed.map(UploadTransfer::transferId)
+                )
+
+                val batch = UploadWork.enqueue(
+                    context = getApplication(),
+                    accessToken = session.accessToken,
+                    transfers = resumed,
+                )
+
+                uploadBatchWorkIds =
+                    uploadBatchWorkIds + batch?.workIds.orEmpty()
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                val ids =
+                    resumed.mapTo(
+                        mutableSetOf(),
+                        UploadTransfer::transferId,
+                    )
+
+                awaitWorkCancellations(
+                    UploadWork.cancelTransfers(
+                        getApplication(),
+                        ids,
+                    )
+                )
+
+                val pausedById = mutableMapOf<String, UploadTransfer>()
+
+                ids.forEach { transferId ->
+                    transferStore.updateUpload(transferId) { current ->
+                        if (current.phase == UploadPhase.TRANSFERRING) {
+                            current.copy(
+                                phase = UploadPhase.PAUSED
+                            )
+                        } else {
+                            current
+                        }
+                    }?.let { paused ->
+                        pausedById[transferId] = paused
+                    }
+                }
+
+                uploadTransfers =
+                    uploadTransfers.map { current ->
+                        pausedById[current.transferId] ?: current
+                    }
+
+                refreshTransferUi()
+                sendThrowableMessage(throwable)
+            } finally {
+                setTransferActionBusy(false)
+            }
+        }
+    }
+
+    fun pauseAllDownloads() {
+        viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
+            }
+
+            val targets =
+                downloadTransfers.filter { transfer ->
+                    isOwnedByActiveSession(transfer.accountKey) &&
+                            transfer.phase == DownloadPhase.TRANSFERRING
+                }
+
+            if (targets.isEmpty()) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            try {
+                val updatedById =
+                    mutableMapOf<String, DownloadTransfer>()
+
+                targets.forEach { transfer ->
+                    transferStore.updateDownload(transfer.transferId) { current ->
+                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                            current.copy(
+                                phase = DownloadPhase.PAUSED
+                            )
+                        } else {
+                            current
+                        }
+                    }?.let { updated ->
+                        updatedById[updated.transferId] = updated
+                    }
+                }
+
+                downloadTransfers =
+                    downloadTransfers.map { current ->
+                        updatedById[current.transferId] ?: current
+                    }
+
+                refreshTransferUi()
+
+                targets.forEach { transfer ->
+                    awaitDownloadCancellation(
+                        DownloadWork.cancelTransfer(
+                            getApplication(),
+                            transfer.transferId,
+                        )
+                    )
+                }
+
+                sendInfoMessage(strings().transfers.paused)
+            } finally {
+                setTransferActionBusy(false)
+            }
+        }
+    }
+
+    fun resumeAllDownloads() {
+        viewModelScope.launch {
+            if (_uiState.value.disk.transferActionBusy) {
+                return@launch
+            }
+
+            val session = activeSession() ?: return@launch
+
+            val targets =
+                downloadTransfers.filter { transfer ->
+                    isOwnedByActiveSession(transfer.accountKey) &&
+                            transfer.phase == DownloadPhase.PAUSED
+                }
+
+            if (targets.isEmpty()) {
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            val resumed = mutableListOf<DownloadTransfer>()
+
+            try {
+                targets.forEach { transfer ->
+                    transferStore.updateDownload(transfer.transferId) { current ->
+                        if (current.phase == DownloadPhase.PAUSED) {
+                            current.copy(
+                                phase = DownloadPhase.TRANSFERRING
+                            )
+                        } else {
+                            current
+                        }
+                    }?.let(resumed::add)
+                }
+
+                val resumedById =
+                    resumed.associateBy(DownloadTransfer::transferId)
+
+                downloadTransfers =
+                    downloadTransfers.map { current ->
+                        resumedById[current.transferId] ?: current
+                    }
+
+                refreshTransferUi()
+
+                if (resumed.isEmpty()) {
+                    return@launch
+                }
+
+                markRecentlyEnqueued(
+                    resumed.map(DownloadTransfer::transferId)
+                )
+
+                DownloadWork.enqueue(
+                    context = getApplication(),
+                    accessToken = session.accessToken,
+                    transfers = resumed,
+                )
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (throwable: Throwable) {
+                val ids =
+                    resumed.mapTo(
+                        mutableSetOf(),
+                        DownloadTransfer::transferId,
+                    )
+
+                val pausedById =
+                    mutableMapOf<String, DownloadTransfer>()
+
+                ids.forEach { transferId ->
+                    runCatching {
+                        awaitDownloadCancellation(
+                            DownloadWork.cancelTransfer(
+                                getApplication(),
+                                transferId,
+                            )
+                        )
+                    }
+
+                    transferStore.updateDownload(transferId) { current ->
+                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                            current.copy(
+                                phase = DownloadPhase.PAUSED
+                            )
+                        } else {
+                            current
+                        }
+                    }?.let { paused ->
+                        pausedById[transferId] = paused
+                    }
+                }
+
+                downloadTransfers =
+                    downloadTransfers.map { current ->
+                        pausedById[current.transferId] ?: current
+                    }
+
+                refreshTransferUi()
+                sendThrowableMessage(throwable)
+            } finally {
+                setTransferActionBusy(false)
+            }
+        }
+    }
+
 }

@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -44,7 +43,6 @@ import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.Button
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -79,7 +77,6 @@ import com.notes.notes.core.ThemeMode
 import com.notes.notes.core.UploadCandidate
 import com.notes.notes.core.UploadPhase
 import com.notes.notes.core.UploadTransferEntry
-import com.notes.notes.core.label
 import com.notes.notes.core.stringsFor
 import com.notes.notes.ui.NotesAppViewModel
 import com.notes.notes.ui.components.ActionChip
@@ -101,6 +98,7 @@ import com.notes.notes.ui.components.SelectionCheck
 import com.notes.notes.ui.components.StatusCard
 import com.notes.notes.ui.theme.LocalNotesExtraColors
 import kotlin.math.roundToInt
+import com.notes.notes.ui.components.IconBubble
 
 @Composable
 fun DiskScreen(
@@ -113,6 +111,7 @@ fun DiskScreen(
     val listState = rememberLazyListState()
     var sortSheetVisible by rememberSaveable { mutableStateOf(false) }
     var uploadSheetVisible by rememberSaveable { mutableStateOf(false) }
+    var downloadTransfersSheetVisible by rememberSaveable { mutableStateOf(false) }
     var downloadedFilesSheetVisible by rememberSaveable { mutableStateOf(false) }
     var createFolderDraft by rememberSaveable { mutableStateOf("") }
     var renameDirectoryTarget by remember { mutableStateOf<DirectoryEntry?>(null) }
@@ -126,6 +125,12 @@ fun DiskScreen(
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val candidates = uris.mapNotNull { uri -> resolveUploadCandidate(context, uri) }
         viewModel.chooseUploadCandidates(candidates)
+    }
+
+    LaunchedEffect(uiState.disk.downloadTransfers.isEmpty()) {
+        if (uiState.disk.downloadTransfers.isEmpty()) {
+            downloadTransfersSheetVisible = false
+        }
     }
 
     val viewportPaddingKey = remember(
@@ -174,6 +179,17 @@ fun DiskScreen(
                 ScreenHeader(
                     title = strings.nav.disk,
                     trailing = {
+                        // Only unfinished downloads get a transfer entry point. It deliberately sits immediately to the
+                        // left of the completed-download repository.
+                        if (uiState.disk.downloadTransfers.isNotEmpty()) {
+                            ActionChip(
+                                icon = Icons.Outlined.Download,
+                                onClick = {
+                                    downloadTransfersSheetVisible = true
+                                },
+                            )
+                        }
+
                         ActionChip(
                             icon = Icons.Outlined.Inventory2,
                             onClick = {
@@ -181,6 +197,7 @@ fun DiskScreen(
                                 viewModel.loadDownloadedFiles()
                             },
                         )
+
                         ActionChip(
                             icon = diskThemeModeIcon(uiState.settings.theme.mode),
                             onClick = viewModel::toggleThemeMode,
@@ -308,16 +325,41 @@ fun DiskScreen(
         )
     }
 
+    if (downloadTransfersSheetVisible) {
+        DownloadTransfersBottomSheet(
+            uiState = uiState,
+            onDismiss = {
+                downloadTransfersSheetVisible = false
+            },
+            onPauseDownload = viewModel::pauseDownload,
+            onResumeDownload = viewModel::resumeDownload,
+            onDeleteDownload = viewModel::cancelDownload,
+            onPauseAll = viewModel::pauseAllDownloads,
+            onResumeAll = viewModel::resumeAllDownloads,
+            onDeleteAll = {
+                cancelTransferTarget =
+                    CancelTransferTarget.DownloadAll
+            },
+        )
+    }
+
     if (downloadedFilesSheetVisible) {
         DownloadedFilesBottomSheet(
             uiState = uiState,
-            onDismiss = { downloadedFilesSheetVisible = false },
+            onDismiss = {
+                downloadedFilesSheetVisible = false
+            },
             onRetry = viewModel::loadDownloadedFiles,
-            onOpenFile = { file -> openDownloadedFile(context, file, strings.common.unknownError) },
-            onDeleteFile = { file -> deleteDownloadedFileTarget = file },
-            onPauseDownload = viewModel::pauseDownload,
-            onResumeDownload = viewModel::resumeDownload,
-            onCancelDownload = viewModel::cancelDownload,
+            onOpenFile = { file ->
+                openDownloadedFile(
+                    context,
+                    file,
+                    strings.common.unknownError,
+                )
+            },
+            onDeleteFile = { file ->
+                deleteDownloadedFileTarget = file
+            },
         )
     }
 
@@ -329,20 +371,31 @@ fun DiskScreen(
             uploadTransfers = uiState.disk.uploadTransfers,
             isUploading = uiState.disk.isUploading,
             transferActionBusy = uiState.disk.transferActionBusy,
-            uploadProgress = uiState.disk.uploadProgress,
-            onDismiss = { uploadSheetVisible = false },
+            onDismiss = {
+                uploadSheetVisible = false
+            },
             onCreateFolder = {
                 viewModel.createDirectory(createFolderDraft)
                 createFolderDraft = ""
             },
-            onPickFiles = { filePicker.launch(arrayOf("*/*")) },
+            onPickFiles = {
+                filePicker.launch(arrayOf("*/*"))
+            },
             onRemoveCandidate = viewModel::removeUploadCandidate,
             onClearCandidates = viewModel::clearUploadCandidates,
             onUpload = viewModel::uploadSelectedFiles,
-            onPauseUploads = viewModel::pauseUploads,
-            onResumeUploads = viewModel::resumeUploads,
-            onCancelUploads = { cancelTransferTarget = CancelTransferTarget.Uploads },
-            onCancelUploadTransfer = { transferId -> cancelTransferTarget = CancelTransferTarget.Upload(transferId) },
+            onPauseUpload = viewModel::pauseUpload,
+            onResumeUpload = viewModel::resumeUpload,
+            onDeleteUploadTransfer = { transferId ->
+                cancelTransferTarget =
+                    CancelTransferTarget.Upload(transferId)
+            },
+            onPauseAllUploads = viewModel::pauseAllUploads,
+            onResumeAllUploads = viewModel::resumeAllUploads,
+            onDeleteAllUploads = {
+                cancelTransferTarget =
+                    CancelTransferTarget.UploadAll
+            },
             language = uiState.settings.language,
             strings = strings,
         )
@@ -350,23 +403,49 @@ fun DiskScreen(
 
     when (val target = cancelTransferTarget) {
         null -> Unit
-        CancelTransferTarget.Uploads -> ConfirmCancelTransferDialog(
-            onDismiss = { cancelTransferTarget = null },
-            onConfirm = {
-                viewModel.cancelUploads()
-                cancelTransferTarget = null
-            },
-            strings = strings,
-        )
 
-        is CancelTransferTarget.Upload -> ConfirmCancelTransferDialog(
-            onDismiss = { cancelTransferTarget = null },
-            onConfirm = {
-                viewModel.cancelUpload(target.transferId)
-                cancelTransferTarget = null
-            },
-            strings = strings,
-        )
+        is CancelTransferTarget.Upload -> {
+            ConfirmCancelTransferDialog(
+                onDismiss = {
+                    cancelTransferTarget = null
+                },
+                onConfirm = {
+                    viewModel.cancelUpload(
+                        target.transferId
+                    )
+                    cancelTransferTarget = null
+                },
+                strings = strings,
+            )
+        }
+
+        CancelTransferTarget.UploadAll -> {
+            ConfirmDeleteAllTransfersDialog(
+                language = uiState.settings.language,
+                isUpload = true,
+                onDismiss = {
+                    cancelTransferTarget = null
+                },
+                onConfirm = {
+                    viewModel.deleteAllUploads()
+                    cancelTransferTarget = null
+                },
+            )
+        }
+
+        CancelTransferTarget.DownloadAll -> {
+            ConfirmDeleteAllTransfersDialog(
+                language = uiState.settings.language,
+                isUpload = false,
+                onDismiss = {
+                    cancelTransferTarget = null
+                },
+                onConfirm = {
+                    viewModel.deleteAllDownloads()
+                    cancelTransferTarget = null
+                },
+            )
+        }
     }
 
     renameDirectoryTarget?.let { directory ->
@@ -562,13 +641,12 @@ private fun DownloadedFilesBottomSheet(
     onRetry: () -> Unit,
     onOpenFile: (DownloadedFileEntry) -> Unit,
     onDeleteFile: (DownloadedFileEntry) -> Unit,
-    onPauseDownload: (String) -> Unit,
-    onResumeDownload: (String) -> Unit,
-    onCancelDownload: (String) -> Unit,
 ) {
     val strings = stringsFor(uiState.settings.language)
-    val language = uiState.settings.language
-    NotesModalBottomSheet(onDismissRequest = onDismiss) {
+
+    NotesModalBottomSheet(
+        onDismissRequest = onDismiss,
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -576,64 +654,10 @@ private fun DownloadedFilesBottomSheet(
                 .padding(bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Download/Notes", style = MaterialTheme.typography.titleLarge)
-
-            if (uiState.disk.downloadTransfers.isNotEmpty()) {
-                Text(
-                    text = strings.transfers.activeTransfers,
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                SectionListCard {
-                    uiState.disk.downloadTransfers.forEachIndexed { index, transfer ->
-                        val active = transfer.phase == DownloadPhase.TRANSFERRING
-                        val stateLabel = when {
-                            transfer.waitingForNetwork -> strings.transfers.waitingForNetwork
-                            active -> strings.transfers.downloading
-                            else -> strings.transfers.paused
-                        }
-                        val percent = (transfer.fraction * 100f).roundToInt()
-                        val progressLabel = if (transfer.totalBytes > 0L) {
-                            val bytes = strings.format(
-                                strings.transfers.bytesProgressTemplate,
-                                language.asLocale(),
-                                formatFileSize(transfer.downloadedBytes, language),
-                                formatFileSize(transfer.totalBytes, language),
-                            )
-                            "$bytes · $percent%"
-                        } else {
-                            formatFileSize(transfer.downloadedBytes, language)
-                        }
-                        SectionRow(
-                            title = transfer.fileName,
-                            subtitle = "$stateLabel\n$progressLabel",
-                            icon = Icons.Outlined.Download,
-                            scrollableTitle = true,
-                            trailing = {
-                                if (active && !transfer.waitingForNetwork) {
-                                    RowActionButton(
-                                        icon = Icons.Outlined.Pause,
-                                        onClick = { onPauseDownload(transfer.transferId) },
-                                    )
-                                } else {
-                                    RowActionButton(
-                                        icon = Icons.Outlined.PlayArrow,
-                                        onClick = { onResumeDownload(transfer.transferId) },
-                                    )
-                                }
-                                RowActionButton(
-                                    icon = Icons.Outlined.Close,
-                                    onClick = { onCancelDownload(transfer.transferId) },
-                                    tint = MaterialTheme.colorScheme.error,
-                                    containerColor = LocalNotesExtraColors.current.danger.copy(alpha = 0.12f),
-                                )
-                            },
-                        )
-                        if (index < uiState.disk.downloadTransfers.lastIndex) {
-                            SectionDivider()
-                        }
-                    }
-                }
-            }
+            Text(
+                text = "Download/Notes",
+                style = MaterialTheme.typography.titleLarge,
+            )
 
             when {
                 uiState.disk.isLoadingDownloadedFiles -> {
@@ -660,27 +684,181 @@ private fun DownloadedFilesBottomSheet(
                 else -> {
                     SectionListCard {
                         uiState.disk.downloadedFiles.forEachIndexed { index, file ->
-                            val (icon, iconTint) = downloadedFileVisual(file)
+                            val (icon, iconTint) =
+                                downloadedFileVisual(file)
+
                             SectionRow(
                                 title = file.name,
-                                subtitle = downloadedFileMetadata(file, uiState.settings.language),
+                                subtitle = downloadedFileMetadata(
+                                    file,
+                                    uiState.settings.language,
+                                ),
                                 icon = icon,
                                 iconTint = iconTint,
                                 scrollableTitle = true,
-                                onClick = { onOpenFile(file) },
+                                onClick = {
+                                    onOpenFile(file)
+                                },
                                 trailing = {
                                     RowActionButton(
                                         icon = Icons.Outlined.Delete,
-                                        onClick = { onDeleteFile(file) },
+                                        onClick = {
+                                            onDeleteFile(file)
+                                        },
                                         tint = MaterialTheme.colorScheme.error,
-                                        containerColor = LocalNotesExtraColors.current.danger.copy(alpha = 0.12f),
+                                        containerColor =
+                                            LocalNotesExtraColors.current.danger.copy(
+                                                alpha = 0.12f
+                                            ),
                                     )
                                 },
                             )
+
                             if (index < uiState.disk.downloadedFiles.lastIndex) {
                                 SectionDivider()
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DownloadTransfersBottomSheet(
+    uiState: NotesUiState,
+    onDismiss: () -> Unit,
+    onPauseDownload: (String) -> Unit,
+    onResumeDownload: (String) -> Unit,
+    onDeleteDownload: (String) -> Unit,
+    onPauseAll: () -> Unit,
+    onResumeAll: () -> Unit,
+    onDeleteAll: () -> Unit,
+) {
+    val strings = stringsFor(uiState.settings.language)
+    val busy = uiState.disk.transferActionBusy
+
+    val hasTransferring =
+        uiState.disk.downloadTransfers.any {
+            it.phase == DownloadPhase.TRANSFERRING
+        }
+
+    val hasPaused =
+        uiState.disk.downloadTransfers.any {
+            it.phase == DownloadPhase.PAUSED
+        }
+
+    val globalActionLabel =
+        when (uiState.settings.language) {
+            AppLanguage.ZH_CN ->
+                if (hasTransferring) "全部暂停" else "全部继续"
+
+            AppLanguage.EN_US ->
+                if (hasTransferring) "Pause all" else "Resume all"
+        }
+
+    NotesModalBottomSheet(
+        onDismissRequest = onDismiss,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 8.dp)
+                .padding(bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = strings.transfers.activeTransfers,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleLarge,
+                )
+
+                if (hasTransferring || hasPaused) {
+                    TextButton(
+                        enabled = !busy,
+                        onClick = {
+                            if (hasTransferring) {
+                                onPauseAll()
+                            } else {
+                                onResumeAll()
+                            }
+                        },
+                    ) {
+                        Text(globalActionLabel)
+                    }
+
+                    TextButton(
+                        enabled = !busy,
+                        onClick = onDeleteAll,
+                    ) {
+                        Text(
+                            text =
+                                when (uiState.settings.language) {
+                                    AppLanguage.ZH_CN ->
+                                        "全部删除"
+
+                                    AppLanguage.EN_US ->
+                                        "Delete all"
+                                },
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+
+            SectionListCard {
+                uiState.disk.downloadTransfers.forEachIndexed { index, transfer ->
+                    TransferProgressRow(
+                        fileName = transfer.fileName,
+                        progress = if (transfer.totalBytes > 0L) {
+                            transfer.fraction
+                        } else {
+                            null
+                        },
+                    ) {
+                        when (transfer.phase) {
+                            DownloadPhase.TRANSFERRING -> {
+                                RowActionButton(
+                                    icon = Icons.Outlined.Pause,
+                                    enabled = !busy,
+                                    onClick = {
+                                        onPauseDownload(transfer.transferId)
+                                    },
+                                )
+                            }
+
+                            DownloadPhase.PAUSED -> {
+                                RowActionButton(
+                                    icon = Icons.Outlined.PlayArrow,
+                                    enabled = !busy,
+                                    onClick = {
+                                        onResumeDownload(transfer.transferId)
+                                    },
+                                )
+
+                                RowActionButton(
+                                    icon = Icons.Outlined.Delete,
+                                    enabled = !busy,
+                                    onClick = {
+                                        onDeleteDownload(transfer.transferId)
+                                    },
+                                    tint = MaterialTheme.colorScheme.error,
+                                    containerColor =
+                                        LocalNotesExtraColors.current.danger.copy(
+                                            alpha = 0.12f
+                                        ),
+                                )
+                            }
+                        }
+                    }
+
+                    if (index < uiState.disk.downloadTransfers.lastIndex) {
+                        SectionDivider()
                     }
                 }
             }
@@ -701,27 +879,30 @@ private fun UploadBottomSheet(
     uploadTransfers: List<UploadTransferEntry>,
     isUploading: Boolean,
     transferActionBusy: Boolean,
-    uploadProgress: Float,
     onDismiss: () -> Unit,
     onCreateFolder: () -> Unit,
     onPickFiles: () -> Unit,
     onRemoveCandidate: (UploadCandidate) -> Unit,
     onClearCandidates: () -> Unit,
     onUpload: () -> Unit,
-    onPauseUploads: () -> Unit,
-    onResumeUploads: () -> Unit,
-    onCancelUploads: () -> Unit,
-    onCancelUploadTransfer: (String) -> Unit,
+    onPauseUpload: (String) -> Unit,
+    onResumeUpload: (String) -> Unit,
+    onDeleteUploadTransfer: (String) -> Unit,
+    onPauseAllUploads: () -> Unit,
+    onResumeAllUploads: () -> Unit,
+    onDeleteAllUploads: () -> Unit,
     language: AppLanguage,
     strings: com.notes.notes.core.AppStrings,
 ) {
-    var currentPage by rememberSaveable { mutableStateOf(UploadSubPage.CREATE_FOLDER) }
-    val transfersInFlight = uploadTransfers.isNotEmpty()
-    val hasPausableTransfer = uploadTransfers.any { it.phase == UploadPhase.TRANSFERRING }
-    val hasResumableTransfer = uploadTransfers.any { it.phase != UploadPhase.TRANSFERRING }
-    val hasFinalizingTransfer = uploadTransfers.any { it.phase == UploadPhase.METADATA_PENDING }
+    var currentPage by rememberSaveable {
+        mutableStateOf(UploadSubPage.CREATE_FOLDER)
+    }
 
-    NotesModalBottomSheet(onDismissRequest = onDismiss) {
+    val transfersInFlight = uploadTransfers.isNotEmpty()
+
+    NotesModalBottomSheet(
+        onDismissRequest = onDismiss,
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -735,7 +916,9 @@ private fun UploadBottomSheet(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = if (currentPage == UploadSubPage.CREATE_FOLDER) {
+                    text = if (
+                        currentPage == UploadSubPage.CREATE_FOLDER
+                    ) {
                         strings.fileDisk.createFolderTitle
                     } else {
                         strings.fileDisk.uploadFilesTitle
@@ -745,19 +928,27 @@ private fun UploadBottomSheet(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     InfoPill(
                         label = strings.fileDisk.uploadTypeDirectory,
-                        highlighted = currentPage == UploadSubPage.CREATE_FOLDER,
-                        onClick = { currentPage = UploadSubPage.CREATE_FOLDER },
+                        highlighted =
+                            currentPage == UploadSubPage.CREATE_FOLDER,
+                        onClick = {
+                            currentPage = UploadSubPage.CREATE_FOLDER
+                        },
                     )
+
                     InfoPill(
                         label = strings.fileDisk.uploadTypeFile,
-                        highlighted = currentPage == UploadSubPage.UPLOAD_FILES,
-                        onClick = { currentPage = UploadSubPage.UPLOAD_FILES },
+                        highlighted =
+                            currentPage == UploadSubPage.UPLOAD_FILES,
+                        onClick = {
+                            currentPage = UploadSubPage.UPLOAD_FILES
+                        },
                     )
                 }
             }
@@ -771,9 +962,12 @@ private fun UploadBottomSheet(
                         value = folderName,
                         onValueChange = onFolderNameChange,
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text(strings.fileDisk.dirName) },
+                        label = {
+                            Text(strings.fileDisk.dirName)
+                        },
                         singleLine = true,
                     )
+
                     PrimaryActionButton(
                         label = strings.common.create,
                         modifier = Modifier.fillMaxWidth(),
@@ -782,134 +976,119 @@ private fun UploadBottomSheet(
                     )
                 }
             } else {
-                if (uploadCandidates.isEmpty() && !transfersInFlight) {
-                    GlassPanel {
-                        Text(
-                            text = strings.fileDisk.emptySelectionHint,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalNotesExtraColors.current.textMuted,
-                        )
-                    }
-                }
-
+                /*
+                 * Once the batch exists, the selection UI disappears entirely. This makes it
+                 * impossible for the screen to suggest that another file can be appended to a
+                 * paused/in-progress batch.
+                 */
                 if (transfersInFlight) {
                     UploadTransferPanel(
                         transfers = uploadTransfers,
-                        batchProgress = uploadProgress,
                         busy = transferActionBusy,
-                        strings = strings,
                         language = language,
-                        onPause = onPauseUploads,
-                        onResume = onResumeUploads,
-                        onCancel = onCancelUploads,
-                        onCancelTransfer = onCancelUploadTransfer,
+                        onPause = onPauseUpload,
+                        onResume = onResumeUpload,
+                        onDelete = onDeleteUploadTransfer,
+                        onPauseAll = onPauseAllUploads,
+                        onResumeAll = onResumeAllUploads,
+                        onDeleteAll = onDeleteAllUploads,
                     )
-                    Text(
-                        text = if (hasFinalizingTransfer) {
-                            strings.transfers.finalizingMetadataHint
-                        } else {
-                            strings.transfers.resumableHint
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LocalNotesExtraColors.current.textMuted,
-                    )
-                }
-
-                if (uploadCandidates.isNotEmpty()) {
-                    SectionListCard {
-                        uploadCandidates.forEachIndexed { index, candidate ->
-                            SectionRow(
-                                title = candidate.displayName,
-                                subtitle = if (candidate.sizeBytes > 0) {
-                                    formatFileSize(candidate.sizeBytes, language)
-                                } else {
-                                    null
-                                },
-                                icon = Icons.AutoMirrored.Outlined.Article,
-                                trailing = {
-                                    RowActionButton(
-                                        icon = Icons.Outlined.Delete,
-                                        onClick = { onRemoveCandidate(candidate) },
-                                        tint = MaterialTheme.colorScheme.error,
-                                        containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
-                                    )
-                                },
+                } else {
+                    if (uploadCandidates.isEmpty()) {
+                        GlassPanel {
+                            Text(
+                                text = strings.fileDisk.emptySelectionHint,
+                                modifier = Modifier.padding(
+                                    horizontal = 16.dp,
+                                    vertical = 16.dp,
+                                ),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color =
+                                    LocalNotesExtraColors.current.textMuted,
                             )
-                            if (index < uploadCandidates.lastIndex) {
-                                SectionDivider()
+                        }
+                    } else {
+                        SectionListCard {
+                            uploadCandidates.forEachIndexed { index, candidate ->
+                                val (icon, iconTint) =
+                                    transferFileVisual(candidate.displayName)
+
+                                SectionRow(
+                                    title = candidate.displayName,
+                                    subtitle = if (candidate.sizeBytes > 0L) {
+                                        formatFileSize(
+                                            candidate.sizeBytes,
+                                            language,
+                                        )
+                                    } else {
+                                        null
+                                    },
+                                    icon = icon,
+                                    iconTint = iconTint,
+                                    trailing = {
+                                        RowActionButton(
+                                            icon = Icons.Outlined.Delete,
+                                            enabled =
+                                                !transferActionBusy &&
+                                                        !isUploading,
+                                            onClick = {
+                                                onRemoveCandidate(candidate)
+                                            },
+                                            tint =
+                                                MaterialTheme.colorScheme.error,
+                                            containerColor =
+                                                MaterialTheme.colorScheme.error.copy(
+                                                    alpha = 0.12f
+                                                ),
+                                        )
+                                    },
+                                )
+
+                                if (index < uploadCandidates.lastIndex) {
+                                    SectionDivider()
+                                }
                             }
                         }
                     }
-                }
 
-                if (isUploading && !transfersInFlight) {
-                    Surface(
-                        shape = RoundedCornerShape(18.dp),
-                        color = MaterialTheme.colorScheme.primaryContainer,
+                    val hasUploadCandidates =
+                        uploadCandidates.isNotEmpty()
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement =
+                            Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 14.dp, vertical = 12.dp),
-                        ) {
-                            androidx.compose.material3.LinearProgressIndicator(
-                                progress = { uploadProgress },
-                                modifier = Modifier.fillMaxWidth(),
+                        SecondaryActionButton(
+                            label = strings.fileDisk.pickFiles,
+                            modifier = Modifier.weight(1f),
+                            enabled =
+                                !transferActionBusy &&
+                                        !isUploading,
+                            onClick = onPickFiles,
+                        )
+
+                        if (hasUploadCandidates) {
+                            SecondaryActionButton(
+                                label =
+                                    strings.fileDisk.clearSelectedFiles,
+                                modifier = Modifier.weight(1f),
+                                enabled =
+                                    !transferActionBusy &&
+                                            !isUploading,
+                                onClick = onClearCandidates,
+                            )
+
+                            PrimaryActionButton(
+                                label = strings.common.upload,
+                                modifier = Modifier.weight(2f),
+                                enabled =
+                                    !transferActionBusy &&
+                                            !isUploading,
+                                onClick = onUpload,
                             )
                         }
-                    }
-                }
-
-                val hasUploadCandidates = uploadCandidates.isNotEmpty()
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    SecondaryActionButton(
-                        label = strings.fileDisk.pickFiles,
-                        modifier = Modifier.weight(1f),
-                        // One batch must be resolved before files for the next one are picked.
-                        // `isUploading` closes the short window in which a batch was already started
-                        // but its transfers are not projected into the UI state yet; the
-                        // `transfersInFlight` check keeps a paused or metadata-pending batch blocking
-                        // even though nothing is uploading at that moment.
-                        enabled = !transferActionBusy && !isUploading && !transfersInFlight,
-                        onClick = onPickFiles,
-                    )
-
-                    if (hasUploadCandidates && !transfersInFlight) {
-                        SecondaryActionButton(
-                            label = strings.fileDisk.clearSelectedFiles,
-                            modifier = Modifier.weight(1f),
-                            enabled = !transferActionBusy && !isUploading,
-                            onClick = onClearCandidates,
-                        )
-                    }
-                    if (hasPausableTransfer) {
-                        SecondaryActionButton(
-                            label = strings.transfers.pause,
-                            modifier = Modifier.weight(1f),
-                            enabled = !transferActionBusy && !hasFinalizingTransfer,
-                            onClick = onPauseUploads,
-                        )
-                    }
-                    if (hasResumableTransfer) {
-                        PrimaryActionButton(
-                            label = strings.transfers.resume,
-                            modifier = Modifier.weight(if (hasUploadCandidates) 2f else 1f),
-                            enabled = !transferActionBusy,
-                            onClick = onResumeUploads,
-                        )
-                    } else if (hasUploadCandidates) {
-                        PrimaryActionButton(
-                            label = strings.common.upload,
-                            modifier = Modifier.weight(2f),
-                            enabled = !transferActionBusy && !isUploading,
-                            onClick = onUpload,
-                        )
                     }
                 }
             }
@@ -917,155 +1096,219 @@ private fun UploadBottomSheet(
     }
 }
 
-/**
- * Batch and per-file progress of the uploads currently owned by this device.
- *
- * Every row exposes the transfer's own state: a transferring file can be paused, a paused file
- * resumed, and a file whose OSS upload already completed is shown as finalizing its metadata with
- * pausing disabled, because there is no OSS transfer left to pause. Such a row offers only a retry of
- * the metadata insert — its object is already complete in OSS, so a destructive cancel would leave an
- * orphan object with no database row, and the batch action disappears entirely when nothing is left
- * to abort.
- */
 @Composable
 private fun UploadTransferPanel(
     transfers: List<UploadTransferEntry>,
-    batchProgress: Float,
     busy: Boolean,
-    strings: com.notes.notes.core.AppStrings,
     language: AppLanguage,
-    onPause: () -> Unit,
-    onResume: () -> Unit,
-    onCancel: () -> Unit,
-    onCancelTransfer: (String) -> Unit,
+    onPause: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onPauseAll: () -> Unit,
+    onResumeAll: () -> Unit,
+    onDeleteAll: () -> Unit,
 ) {
-    val aggregateLabel = when {
-        transfers.any { it.phase == UploadPhase.METADATA_PENDING } -> strings.transfers.finalizingMetadata
-        transfers.any { it.waitingForNetwork } -> strings.transfers.waitingForNetwork
-        transfers.any { it.phase == UploadPhase.TRANSFERRING } ->
-            if (busy) strings.transfers.pausing else strings.transfers.uploading
+    val hasTransferring =
+        transfers.any {
+            it.phase == UploadPhase.TRANSFERRING
+        }
 
-        else -> strings.transfers.paused
-    }
-    val percent = (batchProgress * 100f).roundToInt()
+    val hasPaused =
+        transfers.any {
+            it.phase == UploadPhase.PAUSED
+        }
 
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = MaterialTheme.colorScheme.primaryContainer,
+    val hasDeletable =
+        transfers.any {
+            it.phase != UploadPhase.METADATA_PENDING
+        }
+
+    val globalActionLabel =
+        when (language) {
+            AppLanguage.ZH_CN ->
+                if (hasTransferring) "全部暂停" else "全部继续"
+
+            AppLanguage.EN_US ->
+                if (hasTransferring) "Pause all" else "Resume all"
+        }
+
+    Column(
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+        if (
+            hasTransferring ||
+            hasPaused ||
+            hasDeletable
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = aggregateLabel,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
-                Text(
-                    text = strings.format(strings.transfers.percentTemplate, language.asLocale(), percent),
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
+                if (hasTransferring || hasPaused) {
+                    TextButton(
+                        enabled = !busy,
+                        onClick = {
+                            if (hasTransferring) {
+                                onPauseAll()
+                            } else {
+                                onResumeAll()
+                            }
+                        },
+                    ) {
+                        Text(globalActionLabel)
+                    }
+                }
+
+                if (hasDeletable) {
+                    TextButton(
+                        enabled = !busy,
+                        onClick = onDeleteAll,
+                    ) {
+                        Text(
+                            text =
+                                when (language) {
+                                    AppLanguage.ZH_CN ->
+                                        "全部删除"
+
+                                    AppLanguage.EN_US ->
+                                        "Delete all"
+                                },
+                            color =
+                                MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
             }
-            androidx.compose.material3.LinearProgressIndicator(
-                progress = { batchProgress },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (transfers.any { it.phase == UploadPhase.TRANSFERRING }) {
-                    SecondaryActionButton(
-                        label = strings.transfers.pause,
-                        modifier = Modifier.weight(1f),
-                        // A transfer that already completed in OSS cannot be paused any more.
-                        enabled = transfers.none { it.phase == UploadPhase.METADATA_PENDING },
-                        onClick = onPause,
-                    )
+        }
+
+        SectionListCard {
+            transfers.forEachIndexed { index, transfer ->
+                val progress = when {
+                    transfer.phase == UploadPhase.METADATA_PENDING -> {
+                        1f
+                    }
+
+                    transfer.fileBytes > 0L -> {
+                        (
+                                transfer.transferredBytes.toFloat() /
+                                        transfer.fileBytes.toFloat()
+                                ).coerceIn(0f, 1f)
+                    }
+
+                    else -> {
+                        0f
+                    }
                 }
-                if (transfers.any { it.phase != UploadPhase.TRANSFERRING }) {
-                    // When nothing is left but completed objects waiting for their metadata row, the
-                    // action is a metadata-only retry rather than a resume of an OSS transfer.
-                    val metadataOnly = transfers.all { it.phase == UploadPhase.METADATA_PENDING }
-                    SecondaryActionButton(
-                        label = if (metadataOnly) strings.common.retry else strings.transfers.resume,
-                        modifier = Modifier.weight(1f),
-                        onClick = onResume,
-                    )
+
+                TransferProgressRow(
+                    fileName = transfer.displayName,
+                    progress = progress,
+                ) {
+                    when (transfer.phase) {
+                        UploadPhase.TRANSFERRING -> {
+                            RowActionButton(
+                                icon = Icons.Outlined.Pause,
+                                enabled = !busy,
+                                onClick = {
+                                    onPause(transfer.transferId)
+                                },
+                            )
+                        }
+
+                        UploadPhase.PAUSED -> {
+                            RowActionButton(
+                                icon = Icons.Outlined.PlayArrow,
+                                enabled = !busy,
+                                onClick = {
+                                    onResume(transfer.transferId)
+                                },
+                            )
+
+                            RowActionButton(
+                                icon = Icons.Outlined.Delete,
+                                enabled = !busy,
+                                onClick = {
+                                    onDelete(transfer.transferId)
+                                },
+                                tint = MaterialTheme.colorScheme.error,
+                                containerColor =
+                                    LocalNotesExtraColors.current.danger.copy(
+                                        alpha = 0.12f
+                                    ),
+                            )
+                        }
+
+                        UploadPhase.METADATA_PENDING -> {
+                            // OSS upload already completed. Metadata retry is automatic.
+                        }
+                    }
                 }
-                // Only transfers whose multipart upload can still be aborted are destructively
-                // cancellable; a metadata-pending transfer is preserved and must not be represented
-                // as cancelable.
-                if (transfers.any { it.phase != UploadPhase.METADATA_PENDING }) {
-                    SecondaryActionButton(
-                        label = strings.transfers.cancelTransfer,
-                        modifier = Modifier.weight(1f),
-                        onClick = onCancel,
-                    )
+
+                if (index < transfers.lastIndex) {
+                    SectionDivider()
                 }
             }
         }
     }
+}
 
-    SectionListCard {
-        transfers.forEachIndexed { index, transfer ->
-            // The OSS transfer is over once completion was observed, so the row reports the reserved
-            // last percent while the backend row is still being written.
-            val filePercent = if (transfer.phase == UploadPhase.METADATA_PENDING) {
-                FINALIZING_PERCENT
-            } else if (transfer.fileBytes > 0L) {
-                ((transfer.transferredBytes.toFloat() / transfer.fileBytes.toFloat()) * 100f)
-                    .coerceIn(0f, 100f)
-                    .roundToInt()
-            } else {
-                0
-            }
-            val stateLabel = when {
-                transfer.phase == UploadPhase.METADATA_PENDING -> strings.transfers.finalizingMetadata
-                transfer.phase == UploadPhase.PAUSED -> strings.transfers.paused
-                transfer.waitingForNetwork -> strings.transfers.waitingForNetwork
-                busy -> strings.transfers.pausing
-                else -> strings.transfers.uploading
-            }
-            SectionRow(
-                title = transfer.displayName,
-                subtitle = "$stateLabel · $filePercent%",
-                icon = Icons.AutoMirrored.Outlined.Article,
-                scrollableTitle = true,
-                trailing = {
-                    if (transfer.phase == UploadPhase.METADATA_PENDING) {
-                        // The OSS object is already complete: retrying only repeats the metadata
-                        // insert, and a destructive cancel is not offered because removing the
-                        // record would orphan a complete object with no database row.
-                        RowActionButton(icon = Icons.Outlined.Refresh, onClick = onResume)
-                    } else {
-                        if (transfer.phase == UploadPhase.TRANSFERRING) {
-                            RowActionButton(icon = Icons.Outlined.Pause, onClick = onPause)
-                        } else {
-                            RowActionButton(icon = Icons.Outlined.PlayArrow, onClick = onResume)
-                        }
-                        RowActionButton(
-                            icon = Icons.Outlined.Close,
-                            onClick = { onCancelTransfer(transfer.transferId) },
-                            tint = MaterialTheme.colorScheme.error,
-                            containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
-                        )
-                    }
-                },
+@Composable
+private fun TransferProgressRow(
+    fileName: String,
+    progress: Float?,
+    actions: @Composable () -> Unit,
+) {
+    val (icon, iconTint) =
+        transferFileVisual(fileName)
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(
+                horizontal = 16.dp,
+                vertical = 12.dp,
+            ),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconBubble(
+            icon = icon,
+            background = null,
+            tint = iconTint,
+        )
+
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            Text(
+                text = fileName,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
-            if (index < transfers.lastIndex) {
-                SectionDivider()
+
+            if (progress == null) {
+                androidx.compose.material3.LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                androidx.compose.material3.LinearProgressIndicator(
+                    progress = {
+                        progress.coerceIn(0f, 1f)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
+        }
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            actions()
         }
     }
 }
@@ -1086,11 +1329,99 @@ private fun ConfirmCancelTransferDialog(
     )
 }
 
-private sealed interface CancelTransferTarget {
-    data object Uploads : CancelTransferTarget
+@Composable
+private fun ConfirmDeleteAllTransfersDialog(
+    language: AppLanguage,
+    isUpload: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val title =
+        when (language) {
+            AppLanguage.ZH_CN ->
+                if (isUpload) {
+                    "删除全部上传任务？"
+                } else {
+                    "删除全部下载任务？"
+                }
 
-    /** A metadata-pending upload: cancelling only drops the registration, never the OSS object. */
-    data class Upload(val transferId: String) : CancelTransferTarget
+            AppLanguage.EN_US ->
+                if (isUpload) {
+                    "Delete all uploads?"
+                } else {
+                    "Delete all downloads?"
+                }
+        }
+
+    val body =
+        when (language) {
+            AppLanguage.ZH_CN ->
+                if (isUpload) {
+                    "所有仍可取消的上传都会停止，并清理本地断点和 OSS 未完成分片。已经完成 OSS 上传、仅等待文件登记的项目会保留，以避免产生孤立文件。"
+                } else {
+                    "所有未完成下载都会停止，下载进度和对应的本地临时文件将被删除。"
+                }
+
+            AppLanguage.EN_US ->
+                if (isUpload) {
+                    "All cancellable uploads will stop and their local checkpoints and unfinished OSS multipart data will be cleaned. Uploads already completed in OSS and waiting only for metadata registration will be preserved."
+                } else {
+                    "All unfinished downloads will stop and their progress and local temporary files will be deleted."
+                }
+        }
+
+    NotesAlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+            ) {
+                Text(
+                    when (language) {
+                        AppLanguage.ZH_CN ->
+                            "全部删除"
+
+                        AppLanguage.EN_US ->
+                            "Delete all"
+                    }
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+            ) {
+                Text(
+                    when (language) {
+                        AppLanguage.ZH_CN ->
+                            "取消"
+
+                        AppLanguage.EN_US ->
+                            "Cancel"
+                    }
+                )
+            }
+        },
+        title = {
+            Text(title)
+        },
+        text = {
+            Text(body)
+        },
+    )
+}
+
+private sealed interface CancelTransferTarget {
+
+    data class Upload(
+        val transferId: String,
+    ) : CancelTransferTarget
+
+    data object UploadAll :
+        CancelTransferTarget
+
+    data object DownloadAll :
+        CancelTransferTarget
 }
 
 /** The percent shown while a completed OSS object is still being registered on the backend. */
@@ -1273,14 +1604,30 @@ private fun fileVisual(file: FileEntry): Pair<ImageVector, Color> = when (file.t
     else -> Icons.Outlined.Description to Color(0xFF7A8DA1)
 }
 
-private fun downloadedFileVisual(file: DownloadedFileEntry): Pair<ImageVector, Color> {
-    val extension = file.name.substringAfterLast('.', missingDelimiterValue = "").lowercase()
+private fun transferFileVisual(
+    fileName: String,
+): Pair<ImageVector, Color> {
+    val extension = fileName
+        .substringAfterLast('.', missingDelimiterValue = "")
+        .lowercase()
+
     return when (extension) {
-        "pdf" -> Icons.Outlined.PictureAsPdf to Color(0xFFE35D6A)
-        "md", "markdown" -> Icons.AutoMirrored.Outlined.Article to Color(0xFF3390EC)
-        else -> Icons.Outlined.Description to Color(0xFF7A8DA1)
+        "pdf" ->
+            Icons.Outlined.PictureAsPdf to Color(0xFFE35D6A)
+
+        "md",
+        "markdown" ->
+            Icons.AutoMirrored.Outlined.Article to Color(0xFF3390EC)
+
+        else ->
+            Icons.Outlined.Description to Color(0xFF7A8DA1)
     }
 }
+
+private fun downloadedFileVisual(
+    file: DownloadedFileEntry,
+): Pair<ImageVector, Color> =
+    transferFileVisual(file.name)
 
 private fun openDownloadedFile(
     context: android.content.Context,

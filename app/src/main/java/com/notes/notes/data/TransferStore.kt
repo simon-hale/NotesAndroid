@@ -117,6 +117,56 @@ class TransferStore(private val context: Context) {
         return removed
     }
 
+    /**
+     * Atomically removes only uploads that are still safe to destructively cancel.
+     *
+     * The phase check happens inside the same DataStore edit that removes the records. This closes the
+     * race where a UI snapshot still says TRANSFERRING while UploadWorker has already persisted
+     * METADATA_PENDING after CompleteMultipartUpload succeeded.
+     *
+     * METADATA_PENDING must never be removed here because its complete OSS object can no longer be
+     * cleaned by AbortMultipartUpload or the incomplete-multipart lifecycle rule.
+     */
+    suspend fun removeCancellableUploads(
+        transferIds: Collection<String>,
+    ): List<UploadTransfer> {
+        if (transferIds.isEmpty()) {
+            return emptyList()
+        }
+
+        val requestedIds = transferIds.toSet()
+        var removed: List<UploadTransfer> = emptyList()
+
+        context.transfersDataStore.edit { preferences ->
+            val current =
+                decodeUploads(preferences[Keys.uploads])
+
+            removed =
+                current.filter { transfer ->
+                    transfer.transferId in requestedIds &&
+                            !transfer.isMetadataPending
+                }
+
+            if (removed.isEmpty()) {
+                return@edit
+            }
+
+            val removedIds =
+                removed.mapTo(
+                    mutableSetOf(),
+                    UploadTransfer::transferId,
+                )
+
+            preferences[Keys.uploads] =
+                encodeUploads(
+                    current.filterNot { transfer ->
+                        transfer.transferId in removedIds
+                    }
+                )
+        }
+
+        return removed
+    }
     suspend fun removeUploadsForAccount(accountKey: String): List<UploadTransfer> {
         var removed: List<UploadTransfer> = emptyList()
         context.transfersDataStore.edit { preferences ->

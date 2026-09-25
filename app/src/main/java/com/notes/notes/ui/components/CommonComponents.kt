@@ -782,15 +782,28 @@ fun SectionDivider() {
 fun RowActionButton(
     icon: ImageVector,
     onClick: () -> Unit,
+    enabled: Boolean = true,
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     containerColor: Color = MaterialTheme.colorScheme.surfaceVariant,
 ) {
+    val resolvedTint = if (enabled) {
+        tint
+    } else {
+        tint.copy(alpha = 0.38f)
+    }
+    val resolvedContainerColor = if (enabled) {
+        containerColor
+    } else {
+        containerColor.copy(alpha = 0.45f)
+    }
+
     Surface(
         modifier = Modifier.size(34.dp),
         onClick = onClick,
+        enabled = enabled,
         shape = CircleShape,
-        color = containerColor,
-        contentColor = tint,
+        color = resolvedContainerColor,
+        contentColor = resolvedTint,
         border = BorderStroke(1.dp, iconRingColor()),
         shadowElevation = 0.dp,
     ) {
@@ -1055,7 +1068,7 @@ fun SelectionCheck(selected: Boolean) {
 }
 
 @Composable
-private fun IconBubble(
+internal fun IconBubble(
     icon: ImageVector,
     background: Color?,
     tint: Color,

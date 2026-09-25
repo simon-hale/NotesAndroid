@@ -66,8 +66,9 @@ object DownloadWork {
             workIds += request.id
             workManager.enqueueUniqueWork(
                 uniqueWorkName(transfer.transferId),
-                // A cancelled (paused) download is finished work, so resuming starts a fresh run.
-                ExistingWorkPolicy.KEEP,
+                // New transfers have unique ids. Resume explicitly replaces any stale WorkManager
+                // instance left by the preceding pause/cancellation.
+                ExistingWorkPolicy.REPLACE,
                 request,
             )
         }
