@@ -2535,46 +2535,119 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     fun deleteAccount(curPassword: String) {
         viewModelScope.launch {
-            val session = activeSession() ?: return@launch
+            val session =
+                activeSession()
+                    ?: return@launch
+
             if (curPassword.isEmpty()) {
-                sendWarningMessage(requiredFieldsMessage())
-                return@launch
-            }
-            // The backend deletes the account's objects by enumerating its existing file rows, and a
-            // metadata-pending object has no row yet: deleting the account now would orphan a complete
-            // object in the bucket. Refuse locally and keep the recovery record.
-            if (hasMetadataPendingUploads(session)) {
-                sendErrorMessage(strings().transfers.metadataPendingBlocksDeletion)
-                return@launch
-            }
-            setAccountBusy(true)
-            runCatching {
-                backendService.deleteAccount(
-                    accessToken = session.accessToken,
-                    curPassword = curPassword,
-                    language = uiState.value.settings.language,
+                sendWarningMessage(
+                    requiredFieldsMessage()
                 )
-                preferencesStore.clearCredentials()
-                resetSessionAndContent()
-            }.onFailure { throwable ->
-                sendThrowableMessage(throwable)
+                return@launch
             }
-            setAccountBusy(false)
+
+            /*
+             * Serialize account deletion with transfer actions.
+             *
+             * This closes the opposite race as well:
+             * - deleteAccount starts first -> uploadSelectedFiles/resume sees transferActionBusy and stops;
+             * - uploadSelectedFiles starts first -> it sets isUploading before its first suspension, so the
+             *   unresolved-upload check below catches it.
+             */
+            if (_uiState.value.disk.transferActionBusy) {
+                sendWarningMessage(
+                    accountDeletionTransferBusyMessage()
+                )
+                return@launch
+            }
+
+            setTransferActionBusy(true)
+
+            try {
+                /*
+                 * The backend deletes OSS objects by enumerating existing File rows.
+                 *
+                 * Any UploadTransfer is therefore unsafe during account deletion:
+                 *
+                 * TRANSFERRING:
+                 *   CompleteMultipartUpload could succeed while account deletion is running.
+                 *
+                 * PAUSED:
+                 *   Its unfinished multipart state still belongs to this account.
+                 *
+                 * METADATA_PENDING:
+                 *   The complete OSS object exists but has no File row yet.
+                 *
+                 * The direct TransferStore read is authoritative and also covers records that have not yet
+                 * reached the current UI mirror.
+                 */
+                if (
+                    hasUnresolvedUploads(
+                        session
+                    )
+                ) {
+                    sendErrorMessage(
+                        uploadBlocksAccountDeletionMessage()
+                    )
+                    return@launch
+                }
+
+                setAccountBusy(true)
+
+                try {
+                    backendService.deleteAccount(
+                        accessToken =
+                            session.accessToken,
+                        curPassword =
+                            curPassword,
+                        language =
+                            uiState.value.settings.language,
+                    )
+
+                    preferencesStore
+                        .clearCredentials()
+
+                    resetSessionAndContent()
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (throwable: Throwable) {
+                    sendThrowableMessage(
+                        throwable
+                    )
+                } finally {
+                    setAccountBusy(false)
+                }
+            } finally {
+                /*
+                 * resetSessionAndContent() also resets DiskScreenState after successful deletion, so this is
+                 * intentionally idempotent.
+                 */
+                setTransferActionBusy(false)
+            }
         }
     }
 
     /**
-     * True when the signed-in owner still has a completed-but-unregistered upload.
+     * True when account deletion could race any upload owned by this account.
      *
-     * The store is read directly instead of the UI mirror so a record that is not projected right now
-     * (for example while the session is still bootstrapping) still blocks a destructive account
-     * deletion.
+     * isUploading additionally covers the tiny startup window after the UI has committed to creating a
+     * batch but before its UploadTransfer records have reached TransferStore.
      */
-    private suspend fun hasMetadataPendingUploads(session: SessionState): Boolean =
-        transferStore.uploadsOnce().any { transfer ->
-            transfer.isMetadataPending &&
-                (transfer.accountKey.isBlank() || transfer.accountKey == session.username)
+    private suspend fun hasUnresolvedUploads(
+        session: SessionState,
+    ): Boolean {
+        if (_uiState.value.disk.isUploading) {
+            return true
         }
+
+        return transferStore
+            .uploadsOnce()
+            .any { transfer ->
+                transfer.accountKey.isBlank() ||
+                        transfer.accountKey ==
+                        session.username
+            }
+    }
 
     /**
      * Only an explicit authentication rejection proves that the saved credential is no longer usable.
@@ -3509,6 +3582,28 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun sendThrowableMessage(throwable: Throwable, authRequest: Boolean = false) {
         sendErrorMessage(toUserMessage(throwable, authRequest))
     }
+
+    private fun uploadBlocksAccountDeletionMessage(): String =
+        when (
+            _uiState.value.settings.language
+        ) {
+            AppLanguage.ZH_CN ->
+                "仍有未完成的上传任务，请先完成或删除这些上传任务后再删除账户"
+
+            AppLanguage.EN_US ->
+                "Unfinished uploads remain. Finish or delete them before deleting this account."
+        }
+
+    private fun accountDeletionTransferBusyMessage(): String =
+        when (
+            _uiState.value.settings.language
+        ) {
+            AppLanguage.ZH_CN ->
+                "当前传输操作尚未结束，请稍后再删除账户"
+
+            AppLanguage.EN_US ->
+                "A transfer operation is still in progress. Try deleting the account again when it finishes."
+        }
 
     private fun requiredFieldsMessage(): String = when (_uiState.value.settings.language) {
         AppLanguage.ZH_CN -> "请输入完整信息"
