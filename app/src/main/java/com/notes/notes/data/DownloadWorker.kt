@@ -69,9 +69,10 @@ class DownloadWorker(
             return Result.success(resultData(transferId, OUTCOME_CANCELED))
         }
 
-        // Same protection as upload: a pause is persisted before WorkManager cancellation. If this work
-        // starts in that race window, do not perform any network or file I/O.
-        if (transfer.phase == DownloadPhase.PAUSED) {
+        // Same protection as upload: a pause is persisted before WorkManager cancellation, and a failed
+        // attempt is terminal until the user retries it. If this work starts in either race window, do
+        // not perform any network or file I/O.
+        if (!transfer.phase.isTransferring) {
             return Result.success(resultData(transferId, OUTCOME_CANCELED))
         }
 

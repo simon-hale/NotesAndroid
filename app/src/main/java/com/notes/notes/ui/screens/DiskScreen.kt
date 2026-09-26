@@ -803,12 +803,13 @@ private fun DownloadTransfersBottomSheet(
 
     val hasTransferring =
         uiState.disk.downloadTransfers.any {
-            it.phase == DownloadPhase.TRANSFERRING
+            it.phase.isTransferring
         }
 
+    // Paused and failed downloads are both resumable, so "resume all" covers either of them.
     val hasPaused =
         uiState.disk.downloadTransfers.any {
-            it.phase == DownloadPhase.PAUSED
+            it.phase.isResumable
         }
 
     val globalActionLabel =
@@ -894,7 +895,9 @@ private fun DownloadTransfersBottomSheet(
                                 )
                             }
 
-                            DownloadPhase.PAUSED -> {
+                            // A paused and a failed download offer the same two actions: an explicit
+                            // retry, or a destructive cancel.
+                            DownloadPhase.PAUSED, DownloadPhase.FAILED -> {
                                 RowActionButton(
                                     icon = Icons.Outlined.PlayArrow,
                                     enabled = !busy,

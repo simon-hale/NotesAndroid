@@ -20,12 +20,27 @@ enum class UploadPhase(val storageValue: String) {
     }
 }
 
-/** Persistent download phases. A paused download keeps its partial MediaStore item and byte count. */
+/**
+ * Persistent download phases.
+ *
+ * A paused download keeps its partial MediaStore item and byte count. `FAILED` is a terminal state of
+ * one attempt: it keeps the same resumable state, but it is *not* a user pause, so it must survive a
+ * process restart without ever being reported as "everything is paused". Only an explicit retry moves
+ * such a transfer back to `TRANSFERRING`.
+ */
 enum class DownloadPhase(val storageValue: String) {
     TRANSFERRING("transferring"),
-    PAUSED("paused");
+    PAUSED("paused"),
+    FAILED("failed");
+
+    /** True while the transfer may still be expected to transfer bytes on its own. */
+    val isTransferring: Boolean get() = this == TRANSFERRING
+
+    /** True while the user can start this transfer again. */
+    val isResumable: Boolean get() = this != TRANSFERRING
 
     companion object {
+        /** Unknown values, including records written by older versions, mean "still transferring". */
         fun fromStorage(raw: String?): DownloadPhase =
             entries.firstOrNull { it.storageValue == raw } ?: TRANSFERRING
     }

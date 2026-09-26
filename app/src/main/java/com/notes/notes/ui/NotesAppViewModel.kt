@@ -51,6 +51,7 @@ import com.notes.notes.data.PreviewRepository
 import com.notes.notes.data.TransferAccount
 import com.notes.notes.data.TransferStsCredentialProvider
 import com.notes.notes.data.TransferStore
+import com.notes.notes.data.downloadTaskProgress
 import com.notes.notes.data.UploadUriPermissionManager
 import com.notes.notes.data.UploadWork
 import com.notes.notes.data.UploadWorker
@@ -112,6 +113,15 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /** Latest WorkManager snapshots, used to tell "running" from "waiting for network" and "gone". */
     private var uploadWorkInfos: List<WorkInfo> = emptyList()
     private var downloadWorkInfos: List<WorkInfo> = emptyList()
+
+    /**
+     * True once WorkManager has delivered a full snapshot of this app's download work.
+     *
+     * Before that first snapshot a missing work item says nothing — the download that survived a process
+     * restart simply has not been reported yet — so neither the phase reconciliation nor the ring may
+     * treat it as stopped.
+     */
+    private var downloadWorkInfosObserved = false
 
     /**
      * Transfers this ViewModel just enqueued. Until their work item shows up, a missing work item must
@@ -1372,8 +1382,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     totalBytes = record.totalBytes,
                     waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
                 )
-                downloadTasks += DownloadTaskProgress(
+                downloadTasks += downloadTaskProgress(
                     transferId = record.transferId,
+                    phase = record.phase,
                     // The running worker publishes byte progress more often than it persists the
                     // record, so those live values are the fresher pair of the two.
                     totalBytes = info?.progress
@@ -1382,17 +1393,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     downloadedBytes = info?.progress
                         ?.getLong(DownloadWorker.KEY_PROGRESS_DOWNLOADED_BYTES, record.downloadedBytes)
                         ?: record.downloadedBytes,
-                    // Waiting for network or a worker slot still counts as active: the task has not
-                    // stopped transferring, it just has not been scheduled yet.
-                    active = record.transferId in liveDownloadTransferIds ||
-                        (
-                            record.phase == DownloadPhase.TRANSFERRING &&
-                                isWithinEnqueueGrace(record.transferId, now)
-                            ),
-                    paused = record.phase == DownloadPhase.PAUSED,
+                    hasLiveWork = record.transferId in liveDownloadTransferIds,
+                    withinEnqueueGrace = isWithinEnqueueGrace(record.transferId, now),
                 )
             }
-        val round = downloadRoundProgress.reduce(downloadTasks)
+        val round = downloadRoundProgress.reduce(downloadTasks, now)
 
         // Enqueue grace entries of settled transfers are no longer needed.
         val knownTransferIds =
@@ -1431,7 +1436,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             uploadEntries = uploadEntries,
             downloadEntries = downloadEntries,
             ring = round.ring,
-            immediate = round.structural ||
+            immediate = round.publishNow ||
                 rowsChangedBeyondBytes(uploadEntries, downloadEntries),
         )
     }
@@ -1475,12 +1480,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /**
      * Publishes the transfer projection, coalescing plain byte-progress refreshes.
      *
-     * Chunk-level byte updates arrive far more often than the ring has to be redrawn, so a pure
-     * progress publish is merged with the next one inside
-     * [DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS]. Everything that changes what the state *means* — a
-     * round starting or ending, a member joining, completing, failing, being cancelled, or a pause and
-     * resume — arrives with `immediate` set and is published at once, replacing any pending update, so
-     * no intermediate percentage can reach the screen.
+     * The ring decides its own pacing in [DownloadRoundProgress.reduce]: a structural change — a round
+     * starting or ending, a member joining, completing, failing, being cancelled, or a pause and resume
+     * — arrives with `publishNow` set. This window only covers the remaining case, a pure byte tick, and
+     * a changed transfer row or any other state change always publishes at once, replacing any pending
+     * update, so no intermediate percentage can reach the screen.
      */
     private fun publishTransferUi(
         uploadEntries: List<UploadTransferEntry>,
@@ -1739,6 +1743,15 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun reconcileDownloadPhases() {
+        /*
+         * Until the first WorkManager snapshot arrives, every restored download looks as if it had lost
+         * its work item. Acting on that would turn a download that is really running into a paused one,
+         * and the ring would show the yellow "all paused" state during a live transfer.
+         */
+        if (!downloadWorkInfosObserved) {
+            return
+        }
+
         val now = System.currentTimeMillis()
         val liveTransferIds = downloadWorkInfos
             .filterNot { it.state.isFinished }
@@ -1747,12 +1760,17 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         downloadTransfers
             // A foreign owner's record is not this session's to recover.
             .filter { isOwnedByActiveSession(it.accountKey) }
-            .filter { it.phase == DownloadPhase.TRANSFERRING && it.transferId !in liveTransferIds }
+            /*
+             * Only a transfer the business state still calls running can be exposed as paused. A FAILED
+             * record is a terminal state of its own: it is left exactly as it is, so neither this
+             * reconciliation nor a restart can degrade it into a user pause.
+             */
+            .filter { it.phase.isTransferring && it.transferId !in liveTransferIds }
             .filter { isEnqueueSettled(it.transferId, now) }
             .forEach { record ->
                 viewModelScope.launch {
                     transferStore.updateDownload(record.transferId) { current ->
-                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                        if (current.phase.isTransferring) {
                             current.copy(phase = DownloadPhase.PAUSED)
                         } else {
                             current
@@ -1880,6 +1898,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     private fun applyDownloadWorkInfos(infos: List<WorkInfo>) {
         downloadWorkInfos = infos
+        downloadWorkInfosObserved = true
         infos.forEach { info ->
             val previousState = downloadWorkStates.put(info.id, info.state)
             val changedWhileObserved = previousState != null && previousState != info.state
@@ -1907,8 +1926,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
                 DownloadWorker.OUTCOME_FAILED -> {
                     if (transferId != null) {
-                        // A failure is not a pause: it must never be reported as "everything is paused".
-                        downloadRoundProgress.onTaskFailed(transferId)
+                        // A failure is a terminal state of its own: it is persisted, so a restart cannot
+                        // degrade it into a user pause and make the ring claim "everything is paused".
+                        downloadRoundProgress.onTaskFailed()
+                        markDownloadFailed(transferId)
                         recentlyEnqueuedTransfers.remove(transferId)
                     }
                     sendErrorMessage(downloadWorkFailureMessage(info.outputData))
@@ -1922,6 +1943,37 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
         refreshTransferUi()
         reconcileDownloadPhases()
+    }
+
+    /**
+     * Makes a reported failure permanent.
+     *
+     * The in-memory mirror is updated before the next projection, so the failure is visible in the very
+     * pass that reports it, and the record is persisted so a process restart cannot degrade the failed
+     * attempt into a user pause.
+     *
+     * The store edit accepts any phase except [DownloadPhase.FAILED]: the shared phase reconciliation
+     * may have turned the same record into PAUSED in this instant, and a failure the worker really
+     * reported must not be downgraded by that race.
+     */
+    private fun markDownloadFailed(transferId: String) {
+        downloadTransfers = downloadTransfers.map { transfer ->
+            if (transfer.transferId == transferId && transfer.phase != DownloadPhase.FAILED) {
+                transfer.copy(phase = DownloadPhase.FAILED)
+            } else {
+                transfer
+            }
+        }
+
+        viewModelScope.launch {
+            transferStore.updateDownload(transferId) { current ->
+                if (current.phase == DownloadPhase.FAILED) {
+                    current
+                } else {
+                    current.copy(phase = DownloadPhase.FAILED)
+                }
+            }
+        }
     }
 
     private fun downloadWorkFailureMessage(data: Data): String {
@@ -2228,7 +2280,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             }
 
             if (existing != null) {
-                if (existing.phase == DownloadPhase.PAUSED) {
+                // Tapping download again on a paused or failed file retries that transfer.
+                if (existing.phase.isResumable) {
                     resumeDownload(existing.transferId)
                 }
                 return@launch
@@ -2342,7 +2395,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
             try {
                 val updated = transferStore.updateDownload(transferId) { current ->
-                    if (current.phase == DownloadPhase.TRANSFERRING) {
+                    if (current.phase.isTransferring) {
                         current.copy(phase = DownloadPhase.PAUSED)
                     } else {
                         current
@@ -2372,7 +2425,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Resumes a paused download. The worker always asks for a new presigned URL before continuing. */
+    /**
+     * Resumes a paused or failed download. The worker always asks for a new presigned URL before
+     * continuing.
+     */
     fun resumeDownload(transferId: String) {
         viewModelScope.launch {
             if (_uiState.value.disk.transferActionBusy) {
@@ -2389,20 +2445,36 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 return@launch
             }
 
-            if (transfer.phase != DownloadPhase.PAUSED) {
+            if (!transfer.phase.isResumable) {
                 return@launch
             }
+
+            // The phase this transfer goes back to when WorkManager refuses to take it over.
+            val previousPhase = transfer.phase
 
             setTransferActionBusy(true)
 
             try {
+                /*
+                 * The enqueue grace is established before the phase can be seen as TRANSFERRING: the
+                 * first projection based on the new phase must already treat the transfer as the active
+                 * member of a new round, otherwise it would be neither active nor paused for one pass and
+                 * the yellow ring would blink out before the new work item shows up.
+                 */
+                markRecentlyEnqueued(listOf(transferId))
+
                 val updated = transferStore.updateDownload(transferId) { current ->
-                    if (current.phase == DownloadPhase.PAUSED) {
-                        current.copy(phase = DownloadPhase.TRANSFERRING)
-                    } else {
+                    if (current.phase.isTransferring) {
                         current
+                    } else {
+                        current.copy(phase = DownloadPhase.TRANSFERRING)
                     }
-                } ?: return@launch
+                }
+
+                if (updated == null) {
+                    recentlyEnqueuedTransfers.remove(transferId)
+                    return@launch
+                }
 
                 downloadTransfers = downloadTransfers.map { current ->
                     if (current.transferId == transferId) {
@@ -2413,8 +2485,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 }
                 refreshTransferUi()
 
-                markRecentlyEnqueued(listOf(transferId))
-
                 try {
                     DownloadWork.enqueue(
                         context = getApplication(),
@@ -2424,18 +2494,22 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (throwable: Throwable) {
-                    val paused = transferStore.updateDownload(transferId) { current ->
-                        if (current.phase == DownloadPhase.TRANSFERRING) {
-                            current.copy(phase = DownloadPhase.PAUSED)
+                    // WorkManager did not take the transfer over: roll the phase and the ring back to
+                    // exactly what the user saw before, in one pass.
+                    recentlyEnqueuedTransfers.remove(transferId)
+
+                    val restored = transferStore.updateDownload(transferId) { current ->
+                        if (current.phase.isTransferring) {
+                            current.copy(phase = previousPhase)
                         } else {
                             current
                         }
                     }
 
-                    if (paused != null) {
+                    if (restored != null) {
                         downloadTransfers = downloadTransfers.map { current ->
                             if (current.transferId == transferId) {
-                                paused
+                                restored
                             } else {
                                 current
                             }
@@ -3945,10 +4019,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         const val ENQUEUE_GRACE_MILLIS = 5_000L
 
         /**
-         * Coalescing window for plain byte-progress publishes. State transitions are published
-         * immediately and never wait for this window.
+         * Coalescing window for plain byte-progress publishes, shared with the download ring.
+         * State transitions are published immediately and never wait for this window.
          */
-        const val DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS = 80L
+        const val DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS =
+            DownloadRoundProgress.DEFAULT_PUBLISH_INTERVAL_MILLIS
 
         /** A destructive cancel is best effort; the UI must never wait on it for long. */
         const val CANCEL_ABORT_TIMEOUT_MILLIS = 15_000L
@@ -4135,7 +4210,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             val targets =
                 downloadTransfers.filter { transfer ->
                     isOwnedByActiveSession(transfer.accountKey) &&
-                            transfer.phase == DownloadPhase.TRANSFERRING
+                            transfer.phase.isTransferring
                 }
 
             if (targets.isEmpty()) {
@@ -4150,7 +4225,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
                 targets.forEach { transfer ->
                     transferStore.updateDownload(transfer.transferId) { current ->
-                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                        if (current.phase.isTransferring) {
                             current.copy(
                                 phase = DownloadPhase.PAUSED
                             )
@@ -4196,32 +4271,50 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             val targets =
                 downloadTransfers.filter { transfer ->
                     isOwnedByActiveSession(transfer.accountKey) &&
-                            transfer.phase == DownloadPhase.PAUSED
+                            transfer.phase.isResumable
                 }
 
             if (targets.isEmpty()) {
                 return@launch
             }
 
+            // The phase each transfer goes back to when WorkManager refuses to take it over.
+            val previousPhases =
+                targets.associate { transfer -> transfer.transferId to transfer.phase }
+
             setTransferActionBusy(true)
 
             val resumed = mutableListOf<DownloadTransfer>()
 
             try {
+                /*
+                 * Every grace marker is established before the first transfer can be seen as
+                 * TRANSFERRING, so the very first projection already shows an active new round instead
+                 * of letting the yellow ring blink out while the work items are still being created.
+                 */
+                markRecentlyEnqueued(targets.map(DownloadTransfer::transferId))
+
                 targets.forEach { transfer ->
                     transferStore.updateDownload(transfer.transferId) { current ->
-                        if (current.phase == DownloadPhase.PAUSED) {
+                        if (current.phase.isTransferring) {
+                            current
+                        } else {
                             current.copy(
                                 phase = DownloadPhase.TRANSFERRING
                             )
-                        } else {
-                            current
                         }
                     }?.let(resumed::add)
                 }
 
                 val resumedById =
                     resumed.associateBy(DownloadTransfer::transferId)
+
+                // A transfer that was not actually resumed keeps no enqueue grace behind.
+                targets.forEach { transfer ->
+                    if (transfer.transferId !in resumedById) {
+                        recentlyEnqueuedTransfers.remove(transfer.transferId)
+                    }
+                }
 
                 downloadTransfers =
                     downloadTransfers.map { current ->
@@ -4233,10 +4326,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 if (resumed.isEmpty()) {
                     return@launch
                 }
-
-                markRecentlyEnqueued(
-                    resumed.map(DownloadTransfer::transferId)
-                )
 
                 DownloadWork.enqueue(
                     context = getApplication(),
@@ -4252,7 +4341,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         DownloadTransfer::transferId,
                     )
 
-                val pausedById =
+                ids.forEach { transferId ->
+                    recentlyEnqueuedTransfers.remove(transferId)
+                }
+
+                val restoredById =
                     mutableMapOf<String, DownloadTransfer>()
 
                 ids.forEach { transferId ->
@@ -4265,22 +4358,27 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         )
                     }
 
+                    // A refused resume rolls back to the phase the transfer had before, so a failed
+                    // attempt does not turn into a pause and a real pause does not turn into a failure.
+                    val previousPhase =
+                        previousPhases[transferId] ?: DownloadPhase.PAUSED
+
                     transferStore.updateDownload(transferId) { current ->
-                        if (current.phase == DownloadPhase.TRANSFERRING) {
+                        if (current.phase.isTransferring) {
                             current.copy(
-                                phase = DownloadPhase.PAUSED
+                                phase = previousPhase
                             )
                         } else {
                             current
                         }
-                    }?.let { paused ->
-                        pausedById[transferId] = paused
+                    }?.let { restored ->
+                        restoredById[transferId] = restored
                     }
                 }
 
                 downloadTransfers =
                     downloadTransfers.map { current ->
-                        pausedById[current.transferId] ?: current
+                        restoredById[current.transferId] ?: current
                     }
 
                 refreshTransferUi()

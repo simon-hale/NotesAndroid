@@ -1,40 +1,69 @@
 package com.notes.notes.data
 
+import com.notes.notes.core.DownloadPhase
 import com.notes.notes.core.DownloadRingMode
 import com.notes.notes.core.DownloadRingState
 
 /**
  * One download task as the round accounting sees it at one instant.
  *
- * The bytes are the freshest values available for the transfer; [active] tells whether more bytes are
- * still expected from it. A task that is queued but has not been given a worker slot yet is active
- * too: it will continue transferring, so a moment without a running worker must not end the round.
+ * The bytes are the freshest values available for the transfer, [phase] is the business state the user
+ * sees, and [active] tells whether more bytes are still expected from it.
  */
 data class DownloadTaskProgress(
     val transferId: String,
+    val phase: DownloadPhase,
     val totalBytes: Long,
     val downloadedBytes: Long,
     val active: Boolean,
-    val paused: Boolean,
+)
+
+/**
+ * Builds the round-accounting view of one transfer.
+ *
+ * A task counts as active only while the business state is still [DownloadPhase.TRANSFERRING] *and*
+ * something is really going to move bytes forward: unfinished work in WorkManager, or an enqueue that
+ * was requested just now. The phase condition is what keeps the ring consistent with the list: a pause
+ * is written to the store before the worker cancellation completes, and from that moment on the task
+ * must not be counted as active any more, even while its old work item is still running.
+ */
+fun downloadTaskProgress(
+    transferId: String,
+    phase: DownloadPhase,
+    totalBytes: Long,
+    downloadedBytes: Long,
+    hasLiveWork: Boolean,
+    withinEnqueueGrace: Boolean,
+): DownloadTaskProgress = DownloadTaskProgress(
+    transferId = transferId,
+    phase = phase,
+    totalBytes = totalBytes,
+    downloadedBytes = downloadedBytes,
+    active = phase.isTransferring && (hasLiveWork || withinEnqueueGrace),
 )
 
 /** Outcome of one accounting pass. */
 data class DownloadRoundUpdate(
     val ring: DownloadRingState,
     /**
-     * True when the round itself changed: a member joined, completed or left, the round ended, or the
-     * ring switched between green, indeterminate, paused and hidden. Such a change must reach the UI
-     * immediately, while a plain byte tick may be coalesced with the next one.
+     * True when the round itself changed: a member joined, completed or left, the round started or
+     * ended, the ring switched between green, indeterminate, paused and hidden, or a terminal download
+     * event arrived.
      */
     val structural: Boolean,
+    /**
+     * True when the caller has to publish this ring right away. Only a pure byte tick may be deferred,
+     * and only until the next publish window.
+     */
+    val publishNow: Boolean,
 )
 
 /**
- * Byte accounting of the current *download round*.
+ * Byte accounting and publish policy of the current *download round*.
  *
  * A round is the set of downloads whose bytes the drawer ring shows at the same time. It starts when
  * the first active download appears and is destroyed in one step when the last active download is
- * gone — whether it completed or was paused. Membership is a property of the round, not of the
+ * gone — whether it completed, failed or was paused. Membership is a property of the round, not of the
  * moment: a file that was counted once stays in the round until the round ends, even if it is paused
  * in the meantime or finishes, so neither pausing nor completing one file can shrink the denominator
  * and make the ring jump.
@@ -44,7 +73,9 @@ data class DownloadRoundUpdate(
  * main-dispatcher context. Members, [loadedBytes] and [totalBytes] can therefore never be updated
  * concurrently, and [reduce] either applies a whole state transition or none of it.
  */
-class DownloadRoundProgress {
+class DownloadRoundProgress(
+    private val publishIntervalMillis: Long = DEFAULT_PUBLISH_INTERVAL_MILLIS,
+) {
 
     private class Member(
         var totalBytes: Long,
@@ -64,20 +95,21 @@ class DownloadRoundProgress {
     /** Members of the current round in join order. A member leaves only when the round ends. */
     private val members = LinkedHashMap<String, Member>()
 
-    /**
-     * Transfers whose last attempt ended in an error.
-     *
-     * A failure is not a user pause: it must never turn the ring yellow, and the file has to be
-     * started again explicitly before it joins a round.
-     */
-    private val failed = mutableSetOf<String>()
-
     private var ring = DownloadRingState.Hidden
     private var roundLoadedBytes = 0L
     private var roundTotalBytes = 0L
 
     /** Bumped by every change of the member set, so the owner can tell structural changes from ticks. */
     private var roundRevision = 0
+
+    /**
+     * Set by a terminal download event and consumed by the next [reduce]. A completion, failure or
+     * cancel has to be published immediately even when it leaves the visible ring unchanged, because a
+     * pure byte tick and a state change must never be treated alike.
+     */
+    private var pendingStructuralChange = false
+
+    private var lastRingPublishAt = 0L
 
     /** Ids of the round currently shown, in join order. */
     val memberIds: List<String> get() = members.keys.toList()
@@ -93,20 +125,21 @@ class DownloadRoundProgress {
      * that are still running must keep counting it.
      */
     fun onTaskCompleted(transferId: String) {
-        failed.remove(transferId)
+        pendingStructuralChange = true
         val member = members[transferId] ?: return
         member.completed = true
         if (member.totalKnown) member.downloadedBytes = member.totalBytes
-        roundRevision++
     }
 
     /**
-     * A member's attempt failed. Its last valid byte snapshot stays in the round for as long as the
-     * round lives, so one failure cannot shift the running progress, but the failure itself is
-     * terminal: it is not a pause and it does not rejoin the next round automatically.
+     * A download attempt failed.
+     *
+     * The failure itself lives in the persisted phase, which keeps it out of the yellow "all paused"
+     * ring and out of the next round; the round only has to publish the state it already has, because
+     * the failed member keeps its last valid byte snapshot until the round ends.
      */
-    fun onTaskFailed(transferId: String) {
-        failed.add(transferId)
+    fun onTaskFailed() {
+        pendingStructuralChange = true
     }
 
     /**
@@ -115,46 +148,47 @@ class DownloadRoundProgress {
      * is the accepted consequence of the existing cancel semantics.
      */
     fun onTaskCancelled(transferId: String) {
-        failed.remove(transferId)
-        if (members.remove(transferId) != null) {
-            roundRevision++
-        }
+        pendingStructuralChange = true
+        members.remove(transferId)
     }
 
     /** Drops every knowledge about rounds, for example when the signed-in account changes. */
     fun reset() {
         members.clear()
-        failed.clear()
         roundLoadedBytes = 0L
         roundTotalBytes = 0L
         roundRevision++
         ring = DownloadRingState.Hidden
+        pendingStructuralChange = false
+        lastRingPublishAt = 0L
     }
 
     /**
      * Applies the current task set and returns the ring to show.
      *
      * All members, both byte counters and the ring are updated here before anything is published, so
-     * the caller can never observe a green progress and the matching paused state in two steps.
+     * the caller can never observe a green progress and the matching paused state in two steps. The
+     * publish decision is made in the same pass: a structural change — including a terminal event that
+     * happened since the previous pass — is always published at once, while a plain byte tick is
+     * coalesced to at most one publish per [publishIntervalMillis].
      */
-    fun reduce(tasks: List<DownloadTaskProgress>): DownloadRoundUpdate {
+    fun reduce(tasks: List<DownloadTaskProgress>, nowMillis: Long): DownloadRoundUpdate {
         val revisionBefore = roundRevision
         val modeBefore = ring.mode
+        val eventBefore = pendingStructuralChange
+        pendingStructuralChange = false
 
         val activeTasks = tasks.filter { it.active }
         if (activeTasks.isEmpty()) {
             endRound()
-            val paused = tasks.any { task -> task.paused && task.transferId !in failed }
+            // Only a real user pause turns the ring yellow. A failed download is a terminal state of
+            // its own and must never be reported as "everything is paused".
+            val paused = tasks.any { it.phase == DownloadPhase.PAUSED }
             ring = if (paused) DownloadRingState.Paused else DownloadRingState.Hidden
-            return DownloadRoundUpdate(
-                ring = ring,
-                structural = ring.mode != modeBefore || roundRevision != revisionBefore,
-            )
+            return publish(nowMillis, eventBefore || ring.mode != modeBefore || roundRevision != revisionBefore)
         }
 
         activeTasks.forEach { task ->
-            // Downloading again starts a new attempt, so an earlier failure of this transfer is history.
-            failed.remove(task.transferId)
             if (members.containsKey(task.transferId)) return@forEach
             // Joining brings the complete file size into the denominator and the bytes that are
             // already there into the numerator: a resumed 40 MB / 100 MB file starts the round at 40 %.
@@ -211,10 +245,13 @@ class DownloadRoundProgress {
                 roundLoadedBytes.toDouble().div(roundTotalBytes.toDouble()).toFloat()
             )
         }
-        return DownloadRoundUpdate(
-            ring = ring,
-            structural = ring.mode != modeBefore || roundRevision != revisionBefore,
-        )
+        return publish(nowMillis, eventBefore || ring.mode != modeBefore || roundRevision != revisionBefore)
+    }
+
+    private fun publish(nowMillis: Long, structural: Boolean): DownloadRoundUpdate {
+        val publishNow = structural || nowMillis - lastRingPublishAt >= publishIntervalMillis
+        if (publishNow) lastRingPublishAt = nowMillis
+        return DownloadRoundUpdate(ring = ring, structural = structural, publishNow = publishNow)
     }
 
     /** Ends the round in one step: members and both byte counters are dropped together. */
@@ -236,5 +273,10 @@ class DownloadRoundProgress {
         }
         roundLoadedBytes = loaded
         roundTotalBytes = total
+    }
+
+    companion object {
+        /** Coalescing window for plain byte-progress ring publishes. */
+        const val DEFAULT_PUBLISH_INTERVAL_MILLIS = 80L
     }
 }
