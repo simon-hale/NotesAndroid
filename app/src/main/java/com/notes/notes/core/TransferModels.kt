@@ -39,6 +39,14 @@ enum class DownloadPhase(val storageValue: String) {
     /** True while the user can start this transfer again. */
     val isResumable: Boolean get() = this != TRANSFERRING
 
+    /**
+     * The phase a download keeps when its work item is gone.
+     *
+     * Only a record that still claims to be running is exposed as paused and therefore resumable; a user
+     * pause and a terminal failure are facts that a missing work item cannot undo.
+     */
+    fun withoutLiveWork(): DownloadPhase = if (isTransferring) PAUSED else this
+
     companion object {
         /** Unknown values, including records written by older versions, mean "still transferring". */
         fun fromStorage(raw: String?): DownloadPhase =
@@ -151,7 +159,41 @@ data class DownloadTransfer(
     val phase: DownloadPhase,
     val notice: TransferNotice,
     val createdAt: Long,
-)
+) {
+
+    /**
+     * The state one running attempt publishes.
+     *
+     * The phase is deliberately absent: an attempt only ever reports bytes, its destination and notices,
+     * so it can neither resurrect a pause the user asked for nor overwrite a terminal failure that was
+     * recorded next to it.
+     */
+    fun withAttemptProgress(
+        fileName: String,
+        destinationUri: String,
+        downloadedBytes: Long,
+        totalBytes: Long,
+        etag: String,
+        notice: TransferNotice,
+    ): DownloadTransfer = copy(
+        fileName = fileName,
+        destinationUri = destinationUri,
+        downloadedBytes = downloadedBytes,
+        totalBytes = totalBytes,
+        etag = etag,
+        notice = notice,
+    )
+
+    /**
+     * The persistent form of a failed attempt.
+     *
+     * Everything a later resume needs is kept exactly as it is — bytes, length, ETag, destination, name
+     * and notice — and only the phase becomes terminal, so a restart can never read a failed attempt as a
+     * user pause.
+     */
+    fun asFailedAttempt(): DownloadTransfer =
+        if (phase == DownloadPhase.FAILED) this else copy(phase = DownloadPhase.FAILED)
+}
 
 /** Upload row shown by the disk screen, merged from the transfer store and live WorkManager state. */
 @Immutable

@@ -21,6 +21,45 @@ data class EnqueuedDownloadBatch(
 )
 
 /**
+ * The business result a finished download work item reports.
+ *
+ * The result is part of the persisted work item, which is what makes it recoverable: an app that starts
+ * after the fact still sees that a download failed instead of having to guess from a missing worker.
+ */
+enum class DownloadWorkOutcome {
+    /** The item carried no result at all, for example a work item that was cancelled before it ran. */
+    NONE,
+    SUCCEEDED,
+    FAILED,
+
+    /** A pause, a cancel or a refused start: never a failure. */
+    CANCELED,
+}
+
+fun downloadWorkOutcome(rawOutcome: String?): DownloadWorkOutcome = when (rawOutcome) {
+    DownloadWorker.OUTCOME_SUCCESS -> DownloadWorkOutcome.SUCCEEDED
+    DownloadWorker.OUTCOME_FAILED -> DownloadWorkOutcome.FAILED
+    DownloadWorker.OUTCOME_CANCELED -> DownloadWorkOutcome.CANCELED
+    else -> DownloadWorkOutcome.NONE
+}
+
+/**
+ * Decides whether a failed work item still has to be written to [record].
+ *
+ * A result this process watched happening is always applied. A result it did not watch — the app was
+ * closed while the download failed — is a recovered one, and it is applied only while the record still
+ * claims to be running: that is exactly the failure nobody recorded yet. A record that is paused belongs
+ * to the user, a record that is already failed needs no second write, and a newer attempt that is still
+ * running owns the state as well.
+ */
+fun shouldRecordDownloadFailure(
+    record: DownloadTransfer?,
+    observedWhileRunning: Boolean,
+    supersededByLiveWork: Boolean,
+): Boolean = !supersededByLiveWork &&
+    (observedWhileRunning || record?.phase?.isTransferring == true)
+
+/**
  * Owns the download queue in WorkManager.
  *
  * Every logical download gets its own unique work name derived from its transfer id, so Pause,

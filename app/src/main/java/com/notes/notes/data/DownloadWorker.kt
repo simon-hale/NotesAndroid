@@ -34,6 +34,15 @@ class DownloadForegroundException(cause: Throwable?) :
     Exception("Unable to run the download as a foreground service", cause)
 
 /**
+ * True when an attempt that ended with [throwable] has to be recorded as a persistent failure.
+ *
+ * A cancellation is a user pause, a WorkManager stop or a system shutdown — never a download failure —
+ * so it keeps the transfer resumable instead of marking it failed.
+ */
+internal fun isPersistableDownloadFailure(throwable: Throwable): Boolean =
+    throwable !is CancellationException
+
+/**
  * Runs one logical download transfer as a long-running foreground worker.
  *
  * The partial file is a pending MediaStore item, so an incomplete download is never visible as a
@@ -82,11 +91,10 @@ class DownloadWorker(
             workAccountKey = inputData.getString(KEY_INPUT_ACCOUNT_KEY).orEmpty(),
         )
         if (accessToken.isBlank()) {
-            return Result.success(
-                failureData(
-                    transferId,
-                    IllegalStateException("Missing download session data"),
-                )
+            return finalizeFailure(
+                transferId = transferId,
+                throwable = IllegalStateException("Missing download session data"),
+                run = null,
             )
         }
 
@@ -95,23 +103,63 @@ class DownloadWorker(
         return try {
             val foregroundFailure = promoteToForeground(transfer, run)
             if (foregroundFailure != null) {
-                return Result.success(
-                    failureData(
-                        transferId,
-                        DownloadForegroundException(foregroundFailure),
-                    )
+                return finalizeFailure(
+                    transferId = transferId,
+                    throwable = DownloadForegroundException(foregroundFailure),
+                    run = run,
                 )
             }
 
             transferFile(transfer, accessToken, run)
         } catch (cancellation: CancellationException) {
+            // A pause or a shutdown is not a failure: the attempt keeps its bytes and stays resumable.
             persistRun(run)
             throw cancellation
         } catch (throwable: Throwable) {
+            /*
+             * Only a real error is a failure. The cancellation clause above already keeps pauses out of
+             * here, and this guard keeps that rule explicit even if the clauses are ever reordered.
+             */
+            if (!isPersistableDownloadFailure(throwable)) throw throwable
+            finalizeFailure(transferId, throwable, run)
+        }
+    }
+
+    /**
+     * Records one failed attempt and reports it.
+     *
+     * The failure is persisted by the worker itself, next to the newest byte snapshot, because it is a
+     * fact the download engine produced: whether a UI happened to be alive and watching must not decide
+     * whether the attempt is remembered as failed or mistaken for a user pause later.
+     *
+     * The order matters and is what makes the record consistent: the latest progress is written first,
+     * and the phase is then changed on top of the stored record without touching any of it.
+     */
+    private suspend fun finalizeFailure(
+        transferId: String,
+        throwable: Throwable,
+        run: DownloadRun?,
+    ): Result {
+        if (run != null) {
             Log.w(TAG, "Download failed for ${run.fileName}", throwable)
             persistRun(run)
-            Result.success(failureData(transferId, throwable))
+        } else {
+            Log.w(TAG, "Download failed before the attempt started", throwable)
         }
+
+        /*
+         * The result is reported even when the record could not be updated: whoever reads the result
+         * applies the same rule, so a store hiccup cannot silently turn the failure into a pause.
+         */
+        runCatching {
+            withContext(NonCancellable) {
+                transferStore.updateDownload(transferId) { current -> current.asFailedAttempt() }
+            }
+        }.onFailure { storeFailure ->
+            Log.w(TAG, "Unable to record the terminal download failure", storeFailure)
+        }
+
+        return Result.success(failureData(transferId, throwable))
     }
 
     private suspend fun transferFile(
@@ -312,11 +360,16 @@ class DownloadWorker(
         persistRun(run)
     }
 
-    /** Writes the live transfer state back, but only while the record still exists. */
+    /**
+     * Writes the live transfer state back, but only while the record still exists.
+     *
+     * The phase is not part of what an attempt publishes, so a progress write can never overwrite a
+     * pause the user asked for, nor the terminal failure recorded next to it.
+     */
     private suspend fun persistRun(run: DownloadRun) {
         withContext(NonCancellable) {
             transferStore.updateDownload(run.transferId) { current ->
-                current.copy(
+                current.withAttemptProgress(
                     fileName = run.fileName,
                     destinationUri = run.destinationUri,
                     downloadedBytes = run.downloadedBytes,

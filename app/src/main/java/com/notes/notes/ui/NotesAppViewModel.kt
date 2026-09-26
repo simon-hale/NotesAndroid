@@ -43,6 +43,7 @@ import com.notes.notes.data.DirectoryListing
 import com.notes.notes.data.DownloadRoundProgress
 import com.notes.notes.data.DownloadTaskProgress
 import com.notes.notes.data.DownloadWork
+import com.notes.notes.data.DownloadWorkOutcome
 import com.notes.notes.data.DownloadWorker
 import com.notes.notes.data.FileTransferRepository
 import com.notes.notes.data.NotesBackendService
@@ -52,6 +53,8 @@ import com.notes.notes.data.TransferAccount
 import com.notes.notes.data.TransferStsCredentialProvider
 import com.notes.notes.data.TransferStore
 import com.notes.notes.data.downloadTaskProgress
+import com.notes.notes.data.downloadWorkOutcome
+import com.notes.notes.data.shouldRecordDownloadFailure
 import com.notes.notes.data.UploadUriPermissionManager
 import com.notes.notes.data.UploadWork
 import com.notes.notes.data.UploadWorker
@@ -1770,11 +1773,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             .forEach { record ->
                 viewModelScope.launch {
                     transferStore.updateDownload(record.transferId) { current ->
-                        if (current.phase.isTransferring) {
-                            current.copy(phase = DownloadPhase.PAUSED)
-                        } else {
-                            current
-                        }
+                        // A record that is not running any more keeps its phase: only the legacy running
+                        // one becomes available to the user as paused.
+                        current.copy(phase = current.phase.withoutLiveWork())
                     }
                 }
             }
@@ -1899,80 +1900,92 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun applyDownloadWorkInfos(infos: List<WorkInfo>) {
         downloadWorkInfos = infos
         downloadWorkInfosObserved = true
+        val liveTransferIds = infos
+            .filterNot { it.state.isFinished }
+            .mapNotNullTo(mutableSetOf(), DownloadWork::transferId)
         infos.forEach { info ->
             val previousState = downloadWorkStates.put(info.id, info.state)
             val changedWhileObserved = previousState != null && previousState != info.state
-            if (!info.state.isFinished || !changedWhileObserved) return@forEach
+            if (!info.state.isFinished) return@forEach
+            /*
+             * A finished work item is processed once per item, and deliberately not only when this process
+             * watched it run: a download that failed while the app was closed reports its result here for
+             * the first time, and that result is a persistent fact that still has to be applied.
+             *
+             * Only results this process really watched are additionally reported to the user, so a stale
+             * error is never replayed after a restart.
+             */
             if (!handledDownloadWorkIds.add(info.id)) return@forEach
             /*
              * The round bookkeeping is updated before the UI is refreshed, so the ring and the transfer
              * rows of this pass are computed from the same facts.
              *
-             * A downloaded or failed attempt is over, so its enqueue grace is dropped as well: an
-             * attempt that fails right after it started must not keep looking active for the rest of the
-             * grace window. A cancelled attempt keeps its marker, because that is what a resume relies
-             * on until its replacement work item shows up.
+             * A downloaded or failed attempt is over, so its enqueue grace is dropped as well: an attempt
+             * that fails right after it started must not keep looking active for the rest of the grace
+             * window. A cancelled attempt keeps its marker, because that is what a resume relies on until
+             * its replacement work item shows up.
              */
             val transferId = DownloadWork.transferId(info)
-            when (info.outputData.getString(DownloadWorker.KEY_RESULT_OUTCOME)) {
-                DownloadWorker.OUTCOME_SUCCESS -> {
+            when (downloadWorkOutcome(info.outputData.getString(DownloadWorker.KEY_RESULT_OUTCOME))) {
+                DownloadWorkOutcome.SUCCEEDED -> {
                     if (transferId != null) {
                         // A finished download keeps its place in the running round at its full size.
                         downloadRoundProgress.onTaskCompleted(transferId)
                         recentlyEnqueuedTransfers.remove(transferId)
                     }
-                    loadDownloadedFiles()
+                    // The worker already removed the completed download; only the list has to catch up.
+                    if (changedWhileObserved) loadDownloadedFiles()
                 }
 
-                DownloadWorker.OUTCOME_FAILED -> {
+                DownloadWorkOutcome.FAILED -> {
                     if (transferId != null) {
-                        // A failure is a terminal state of its own: it is persisted, so a restart cannot
-                        // degrade it into a user pause and make the ring claim "everything is paused".
                         downloadRoundProgress.onTaskFailed()
-                        markDownloadFailed(transferId)
+                        val record = downloadTransfers.firstOrNull { it.transferId == transferId }
+                        if (
+                            shouldRecordDownloadFailure(
+                                record = record,
+                                observedWhileRunning = changedWhileObserved,
+                                supersededByLiveWork = transferId in liveTransferIds,
+                            )
+                        ) {
+                            markDownloadFailed(transferId)
+                        }
                         recentlyEnqueuedTransfers.remove(transferId)
                     }
-                    sendErrorMessage(downloadWorkFailureMessage(info.outputData))
+                    if (changedWhileObserved) sendErrorMessage(downloadWorkFailureMessage(info.outputData))
                 }
 
-                else -> Unit
+                DownloadWorkOutcome.CANCELED, DownloadWorkOutcome.NONE -> Unit
             }
         }
-        if (infos.any { !it.state.isFinished }) {
-            handledDownloadWorkIds.clear()
-        }
+        /*
+         * Only work items WorkManager still reports stay remembered. A stale finished item can therefore
+         * never replay its result while a download is running, and the set stays bounded.
+         */
+        handledDownloadWorkIds.retainAll(infos.mapTo(mutableSetOf(), WorkInfo::id))
         refreshTransferUi()
         reconcileDownloadPhases()
     }
 
     /**
-     * Makes a reported failure permanent.
+     * Mirrors a reported failure into the UI right away and re-asserts it in the store.
      *
-     * The in-memory mirror is updated before the next projection, so the failure is visible in the very
-     * pass that reports it, and the record is persisted so a process restart cannot degrade the failed
-     * attempt into a user pause.
+     * The worker already persisted the failure itself, so this is the immediate UI half plus a safety
+     * net for records that were written before the download engine recorded failures on its own. The
+     * in-memory mirror is updated before the next projection, so the failure is visible in the very pass
+     * that reports it.
      *
      * The store edit accepts any phase except [DownloadPhase.FAILED]: the shared phase reconciliation
-     * may have turned the same record into PAUSED in this instant, and a failure the worker really
-     * reported must not be downgraded by that race.
+     * may have turned the same record into PAUSED in this instant, and a failure that was really reported
+     * must not be downgraded by that race.
      */
     private fun markDownloadFailed(transferId: String) {
         downloadTransfers = downloadTransfers.map { transfer ->
-            if (transfer.transferId == transferId && transfer.phase != DownloadPhase.FAILED) {
-                transfer.copy(phase = DownloadPhase.FAILED)
-            } else {
-                transfer
-            }
+            if (transfer.transferId == transferId) transfer.asFailedAttempt() else transfer
         }
 
         viewModelScope.launch {
-            transferStore.updateDownload(transferId) { current ->
-                if (current.phase == DownloadPhase.FAILED) {
-                    current
-                } else {
-                    current.copy(phase = DownloadPhase.FAILED)
-                }
-            }
+            transferStore.updateDownload(transferId) { current -> current.asFailedAttempt() }
         }
     }
 
