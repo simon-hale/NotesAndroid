@@ -64,9 +64,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.notes.notes.core.AppLanguage
+import com.notes.notes.core.AppStrings
 import com.notes.notes.core.AppTab
 import com.notes.notes.core.DirectoryEntry
 import com.notes.notes.core.DownloadPhase
+import com.notes.notes.core.DownloadRingMode
+import com.notes.notes.core.DownloadRingState
 import com.notes.notes.core.DownloadedFileEntry
 import com.notes.notes.core.FileEntry
 import com.notes.notes.core.FileDiskStrings
@@ -81,6 +84,7 @@ import com.notes.notes.core.stringsFor
 import com.notes.notes.ui.NotesAppViewModel
 import com.notes.notes.ui.components.ActionChip
 import com.notes.notes.ui.components.BreadcrumbBar
+import com.notes.notes.ui.components.ChipProgressRing
 import com.notes.notes.ui.components.GlassPanel
 import com.notes.notes.ui.components.InfoPill
 import com.notes.notes.ui.components.LoadingCard
@@ -182,8 +186,10 @@ fun DiskScreen(
                         // Only unfinished downloads get a transfer entry point. It deliberately sits immediately to the
                         // left of the completed-download repository.
                         if (uiState.disk.downloadTransfers.isNotEmpty()) {
-                            ActionChip(
-                                icon = Icons.Outlined.Download,
+                            DownloadTransfersActionChip(
+                                ring = uiState.disk.downloadRing,
+                                language = uiState.settings.language,
+                                strings = strings,
                                 onClick = {
                                     downloadTransfersSheetVisible = true
                                 },
@@ -521,6 +527,62 @@ fun DiskScreen(
             strings = strings,
         )
     }
+}
+
+/**
+ * Entry point to the running downloads.
+ *
+ * The ring inside the button mirrors the byte progress of the current download round. It is drawn
+ * against the inner edge of the unchanged button, so its size, click area and interaction stay exactly
+ * as they were. The state is never carried by colour alone: the very same information is exposed to
+ * accessibility services as the button's state description.
+ */
+@Composable
+private fun DownloadTransfersActionChip(
+    ring: DownloadRingState,
+    language: AppLanguage,
+    strings: AppStrings,
+    onClick: () -> Unit,
+) {
+    val extraColors = LocalNotesExtraColors.current
+    ActionChip(
+        icon = Icons.Outlined.Download,
+        onClick = onClick,
+        contentDescription = strings.transfers.downloadRingButton,
+        stateDescription = downloadRingDescription(ring, language, strings),
+        progressRing = if (ring.visible) {
+            ChipProgressRing(
+                // An unknown file size must never be drawn as a made-up percentage.
+                progress = if (ring.mode == DownloadRingMode.INDETERMINATE) null else ring.progress,
+                color = when (ring.mode) {
+                    DownloadRingMode.PAUSED -> extraColors.warning
+                    else -> extraColors.success
+                },
+            )
+        } else {
+            null
+        },
+    )
+}
+
+/** What the ring means, in words, for accessibility services. */
+private fun downloadRingDescription(
+    ring: DownloadRingState,
+    language: AppLanguage,
+    strings: AppStrings,
+): String = when (ring.mode) {
+    DownloadRingMode.DETERMINATE -> strings.format(
+        strings.transfers.downloadRingProgressTemplate,
+        language.asLocale(),
+        (ring.progress.coerceIn(0f, 1f) * 100f).roundToInt(),
+    )
+
+    DownloadRingMode.INDETERMINATE -> strings.transfers.downloadRingIndeterminate
+
+    // A full yellow ring means "paused", never "finished".
+    DownloadRingMode.PAUSED -> strings.transfers.downloadRingPaused
+
+    DownloadRingMode.HIDDEN -> strings.transfers.downloadRingIdle
 }
 
 @Composable

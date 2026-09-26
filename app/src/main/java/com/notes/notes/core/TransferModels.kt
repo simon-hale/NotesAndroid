@@ -166,3 +166,49 @@ data class DownloadTransferEntry(
             0f
         }
 }
+
+/** What the ring inside the download-drawer button currently communicates. */
+enum class DownloadRingMode {
+    /** No active and no paused download: the button keeps its plain idle look. */
+    HIDDEN,
+
+    /** Green ring filled by the current round's byte progress. */
+    DETERMINATE,
+
+    /** Green ring that spins because at least one member's size is not known yet. */
+    INDETERMINATE,
+
+    /**
+     * Yellow full ring: no download is running, but at least one task is paused and can be resumed.
+     * It never means "download finished".
+     */
+    PAUSED,
+}
+
+/**
+ * Ring state of one download round.
+ *
+ * The value is produced by the download round accounting together with the transfer rows, so the ring
+ * and the list always describe the same instant.
+ */
+@Immutable
+data class DownloadRingState(
+    val mode: DownloadRingMode = DownloadRingMode.HIDDEN,
+    /** Byte progress of the current round, meaningful for [DownloadRingMode.DETERMINATE] only. */
+    val progress: Float = 0f,
+) {
+    val visible: Boolean get() = mode != DownloadRingMode.HIDDEN
+
+    companion object {
+        val Hidden = DownloadRingState()
+
+        val Paused = DownloadRingState(mode = DownloadRingMode.PAUSED, progress = 1f)
+
+        val Indeterminate = DownloadRingState(mode = DownloadRingMode.INDETERMINATE)
+
+        fun determinate(progress: Float): DownloadRingState = DownloadRingState(
+            mode = DownloadRingMode.DETERMINATE,
+            progress = progress.coerceIn(0f, 1f),
+        )
+    }
+}

@@ -13,6 +13,7 @@ import com.notes.notes.core.AppTab
 import com.notes.notes.core.DirectoryEntry
 import com.notes.notes.core.DiskScreenState
 import com.notes.notes.core.DownloadPhase
+import com.notes.notes.core.DownloadRingState
 import com.notes.notes.core.DownloadTransfer
 import com.notes.notes.core.DownloadTransferEntry
 import com.notes.notes.core.DownloadedFileEntry
@@ -39,6 +40,8 @@ import com.notes.notes.core.UploadTransferEntry
 import com.notes.notes.core.stringsFor
 import com.notes.notes.data.AppPreferencesStore
 import com.notes.notes.data.DirectoryListing
+import com.notes.notes.data.DownloadRoundProgress
+import com.notes.notes.data.DownloadTaskProgress
 import com.notes.notes.data.DownloadWork
 import com.notes.notes.data.DownloadWorker
 import com.notes.notes.data.FileTransferRepository
@@ -53,6 +56,7 @@ import com.notes.notes.data.UploadWork
 import com.notes.notes.data.UploadWorker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -129,6 +133,19 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     private val handledDownloadWorkIds = mutableSetOf<UUID>()
     private val downloadWorkStates = mutableMapOf<UUID, WorkInfo.State>()
+
+    /**
+     * Byte accounting of the download round the drawer ring shows.
+     *
+     * It lives in the ViewModel, so a configuration change keeps the round; only a killed process ends
+     * it, and the downloads that are really active when the app returns simply start a new round.
+     */
+    private val downloadRoundProgress = DownloadRoundProgress()
+
+    /** Latest transfer projection waiting for its coalesced publish, if any. */
+    private var pendingTransferUi: PendingTransferUi? = null
+    private var transferUiFlushJob: Job? = null
+    private var lastTransferUiPublishAt = 0L
 
     init {
         viewModelScope.launch {
@@ -1330,13 +1347,24 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
                 )
             }
-        val downloadEntries = downloadTransfers
+        /*
+         * The round accounting runs after the transfer mirror and the WorkManager snapshots are up to
+         * date and produces the ring together with the rows, so one publish always describes one
+         * consistent instant: never a green progress followed by a paused state.
+         */
+        val now = System.currentTimeMillis()
+        val liveDownloadTransferIds = downloadWorkInfos
+            .filterNot { it.state.isFinished }
+            .mapNotNullTo(mutableSetOf(), DownloadWork::transferId)
+        val downloadEntries = mutableListOf<DownloadTransferEntry>()
+        val downloadTasks = mutableListOf<DownloadTaskProgress>()
+        downloadTransfers
             .filter { isOwnedByActiveSession(it.accountKey) }
-            .map { record ->
+            .forEach { record ->
                 val info = downloadWorkInfos.firstOrNull { info ->
                     !info.state.isFinished && DownloadWork.transferId(info) == record.transferId
                 }
-                DownloadTransferEntry(
+                downloadEntries += DownloadTransferEntry(
                     transferId = record.transferId,
                     fileName = record.fileName,
                     phase = record.phase,
@@ -1344,7 +1372,28 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     totalBytes = record.totalBytes,
                     waitingForNetwork = info != null && info.state == WorkInfo.State.ENQUEUED,
                 )
+                downloadTasks += DownloadTaskProgress(
+                    transferId = record.transferId,
+                    // The running worker publishes byte progress more often than it persists the
+                    // record, so those live values are the fresher pair of the two.
+                    totalBytes = info?.progress
+                        ?.getLong(DownloadWorker.KEY_PROGRESS_TOTAL_BYTES, record.totalBytes)
+                        ?: record.totalBytes,
+                    downloadedBytes = info?.progress
+                        ?.getLong(DownloadWorker.KEY_PROGRESS_DOWNLOADED_BYTES, record.downloadedBytes)
+                        ?: record.downloadedBytes,
+                    // Waiting for network or a worker slot still counts as active: the task has not
+                    // stopped transferring, it just has not been scheduled yet.
+                    active = record.transferId in liveDownloadTransferIds ||
+                        (
+                            record.phase == DownloadPhase.TRANSFERRING &&
+                                isWithinEnqueueGrace(record.transferId, now)
+                            ),
+                    paused = record.phase == DownloadPhase.PAUSED,
+                )
             }
+        val round = downloadRoundProgress.reduce(downloadTasks)
+
         // Enqueue grace entries of settled transfers are no longer needed.
         val knownTransferIds =
             uploadTransfers.mapTo(
@@ -1373,17 +1422,111 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
          * That exact race used to make a brand-new download look orphaned and reconcile it
          * from TRANSFERRING to PAUSED before its Worker could start.
          */
-        val now = System.currentTimeMillis()
         recentlyEnqueuedTransfers.entries.removeAll { entry ->
             entry.key !in knownTransferIds &&
                     entry.key !in liveWorkTransferIds &&
                     now - entry.value >= ENQUEUE_GRACE_MILLIS
         }
+        publishTransferUi(
+            uploadEntries = uploadEntries,
+            downloadEntries = downloadEntries,
+            ring = round.ring,
+            immediate = round.structural ||
+                rowsChangedBeyondBytes(uploadEntries, downloadEntries),
+        )
+    }
+
+    /**
+     * True when the projected rows differ from what is on screen in anything but their byte counters,
+     * which is exactly what a pause, a resume, a queued or a removed transfer looks like.
+     */
+    private fun rowsChangedBeyondBytes(
+        uploadEntries: List<UploadTransferEntry>,
+        downloadEntries: List<DownloadTransferEntry>,
+    ): Boolean {
+        val published = _uiState.value.disk
+        if (published.uploadTransfers.size != uploadEntries.size) return true
+        if (published.downloadTransfers.size != downloadEntries.size) return true
+        if (published.uploadTransfers.zip(uploadEntries).any { (current, next) ->
+                current.transferId != next.transferId ||
+                    current.displayName != next.displayName ||
+                    current.phase != next.phase ||
+                    current.fileBytes != next.fileBytes ||
+                    current.waitingForNetwork != next.waitingForNetwork
+            }
+        ) {
+            return true
+        }
+        return published.downloadTransfers.zip(downloadEntries).any { (current, next) ->
+            current.transferId != next.transferId ||
+                current.fileName != next.fileName ||
+                current.phase != next.phase ||
+                current.totalBytes != next.totalBytes ||
+                current.waitingForNetwork != next.waitingForNetwork
+        }
+    }
+
+    private data class PendingTransferUi(
+        val uploadEntries: List<UploadTransferEntry>,
+        val downloadEntries: List<DownloadTransferEntry>,
+        val ring: DownloadRingState,
+    )
+
+    /**
+     * Publishes the transfer projection, coalescing plain byte-progress refreshes.
+     *
+     * Chunk-level byte updates arrive far more often than the ring has to be redrawn, so a pure
+     * progress publish is merged with the next one inside
+     * [DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS]. Everything that changes what the state *means* — a
+     * round starting or ending, a member joining, completing, failing, being cancelled, or a pause and
+     * resume — arrives with `immediate` set and is published at once, replacing any pending update, so
+     * no intermediate percentage can reach the screen.
+     */
+    private fun publishTransferUi(
+        uploadEntries: List<UploadTransferEntry>,
+        downloadEntries: List<DownloadTransferEntry>,
+        ring: DownloadRingState,
+        immediate: Boolean,
+    ) {
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastTransferUiPublishAt
+        if (immediate || elapsed >= DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS) {
+            cancelPendingTransferUi()
+            lastTransferUiPublishAt = now
+            applyTransferUi(uploadEntries, downloadEntries, ring)
+            return
+        }
+
+        pendingTransferUi = PendingTransferUi(uploadEntries, downloadEntries, ring)
+        if (transferUiFlushJob != null) return
+
+        transferUiFlushJob = viewModelScope.launch {
+            delay(DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS - elapsed)
+            transferUiFlushJob = null
+            val pending = pendingTransferUi ?: return@launch
+            pendingTransferUi = null
+            lastTransferUiPublishAt = System.currentTimeMillis()
+            applyTransferUi(pending.uploadEntries, pending.downloadEntries, pending.ring)
+        }
+    }
+
+    private fun cancelPendingTransferUi() {
+        transferUiFlushJob?.cancel()
+        transferUiFlushJob = null
+        pendingTransferUi = null
+    }
+
+    private fun applyTransferUi(
+        uploadEntries: List<UploadTransferEntry>,
+        downloadEntries: List<DownloadTransferEntry>,
+        ring: DownloadRingState,
+    ) {
         _uiState.update { state ->
             state.copy(
                 disk = state.disk.copy(
                     uploadTransfers = uploadEntries,
                     downloadTransfers = downloadEntries,
+                    downloadRing = ring,
                 )
             )
         }
@@ -1633,6 +1776,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         return true
     }
 
+    /** Read-only counterpart of [isEnqueueSettled] for the transfer projection. */
+    private fun isWithinEnqueueGrace(transferId: String, now: Long): Boolean {
+        val enqueuedAt = recentlyEnqueuedTransfers[transferId] ?: return false
+        return now - enqueuedAt < ENQUEUE_GRACE_MILLIS
+    }
+
     private fun setTransferActionBusy(busy: Boolean) {
         _uiState.update { it.copy(disk = it.disk.copy(transferActionBusy = busy)) }
     }
@@ -1736,13 +1885,32 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             val changedWhileObserved = previousState != null && previousState != info.state
             if (!info.state.isFinished || !changedWhileObserved) return@forEach
             if (!handledDownloadWorkIds.add(info.id)) return@forEach
+            /*
+             * The round bookkeeping is updated before the UI is refreshed, so the ring and the transfer
+             * rows of this pass are computed from the same facts.
+             *
+             * A downloaded or failed attempt is over, so its enqueue grace is dropped as well: an
+             * attempt that fails right after it started must not keep looking active for the rest of the
+             * grace window. A cancelled attempt keeps its marker, because that is what a resume relies
+             * on until its replacement work item shows up.
+             */
+            val transferId = DownloadWork.transferId(info)
             when (info.outputData.getString(DownloadWorker.KEY_RESULT_OUTCOME)) {
                 DownloadWorker.OUTCOME_SUCCESS -> {
-                    sendSuccessMessage(strings().fileDisk.downloadCompleted)
+                    if (transferId != null) {
+                        // A finished download keeps its place in the running round at its full size.
+                        downloadRoundProgress.onTaskCompleted(transferId)
+                        recentlyEnqueuedTransfers.remove(transferId)
+                    }
                     loadDownloadedFiles()
                 }
 
                 DownloadWorker.OUTCOME_FAILED -> {
+                    if (transferId != null) {
+                        // A failure is not a pause: it must never be reported as "everything is paused".
+                        downloadRoundProgress.onTaskFailed(transferId)
+                        recentlyEnqueuedTransfers.remove(transferId)
+                    }
                     sendErrorMessage(downloadWorkFailureMessage(info.outputData))
                 }
 
@@ -2141,11 +2309,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
                     throw throwable
                 }
-
-                emitMessage(
-                    strings().fileDisk.downloadStarted,
-                    MessageTone.INFO,
-                )
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (throwable: Throwable) {
@@ -2332,6 +2495,9 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         val removed =
             transferStore.removeDownload(transfer.transferId)
                 ?: transfer
+
+        // A destructive cancel removes the transfer and its partial file, so it also leaves the round.
+        downloadRoundProgress.onTaskCancelled(transfer.transferId)
 
         downloadTransfers = downloadTransfers.filterNot {
             it.transferId == transfer.transferId
@@ -3340,6 +3506,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             }
 
             /*
+             * The ring only ever describes the downloads of the session that is ending. Its round and
+             * any coalesced projection still waiting to be published must not survive into the next one.
+             */
+            cancelPendingTransferUi()
+            downloadRoundProgress.reset()
+
+            /*
              * Reset every user-visible account/session state. Theme/language stay because they are device
              * preferences rather than authenticated account content.
              */
@@ -3549,10 +3722,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         return raw.replace('\n', ' ').take(120)
     }
 
-    private suspend fun emitMessage(message: String, tone: MessageTone = MessageTone.INFO) {
-        messageChannel.send(UiMessage(message = message, tone = tone))
-    }
-
     private fun strings() = stringsFor(_uiState.value.settings.language)
 
     private fun toUserMessage(throwable: Throwable, authRequest: Boolean = false): String {
@@ -3708,6 +3877,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     targetIds
                 )
 
+                targetIds.forEach(downloadRoundProgress::onTaskCancelled)
+
                 downloadTransfers =
                     downloadTransfers.filterNot { transfer ->
                         transfer.transferId in targetIds
@@ -3772,6 +3943,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
         /** How long a just-enqueued transfer may be missing from the WorkManager snapshot. */
         const val ENQUEUE_GRACE_MILLIS = 5_000L
+
+        /**
+         * Coalescing window for plain byte-progress publishes. State transitions are published
+         * immediately and never wait for this window.
+         */
+        const val DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS = 80L
 
         /** A destructive cancel is best effort; the UI must never wait on it for long. */
         const val CANCEL_ABORT_TIMEOUT_MILLIS = 15_000L

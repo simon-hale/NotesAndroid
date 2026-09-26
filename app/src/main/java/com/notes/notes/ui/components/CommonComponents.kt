@@ -1,6 +1,11 @@
 package com.notes.notes.ui.components
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -47,15 +52,23 @@ import androidx.compose.material3.SnackbarVisuals
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -404,13 +417,30 @@ fun SectionHeading(title: String, action: String? = null) {
     }
 }
 
+/**
+ * Ring drawn against the inner edge of an [ActionChip], without changing its size or its click area.
+ *
+ * [progress] is a `0..1` fraction for a determinate arc; `null` asks for the indeterminate spinner that
+ * is used while a byte progress cannot be computed honestly.
+ */
+@Immutable
+data class ChipProgressRing(
+    val progress: Float?,
+    val color: Color,
+)
+
 @Composable
 fun ActionChip(
     icon: ImageVector,
     onClick: () -> Unit,
+    contentDescription: String? = null,
+    stateDescription: String? = null,
+    progressRing: ChipProgressRing? = null,
 ) {
     Surface(
-        modifier = Modifier.size(42.dp),
+        modifier = Modifier
+            .size(42.dp)
+            .semantics { if (stateDescription != null) this.stateDescription = stateDescription },
         onClick = onClick,
         shape = CircleShape,
         color = Color.Transparent,
@@ -422,10 +452,91 @@ fun ActionChip(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
+            if (progressRing != null) {
+                ChipProgressRingArc(
+                    ring = progressRing,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            Icon(icon, contentDescription = contentDescription, modifier = Modifier.size(20.dp))
         }
     }
 }
+
+/**
+ * Draws one chip ring with the Compose drawing API.
+ *
+ * The arc geometry and the stroke are only rebuilt when the size changes, and the spinning angle is
+ * read inside the draw lambda, so an indeterminate ring invalidates the draw without recomposing.
+ */
+@Composable
+private fun ChipProgressRingArc(
+    ring: ChipProgressRing,
+    modifier: Modifier = Modifier,
+) {
+    val spinAngle = if (ring.progress == null) {
+        val transition = rememberInfiniteTransition(label = "chip-ring-spin")
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = CHIP_RING_SPIN_MILLIS, easing = LinearEasing),
+            ),
+            label = "chip-ring-angle",
+        )
+    } else {
+        null
+    }
+
+    Box(
+        modifier = modifier.drawWithCache {
+            val strokeWidth = CHIP_RING_STROKE_WIDTH.toPx()
+            // Hug the inside of the button's own border instead of overlapping it.
+            val inset = CHIP_RING_INSET.toPx() + strokeWidth / 2f
+            val diameter = (size.minDimension - inset * 2f).coerceAtLeast(0f)
+            val topLeft = Offset((size.width - diameter) / 2f, (size.height - diameter) / 2f)
+            val arcSize = Size(diameter, diameter)
+            val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+            onDrawBehind {
+                val progress = ring.progress
+                if (progress == null) {
+                    drawArc(
+                        color = ring.color,
+                        startAngle = (spinAngle?.value ?: 0f) - 90f,
+                        sweepAngle = CHIP_RING_INDETERMINATE_SWEEP,
+                        useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
+                        style = stroke,
+                    )
+                    return@onDrawBehind
+                }
+                val sweep = CHIP_RING_FULL_SWEEP * progress.coerceIn(0f, 1f)
+                if (sweep > 0f) {
+                    drawArc(
+                        color = ring.color,
+                        startAngle = -90f,
+                        sweepAngle = sweep,
+                        useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
+                        style = stroke,
+                    )
+                }
+            }
+        }
+    )
+}
+
+/** Stroke thickness of a chip ring. */
+private val CHIP_RING_STROKE_WIDTH = 2.5.dp
+
+/** Gap between the chip outline and the ring, so the ring reads as part of the button. */
+private val CHIP_RING_INSET = 1.5.dp
+
+private const val CHIP_RING_FULL_SWEEP = 360f
+private const val CHIP_RING_INDETERMINATE_SWEEP = 100f
+private const val CHIP_RING_SPIN_MILLIS = 1_400
 
 @Composable
 fun StatusCard(

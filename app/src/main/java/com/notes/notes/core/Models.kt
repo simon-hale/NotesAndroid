@@ -139,6 +139,8 @@ data class DiskScreenState(
     val uploadTransfers: List<UploadTransferEntry> = emptyList(),
     /** Live and paused downloads, shown above the completed downloads. */
     val downloadTransfers: List<DownloadTransferEntry> = emptyList(),
+    /** Ring drawn inside the download button of the disk header. */
+    val downloadRing: DownloadRingState = DownloadRingState(),
     /** True while a pause/resume/cancel request is being applied, so the UI can lock its actions. */
     val transferActionBusy: Boolean = false,
 ) {

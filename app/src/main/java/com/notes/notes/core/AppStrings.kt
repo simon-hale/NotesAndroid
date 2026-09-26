@@ -180,8 +180,6 @@ data class FileDiskStrings(
     val uploadSuccessTemplate: String,
     val uploadFailedTemplate: String,
     val selected: String,
-    val downloadStarted: String,
-    val downloadCompleted: String,
     val uploadSelectionCountTemplate: String,
     val emptySelectionHint: String,
     val deleteDownloadedFilePrompt: String,
@@ -220,10 +218,19 @@ data class TransferStrings(
     val uploadSourceChanged: String,
     val uploadTargetChanged: String,
     val resolveBatchFirst: String,
-    val metadataPendingBlocksDeletion: String,
     val bytesProgressTemplate: String,
     val percentTemplate: String,
     val resumableHint: String,
+    /** Accessibility name of the download drawer button. */
+    val downloadRingButton: String,
+    /** Accessibility state of a running round; `%1$d` is the rounded percentage. */
+    val downloadRingProgressTemplate: String,
+    /** Accessibility state while at least one member's size is still unknown. */
+    val downloadRingIndeterminate: String,
+    /** Accessibility state of the yellow full ring: everything paused, never "finished". */
+    val downloadRingPaused: String,
+    /** Accessibility state without any download to show. */
+    val downloadRingIdle: String,
 )
 
 data class AppStrings(
@@ -439,8 +446,6 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             uploadSuccessTemplate = "上传成功：%s",
             uploadFailedTemplate = "上传失败：%s",
             selected = "已选中，前往阅读页后点击刷新即可预览",
-            downloadStarted = "已开始下载",
-            downloadCompleted = "下载完成",
             uploadSelectionCountTemplate = "已选择 %d 个文件",
             emptySelectionHint = "尚未选择任何文件",
             deleteDownloadedFilePrompt = "删除后将从 Download/Notes 中移除",
@@ -477,10 +482,14 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             uploadSourceChanged = "本地文件已发生变化，已重新开始上传",
             uploadTargetChanged = "OSS 上传目标已发生变化，已保留原有的断点续传任务，可取消后重新上传",
             resolveBatchFirst = "请先完成当前的上传任务，再选择新的文件",
-            metadataPendingBlocksDeletion = "仍有文件等待写入服务器元数据，完成登记后才能删除账户",
             bytesProgressTemplate = "%1\$s / %2\$s",
             percentTemplate = "%1\$d%%",
             resumableHint = "可以关闭此面板，传输与断点会保留",
+            downloadRingButton = "下载任务",
+            downloadRingProgressTemplate = "正在下载，进度 %1\$d%%",
+            downloadRingIndeterminate = "正在下载，文件大小未知",
+            downloadRingPaused = "全部暂停",
+            downloadRingIdle = "无下载任务",
         ),
     )
 
@@ -651,8 +660,6 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             uploadSuccessTemplate = "Upload success: %s",
             uploadFailedTemplate = "Upload failed: %s",
             selected = "Selected. Go to the reader and tap refresh to preview it.",
-            downloadStarted = "Download has started.",
-            downloadCompleted = "Download completed.",
             uploadSelectionCountTemplate = "%d file(s) selected",
             emptySelectionHint = "No files selected yet",
             deleteDownloadedFilePrompt = "The file will be removed from Download/Notes.",
@@ -689,10 +696,14 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             uploadSourceChanged = "The local file changed, so the upload restarted",
             uploadTargetChanged = "The OSS upload target changed; the existing resumable upload was preserved. Cancel it to upload again.",
             resolveBatchFirst = "Finish the current upload batch before picking new files.",
-            metadataPendingBlocksDeletion = "A file is still waiting to be registered on the server. Complete it before deleting this account.",
             bytesProgressTemplate = "%1\$s / %2\$s",
             percentTemplate = "%1\$d%%",
             resumableHint = "You can close this panel; the transfer and its checkpoint are kept",
+            downloadRingButton = "Downloads",
+            downloadRingProgressTemplate = "Downloading, %1\$d%% complete",
+            downloadRingIndeterminate = "Downloading, file size unknown",
+            downloadRingPaused = "All paused",
+            downloadRingIdle = "No downloads",
         ),
     )
 }
