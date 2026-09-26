@@ -9,6 +9,7 @@ import androidx.work.Operation
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.notes.notes.core.DownloadPhase
 import com.notes.notes.core.DownloadTransfer
 import kotlinx.coroutines.flow.Flow
 import java.util.UUID
@@ -46,18 +47,24 @@ fun downloadWorkOutcome(rawOutcome: String?): DownloadWorkOutcome = when (rawOut
 /**
  * Decides whether a failed work item still has to be written to [record].
  *
- * A result this process watched happening is always applied. A result it did not watch — the app was
- * closed while the download failed — is a recovered one, and it is applied only while the record still
- * claims to be running: that is exactly the failure nobody recorded yet. A record that is paused belongs
- * to the user, a record that is already failed needs no second write, and a newer attempt that is still
- * running owns the state as well.
+ * The record's own phase owns the decision: only a transfer that still claims to be running is the
+ * attempt this result belongs to. A record the user paused, a destructive cancel in flight and an
+ * already failed transfer are never turned into a failure — whether or not this process watched the
+ * attempt run — and a newer attempt that is still running owns the state as well.
  */
 fun shouldRecordDownloadFailure(
     record: DownloadTransfer?,
-    observedWhileRunning: Boolean,
     supersededByLiveWork: Boolean,
-): Boolean = !supersededByLiveWork &&
-    (observedWhileRunning || record?.phase?.isTransferring == true)
+): Boolean = !supersededByLiveWork && record?.phase?.isTransferring == true
+
+/**
+ * The transfers whose destructive cancel was interrupted by process death.
+ *
+ * They are not resumable and must not be shown as paused; the next start finishes what the cancel began,
+ * so no transfer can stay in that state forever.
+ */
+fun interruptedCancels(transfers: List<DownloadTransfer>): List<DownloadTransfer> =
+    transfers.filter { it.phase == DownloadPhase.CANCELING }
 
 /**
  * Owns the download queue in WorkManager.

@@ -54,6 +54,7 @@ import com.notes.notes.data.TransferStsCredentialProvider
 import com.notes.notes.data.TransferStore
 import com.notes.notes.data.downloadTaskProgress
 import com.notes.notes.data.downloadWorkOutcome
+import com.notes.notes.data.interruptedCancels
 import com.notes.notes.data.shouldRecordDownloadFailure
 import com.notes.notes.data.UploadUriPermissionManager
 import com.notes.notes.data.UploadWork
@@ -1940,19 +1941,22 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 DownloadWorkOutcome.FAILED -> {
                     if (transferId != null) {
                         downloadRoundProgress.onTaskFailed()
-                        val record = downloadTransfers.firstOrNull { it.transferId == transferId }
-                        if (
-                            shouldRecordDownloadFailure(
-                                record = record,
-                                observedWhileRunning = changedWhileObserved,
-                                supersededByLiveWork = transferId in liveTransferIds,
-                            )
-                        ) {
+                        /*
+                         * The stored phase decides whether this result still owns the transfer. A pause or a
+                         * destructive cancel the user asked for in the meantime is never overwritten, and
+                         * neither is an attempt that is already running again, whose stale result this is.
+                         */
+                        val applied = shouldRecordDownloadFailure(
+                            record = downloadTransfers.firstOrNull { it.transferId == transferId },
+                            supersededByLiveWork = transferId in liveTransferIds,
+                        )
+                        if (applied) {
                             markDownloadFailed(transferId)
+                            // Only a failure that really owns the transfer is worth reporting.
+                            if (changedWhileObserved) sendErrorMessage(downloadWorkFailureMessage(info.outputData))
                         }
                         recentlyEnqueuedTransfers.remove(transferId)
                     }
-                    if (changedWhileObserved) sendErrorMessage(downloadWorkFailureMessage(info.outputData))
                 }
 
                 DownloadWorkOutcome.CANCELED, DownloadWorkOutcome.NONE -> Unit
@@ -1970,22 +1974,18 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /**
      * Mirrors a reported failure into the UI right away and re-asserts it in the store.
      *
-     * The worker already persisted the failure itself, so this is the immediate UI half plus a safety
-     * net for records that were written before the download engine recorded failures on its own. The
-     * in-memory mirror is updated before the next projection, so the failure is visible in the very pass
-     * that reports it.
-     *
-     * The store edit accepts any phase except [DownloadPhase.FAILED]: the shared phase reconciliation
-     * may have turned the same record into PAUSED in this instant, and a failure that was really reported
-     * must not be downgraded by that race.
+     * Called only for a transfer the stored phase still calls running, which is also the condition the
+     * store edit re-checks: the record may have been paused or cancelled after the projection was built,
+     * and the phase it has at that moment owns the decision. The worker already persisted the failure
+     * itself, so this is the immediate UI half plus a safety net for a failure the engine could not write.
      */
     private fun markDownloadFailed(transferId: String) {
         downloadTransfers = downloadTransfers.map { transfer ->
-            if (transfer.transferId == transferId) transfer.asFailedAttempt() else transfer
+            if (transfer.transferId == transferId) transfer.failedAttemptIfRunning() else transfer
         }
 
         viewModelScope.launch {
-            transferStore.updateDownload(transferId) { current -> current.asFailedAttempt() }
+            transferStore.updateDownload(transferId) { current -> current.failedAttemptIfRunning() }
         }
     }
 
@@ -2566,12 +2566,16 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun cancelDownloadInternal(transfer: DownloadTransfer) {
         /*
-         * Stop the writer first. Unlike upload, there is no remote multipart state here and therefore no
-         * reason to delete the persistent record before the worker has finished unwinding.
+         * The user's cancel owns the transfer from this instant on: the intent is persisted before the
+         * worker is asked to stop, so a worker that is still unwinding cannot turn an ordinary I/O error
+         * into a business failure of a transfer the user is deleting anyway.
          *
-         * If the process dies during this sequence, keeping the record is safer than leaving an
-         * untracked pending MediaStore row.
+         * The record is only deleted once the worker stopped, because an untracked pending MediaStore row
+         * is worse than a record whose cancel was interrupted: if the process dies in between, the record
+         * stays CANCELING and the next start finishes the cancel.
          */
+        markDownloadsCanceling(listOf(transfer.transferId))
+
         awaitDownloadCancellation(
             DownloadWork.cancelTransfer(
                 getApplication(),
@@ -2596,6 +2600,28 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 removed.destinationUri
             )
         }
+    }
+
+    /**
+     * Persists the cancel intent of [transferIds] and projects it before any worker is stopped.
+     *
+     * CANCELING is a transitional state of this app only: it is not active, not paused and not resumable,
+     * so the ring keeps no progress and no yellow "all paused" claim while the cancel unwinds.
+     */
+    private suspend fun markDownloadsCanceling(transferIds: Collection<String>) {
+        val canceledById = mutableMapOf<String, DownloadTransfer>()
+
+        transferIds.toSet().forEach { transferId ->
+            transferStore.updateDownload(transferId) { current -> current.asCancelling() }
+                ?.let { updated -> canceledById[updated.transferId] = updated }
+        }
+
+        if (canceledById.isEmpty()) return
+
+        downloadTransfers = downloadTransfers.map { current ->
+            canceledById[current.transferId] ?: current
+        }
+        refreshTransferUi()
     }
 
     /** Blocks on a background dispatcher until WorkManager persisted the requested cancellation. */
@@ -3720,10 +3746,16 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     /**
      * Reconciles pending MediaStore downloads against the persistent DownloadTransfer store.
      *
+     * A cancel that process death interrupted is finished first: its worker is stopped, its record is
+     * deleted and its pending destination is removed, exactly as the cancel would have done, so a
+     * CANCELING transfer can never survive as a state the user cannot act on.
+     *
      * A referenced pending destination is resumable and must stay. An unreferenced pending destination
      * cannot be resumed by any worker and is safe to remove.
      */
     private suspend fun cleanupStaleDownloadDestinations() {
+        finishInterruptedCancels()
+
         val referencedDestinationUris =
             transferStore.downloadsOnce()
                 .mapTo(
@@ -3748,6 +3780,31 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 TAG,
                 "Unable to clean $failureCount orphan pending download destination(s)",
             )
+        }
+    }
+
+    /** Completes the destructive cancels a previous process did not get to finish. */
+    private suspend fun finishInterruptedCancels() {
+        val interrupted = interruptedCancels(transferStore.downloadsOnce())
+        if (interrupted.isEmpty()) return
+
+        interrupted.forEach { transfer ->
+            runCatching {
+                awaitDownloadCancellation(
+                    DownloadWork.cancelTransfer(
+                        getApplication(),
+                        transfer.transferId,
+                    )
+                )
+            }
+        }
+
+        transferStore.removeDownloads(interrupted.map(DownloadTransfer::transferId))
+
+        withContext(Dispatchers.IO) {
+            interrupted.forEach { transfer ->
+                transferRepository.deleteDownloadDestination(transfer.destinationUri)
+            }
         }
     }
 
@@ -3934,6 +3991,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         mutableSetOf(),
                         DownloadTransfer::transferId,
                     )
+
+                /*
+                 * The cancel intent is persisted for every target before any worker is stopped, so an old
+                 * worker ending with an ordinary error cannot report a failure for a transfer the user is
+                 * deleting.
+                 */
+                markDownloadsCanceling(targetIds)
 
                 /*
                  * Issue every cancellation before waiting for any one of them. This prevents a slow worker

@@ -919,6 +919,9 @@ private fun DownloadTransfersBottomSheet(
                                         ),
                                 )
                             }
+
+                            // A cancel in flight is transitional: its row has no action left to offer.
+                            DownloadPhase.CANCELING -> Unit
                         }
                     }
 

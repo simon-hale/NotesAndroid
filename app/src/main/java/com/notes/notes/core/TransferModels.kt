@@ -27,23 +27,29 @@ enum class UploadPhase(val storageValue: String) {
  * one attempt: it keeps the same resumable state, but it is *not* a user pause, so it must survive a
  * process restart without ever being reported as "everything is paused". Only an explicit retry moves
  * such a transfer back to `TRANSFERRING`.
+ *
+ * `CANCELING` is the internal state of a destructive cancel that the user already asked for: the
+ * transfer is neither running nor paused and cannot be resumed, and the worker unwinding behind it may
+ * no longer turn its own ending into a business result. The record is deleted when the cancel completes,
+ * and the next start finishes a cancel that process death interrupted.
  */
 enum class DownloadPhase(val storageValue: String) {
     TRANSFERRING("transferring"),
     PAUSED("paused"),
-    FAILED("failed");
+    FAILED("failed"),
+    CANCELING("canceling");
 
     /** True while the transfer may still be expected to transfer bytes on its own. */
     val isTransferring: Boolean get() = this == TRANSFERRING
 
-    /** True while the user can start this transfer again. */
-    val isResumable: Boolean get() = this != TRANSFERRING
+    /** True while the user can start this transfer again. A cancel in flight cannot be resumed. */
+    val isResumable: Boolean get() = this == PAUSED || this == FAILED
 
     /**
      * The phase a download keeps when its work item is gone.
      *
      * Only a record that still claims to be running is exposed as paused and therefore resumable; a user
-     * pause and a terminal failure are facts that a missing work item cannot undo.
+     * pause, a terminal failure and a cancel in flight are facts that a missing work item cannot undo.
      */
     fun withoutLiveWork(): DownloadPhase = if (isTransferring) PAUSED else this
 
@@ -185,14 +191,24 @@ data class DownloadTransfer(
     )
 
     /**
-     * The persistent form of a failed attempt.
+     * The persistent result of a failed attempt — but only for the attempt that is still running.
      *
-     * Everything a later resume needs is kept exactly as it is — bytes, length, ETag, destination, name
-     * and notice — and only the phase becomes terminal, so a restart can never read a failed attempt as a
-     * user pause.
+     * The stored phase owns the decision. Once the user paused this transfer, or a destructive cancel
+     * owns it, or it already failed, an error that an old worker reports afterwards belongs to nobody and
+     * the record must keep the state the user created. Everything a later resume needs — bytes, length,
+     * ETag, destination, name and notice — is kept exactly as it is either way.
      */
-    fun asFailedAttempt(): DownloadTransfer =
-        if (phase == DownloadPhase.FAILED) this else copy(phase = DownloadPhase.FAILED)
+    fun failedAttemptIfRunning(): DownloadTransfer =
+        if (phase.isTransferring) copy(phase = DownloadPhase.FAILED) else this
+
+    /**
+     * The state a download enters the moment the user cancels it.
+     *
+     * Announced before the worker is asked to stop, so that the worker's own ending can no longer be
+     * mistaken for a business result while the cancel is unwinding.
+     */
+    fun asCancelling(): DownloadTransfer =
+        if (phase == DownloadPhase.CANCELING) this else copy(phase = DownloadPhase.CANCELING)
 }
 
 /** Upload row shown by the disk screen, merged from the transfer store and live WorkManager state. */

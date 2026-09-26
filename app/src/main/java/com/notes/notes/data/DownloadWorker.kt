@@ -150,10 +150,14 @@ class DownloadWorker(
         /*
          * The result is reported even when the record could not be updated: whoever reads the result
          * applies the same rule, so a store hiccup cannot silently turn the failure into a pause.
+         *
+         * The phase is written on top of the newest stored record and only while that record still claims
+         * to be running: a pause the user asked for, or a destructive cancel that is already unwinding,
+         * owns the state by then and must not be replaced by this attempt's ending.
          */
         runCatching {
             withContext(NonCancellable) {
-                transferStore.updateDownload(transferId) { current -> current.asFailedAttempt() }
+                transferStore.updateDownload(transferId) { current -> current.failedAttemptIfRunning() }
             }
         }.onFailure { storeFailure ->
             Log.w(TAG, "Unable to record the terminal download failure", storeFailure)

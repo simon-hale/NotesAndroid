@@ -23,9 +23,10 @@ class DownloadPhaseStorageTest {
     }
 
     @Test
-    fun `stored values of the failing phase decode as failed`() {
+    fun `stored values of every phase decode as themselves`() {
         assertEquals(DownloadPhase.FAILED, DownloadPhase.fromStorage("failed"))
         assertEquals(DownloadPhase.PAUSED, DownloadPhase.fromStorage("paused"))
+        assertEquals(DownloadPhase.CANCELING, DownloadPhase.fromStorage("canceling"))
         assertEquals(DownloadPhase.TRANSFERRING, DownloadPhase.fromStorage("transferring"))
     }
 
@@ -37,13 +38,16 @@ class DownloadPhaseStorageTest {
     }
 
     @Test
-    fun `only transferring keeps running and every other phase is resumable`() {
+    fun `only transferring keeps running and only a pause or a failure is resumable`() {
         assertTrue(DownloadPhase.TRANSFERRING.isTransferring)
         assertFalse(DownloadPhase.PAUSED.isTransferring)
         assertFalse(DownloadPhase.FAILED.isTransferring)
+        assertFalse(DownloadPhase.CANCELING.isTransferring)
 
         assertFalse(DownloadPhase.TRANSFERRING.isResumable)
         assertTrue(DownloadPhase.PAUSED.isResumable)
         assertTrue(DownloadPhase.FAILED.isResumable)
+        // A cancel in flight cannot be resumed: the user is deleting that download.
+        assertFalse(DownloadPhase.CANCELING.isResumable)
     }
 }
