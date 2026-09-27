@@ -78,13 +78,15 @@ class DownloadFailureRecoveryTest {
 
         // No UI was alive: the worker records the failure itself.
         chain.attemptFailed()
+        // The next process only ever sees a finished work item and has to catch up from the store.
+        chain.projectMirrorPhase(DownloadPhase.TRANSFERRING)
 
-        // The next process only ever sees a finished work item. The failure is already stored, so nothing
-        // is written twice, and the record stays failed.
-        val report = chain.applyWorkResult(DownloadWorkOutcome.FAILED, watchedWhileRunning = false)
+        val report = chain.applyWorkResult(watchedWhileRunning = false)
+        assertEquals(DownloadFailureOutcome.ALREADY_FAILED, report.outcome)
         assertFalse(report.applied)
         assertFalse(report.reported)
         assertEquals(DownloadPhase.FAILED, chain.record.phase)
+        assertEquals(DownloadPhase.FAILED, chain.mirroredPhase)
 
         chain.reconciledWithoutWork()
         assertEquals(DownloadPhase.FAILED, chain.record.phase)
@@ -103,7 +105,7 @@ class DownloadFailureRecoveryTest {
         chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
 
         // The process died before the terminal phase could be written, so the record still claims to run.
-        val report = chain.applyWorkResult(DownloadWorkOutcome.FAILED, watchedWhileRunning = false)
+        val report = chain.applyWorkResult(watchedWhileRunning = false)
         assertTrue(report.applied)
 
         assertEquals(DownloadPhase.FAILED, chain.record.phase)
@@ -120,7 +122,8 @@ class DownloadFailureRecoveryTest {
     fun `a user pause is never read as a failure`() {
         val chain = DownloadFailureChain(storedTransfer(phase = DownloadPhase.PAUSED))
 
-        val report = chain.applyWorkResult(DownloadWorkOutcome.CANCELED, watchedWhileRunning = false)
+        val report = chain.applyWorkResult(watchedWhileRunning = false)
+        assertEquals(DownloadFailureOutcome.IGNORED_PHASE, report.outcome)
         assertFalse(report.applied)
         assertEquals(DownloadPhase.PAUSED, chain.record.phase)
 
@@ -169,11 +172,6 @@ class DownloadFailureRecoveryTest {
             downloadWorkOutcome(DownloadWorker.OUTCOME_SUCCESS),
         )
         assertEquals(DownloadWorkOutcome.NONE, downloadWorkOutcome(null))
-
-        val chain = DownloadFailureChain(storedTransfer())
-        val report = chain.applyWorkResult(DownloadWorkOutcome.CANCELED, watchedWhileRunning = true)
-        assertFalse(report.applied)
-        assertEquals(DownloadPhase.TRANSFERRING, chain.record.phase)
     }
 
     @Test

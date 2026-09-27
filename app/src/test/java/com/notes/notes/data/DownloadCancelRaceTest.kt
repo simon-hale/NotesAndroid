@@ -7,6 +7,7 @@ import com.notes.notes.core.TransferNotice
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -16,7 +17,8 @@ import org.junit.Test
  * A pause or a destructive cancel is a persistent business fact the moment it is written. An attempt that
  * ends with an ordinary I/O error afterwards belongs to nobody: it must not turn a paused download into a
  * failure, it must not report anything to the user, and it must not resurrect a transfer the user is
- * deleting. All steps below go through the production rules the app itself uses.
+ * deleting. All steps below go through the production rules the app itself uses, and the UI projection is
+ * deliberately allowed to lag behind the store, which is exactly the window that used to be misjudged.
  */
 class DownloadCancelRaceTest {
 
@@ -69,31 +71,109 @@ class DownloadCancelRaceTest {
     }
 
     @Test
-    fun `a watched failure result never turns a paused transfer into a failure`() {
+    fun `a failure result stays harmless while the paused phase has not reached the UI yet`() {
         val chain = DownloadFailureChain(storedTransfer())
+        chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
+
         chain.userPaused()
+        // The mirror still shows the old projection: this is the window the authoritative check survives.
+        chain.projectMirrorPhase(DownloadPhase.TRANSFERRING)
 
-        val report = chain.applyWorkResult(DownloadWorkOutcome.FAILED, watchedWhileRunning = true)
+        val report = chain.applyWorkResult(watchedWhileRunning = true)
 
+        assertEquals(DownloadFailureOutcome.IGNORED_PHASE, report.outcome)
         assertFalse(report.applied)
-        // A pause is not a failure, so nothing is reported to the user either.
         assertFalse(report.reported)
         assertEquals(DownloadPhase.PAUSED, chain.record.phase)
+        // The row ends on the phase the store holds, without a single failed frame.
+        assertEquals(DownloadPhase.PAUSED, chain.mirroredPhase)
         assertEquals(DownloadRingMode.PAUSED, ringOf(chain.roundTask(hasLiveWork = false)).mode)
+    }
+
+    @Test
+    fun `a failure result stays harmless while the cancel phase has not reached the UI yet`() {
+        val chain = DownloadFailureChain(storedTransfer())
+        chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
+
+        chain.userCancelled()
+        chain.projectMirrorPhase(DownloadPhase.TRANSFERRING)
+
+        val report = chain.applyWorkResult(watchedWhileRunning = true)
+
+        assertEquals(DownloadFailureOutcome.IGNORED_PHASE, report.outcome)
+        assertFalse(report.reported)
+        assertEquals(DownloadPhase.CANCELING, chain.record.phase)
+        assertEquals(DownloadPhase.CANCELING, chain.mirroredPhase)
+    }
+
+    @Test
+    fun `a failure that still owns the transfer is applied and reported once`() {
+        val chain = DownloadFailureChain(storedTransfer())
+        chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
+
+        val report = chain.applyWorkResult(watchedWhileRunning = true)
+
+        assertEquals(DownloadFailureOutcome.APPLIED, report.outcome)
+        assertTrue(report.applied)
+        assertTrue(report.reported)
+        assertEquals(DownloadPhase.FAILED, chain.record.phase)
+        assertEquals(DownloadPhase.FAILED, chain.mirroredPhase)
+        assertEquals(40_000L, chain.record.downloadedBytes)
+    }
+
+    @Test
+    fun `a failure the worker already persisted is not written again but is reported once`() {
+        val chain = DownloadFailureChain(storedTransfer(phase = DownloadPhase.FAILED))
+
+        val report = chain.applyWorkResult(watchedWhileRunning = true)
+
+        assertEquals(DownloadFailureOutcome.ALREADY_FAILED, report.outcome)
+        assertFalse(report.applied)
+        assertTrue(report.reported)
+        assertEquals(DownloadPhase.FAILED, chain.record.phase)
+        assertEquals(DownloadPhase.FAILED, chain.mirroredPhase)
+    }
+
+    @Test
+    fun `a stale failure recovered after a restart is never reported again`() {
+        val chain = DownloadFailureChain(storedTransfer(phase = DownloadPhase.FAILED))
+        chain.projectMirrorPhase(DownloadPhase.TRANSFERRING)
+
+        val report = chain.applyWorkResult(watchedWhileRunning = false)
+
+        assertEquals(DownloadFailureOutcome.ALREADY_FAILED, report.outcome)
+        assertFalse(report.reported)
+        assertEquals(DownloadPhase.FAILED, chain.mirroredPhase)
+    }
+
+    @Test
+    fun `a failure for a transfer that no longer exists is ignored and its row disappears`() {
+        val chain = DownloadFailureChain(storedTransfer())
+        chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
+        // The cancel already removed the record; the UI simply has not projected that yet.
+        chain.dropRecordKeepingMirror()
+        assertEquals(DownloadPhase.TRANSFERRING, chain.mirroredPhase)
+
+        val report = chain.applyWorkResult(watchedWhileRunning = true)
+
+        assertEquals(DownloadFailureOutcome.MISSING, report.outcome)
+        assertFalse(report.reported)
+        assertNull(chain.mirroredPhase)
+        assertTrue(chain.recordsOrEmpty.isEmpty())
     }
 
     @Test
     fun `a failure the worker could not write is only recovered while the record is still running`() {
         val running = DownloadFailureChain(storedTransfer())
         running.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
-        val recovered = running.applyWorkResult(DownloadWorkOutcome.FAILED, watchedWhileRunning = false)
-        assertTrue(recovered.applied)
+        val recovered = running.applyWorkResult(watchedWhileRunning = false)
+        assertEquals(DownloadFailureOutcome.APPLIED, recovered.outcome)
         assertEquals(DownloadPhase.FAILED, running.record.phase)
 
         val paused = DownloadFailureChain(storedTransfer())
         paused.userPaused()
-        val ignored = paused.applyWorkResult(DownloadWorkOutcome.FAILED, watchedWhileRunning = false)
-        assertFalse(ignored.applied)
+        val ignored = paused.applyWorkResult(watchedWhileRunning = false)
+        assertEquals(DownloadFailureOutcome.IGNORED_PHASE, ignored.outcome)
         assertFalse(ignored.reported)
         assertEquals(DownloadPhase.PAUSED, paused.record.phase)
     }
@@ -105,14 +185,15 @@ class DownloadCancelRaceTest {
         chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
 
         val report = chain.applyWorkResult(
-            outcome = DownloadWorkOutcome.FAILED,
             watchedWhileRunning = true,
             supersededByLiveWork = true,
         )
 
+        assertEquals(DownloadFailureOutcome.SUPERSEDED, report.outcome)
         assertFalse(report.applied)
         assertFalse(report.reported)
         assertEquals(DownloadPhase.TRANSFERRING, chain.record.phase)
+        assertEquals(DownloadPhase.TRANSFERRING, chain.mirroredPhase)
         assertTrue(chain.roundTask(hasLiveWork = true).active)
     }
 
@@ -125,7 +206,7 @@ class DownloadCancelRaceTest {
         chain.attemptFailed()
 
         assertEquals(DownloadPhase.CANCELING, chain.record.phase)
-        assertFalse(chain.applyWorkResult(DownloadWorkOutcome.FAILED, watchedWhileRunning = true).applied)
+        assertFalse(chain.applyWorkResult(watchedWhileRunning = true).applied)
         assertEquals(DownloadPhase.CANCELING, chain.record.phase)
     }
 
@@ -152,6 +233,7 @@ class DownloadCancelRaceTest {
         chain.cancelFinished()
 
         assertTrue(chain.recordsOrEmpty.isEmpty())
+        assertNull(chain.mirroredPhase)
     }
 
     @Test

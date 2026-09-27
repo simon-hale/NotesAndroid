@@ -45,19 +45,6 @@ fun downloadWorkOutcome(rawOutcome: String?): DownloadWorkOutcome = when (rawOut
 }
 
 /**
- * Decides whether a failed work item still has to be written to [record].
- *
- * The record's own phase owns the decision: only a transfer that still claims to be running is the
- * attempt this result belongs to. A record the user paused, a destructive cancel in flight and an
- * already failed transfer are never turned into a failure — whether or not this process watched the
- * attempt run — and a newer attempt that is still running owns the state as well.
- */
-fun shouldRecordDownloadFailure(
-    record: DownloadTransfer?,
-    supersededByLiveWork: Boolean,
-): Boolean = !supersededByLiveWork && record?.phase?.isTransferring == true
-
-/**
  * The transfers whose destructive cancel was interrupted by process death.
  *
  * They are not resumable and must not be shown as paused; the next start finishes what the cancel began,

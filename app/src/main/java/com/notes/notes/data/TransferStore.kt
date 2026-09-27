@@ -31,6 +31,49 @@ import java.io.IOException
  */
 private val Context.transfersDataStore by preferencesDataStore(name = "notes_transfers")
 
+/** What the store decided about a download failure that was reported for one transfer. */
+enum class DownloadFailureOutcome {
+    /** The transfer was still running and now carries the terminal failure. */
+    APPLIED,
+
+    /** The download engine had already persisted the failure; nothing was written a second time. */
+    ALREADY_FAILED,
+
+    /** The user paused the transfer, or a cancel owns it: this failure has lost its ownership. */
+    IGNORED_PHASE,
+
+    /** The transfer does not exist (any more); a work result never recreates it. */
+    MISSING,
+
+    /** A newer attempt for the same transfer is running, so this result only describes history. */
+    SUPERSEDED,
+}
+
+/** Result of [TransferStore.resolveDownloadFailure], including the phase the store held. */
+data class DownloadFailureResolution(
+    val outcome: DownloadFailureOutcome,
+    /** The stored phase at the moment of the decision, or `null` when no record exists (any more). */
+    val storedPhase: DownloadPhase?,
+)
+
+/**
+ * The store's decision for a reported download failure, on the record it currently holds.
+ *
+ * Only a transfer that still claims to be running is the attempt this result belongs to. A phase the user
+ * created — a pause or a cancel — is never replaced by an error an old worker reports afterwards, and a
+ * failure the download engine already persisted needs no second write.
+ */
+fun resolveDownloadFailureOutcome(
+    storedPhase: DownloadPhase?,
+    supersededByLiveWork: Boolean,
+): DownloadFailureOutcome = when {
+    storedPhase == null -> DownloadFailureOutcome.MISSING
+    supersededByLiveWork -> DownloadFailureOutcome.SUPERSEDED
+    storedPhase == DownloadPhase.FAILED -> DownloadFailureOutcome.ALREADY_FAILED
+    storedPhase.isTransferring -> DownloadFailureOutcome.APPLIED
+    else -> DownloadFailureOutcome.IGNORED_PHASE
+}
+
 class TransferStore(private val context: Context) {
 
     private object Keys {
@@ -273,6 +316,40 @@ class TransferStore(private val context: Context) {
             )
         }
         return result
+    }
+
+    /**
+     * Decides who owns a reported download failure and applies it in the same atomic edit.
+     *
+     * Reading the record, judging it and writing the outcome happen inside one DataStore edit, so the
+     * answer can never be based on a record that another writer — a pause, a cancel, the download engine
+     * itself — changed in between.
+     */
+    suspend fun resolveDownloadFailure(
+        transferId: String,
+        supersededByLiveWork: Boolean,
+    ): DownloadFailureResolution {
+        var storedPhase: DownloadPhase? = null
+        var outcome = DownloadFailureOutcome.MISSING
+
+        context.transfersDataStore.edit { preferences ->
+            val current = decodeDownloads(preferences[Keys.downloads])
+            val index = current.indexOfFirst { it.transferId == transferId }
+            val stored = current.getOrNull(index)
+
+            storedPhase = stored?.phase
+            outcome = resolveDownloadFailureOutcome(stored?.phase, supersededByLiveWork)
+
+            if (outcome == DownloadFailureOutcome.APPLIED && stored != null) {
+                preferences[Keys.downloads] = encodeDownloads(
+                    current.toMutableList().apply {
+                        this[index] = stored.failedAttemptIfRunning()
+                    }
+                )
+            }
+        }
+
+        return DownloadFailureResolution(outcome = outcome, storedPhase = storedPhase)
     }
 
     suspend fun removeDownload(transferId: String): DownloadTransfer? =

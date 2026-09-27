@@ -40,6 +40,7 @@ import com.notes.notes.core.UploadTransferEntry
 import com.notes.notes.core.stringsFor
 import com.notes.notes.data.AppPreferencesStore
 import com.notes.notes.data.DirectoryListing
+import com.notes.notes.data.DownloadFailureOutcome
 import com.notes.notes.data.DownloadRoundProgress
 import com.notes.notes.data.DownloadTaskProgress
 import com.notes.notes.data.DownloadWork
@@ -55,7 +56,6 @@ import com.notes.notes.data.TransferStore
 import com.notes.notes.data.downloadTaskProgress
 import com.notes.notes.data.downloadWorkOutcome
 import com.notes.notes.data.interruptedCancels
-import com.notes.notes.data.shouldRecordDownloadFailure
 import com.notes.notes.data.UploadUriPermissionManager
 import com.notes.notes.data.UploadWork
 import com.notes.notes.data.UploadWorker
@@ -1898,7 +1898,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         reconcileUploadPhases()
     }
 
-    private fun applyDownloadWorkInfos(infos: List<WorkInfo>) {
+    private suspend fun applyDownloadWorkInfos(infos: List<WorkInfo>) {
         downloadWorkInfos = infos
         downloadWorkInfosObserved = true
         val liveTransferIds = infos
@@ -1940,22 +1940,36 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
                 DownloadWorkOutcome.FAILED -> {
                     if (transferId != null) {
-                        downloadRoundProgress.onTaskFailed()
                         /*
-                         * The stored phase decides whether this result still owns the transfer. A pause or a
-                         * destructive cancel the user asked for in the meantime is never overwritten, and
-                         * neither is an attempt that is already running again, whose stale result this is.
+                         * Ownership of this failure is decided by the record the store holds right now, never
+                         * by the UI mirror: the mirror can lag one step behind a pause or a cancel the user
+                         * just persisted, and this result must not claim a transfer that is already theirs.
                          */
-                        val applied = shouldRecordDownloadFailure(
-                            record = downloadTransfers.firstOrNull { it.transferId == transferId },
+                        val resolution = transferStore.resolveDownloadFailure(
+                            transferId = transferId,
                             supersededByLiveWork = transferId in liveTransferIds,
                         )
-                        if (applied) {
-                            markDownloadFailed(transferId)
-                            // Only a failure that really owns the transfer is worth reporting.
-                            if (changedWhileObserved) sendErrorMessage(downloadWorkFailureMessage(info.outputData))
+                        val ownsFailure =
+                            resolution.outcome == DownloadFailureOutcome.APPLIED ||
+                                resolution.outcome == DownloadFailureOutcome.ALREADY_FAILED
+
+                        if (ownsFailure) {
+                            downloadRoundProgress.onTaskFailed()
                         }
-                        recentlyEnqueuedTransfers.remove(transferId)
+
+                        if (resolution.outcome != DownloadFailureOutcome.SUPERSEDED) {
+                            // The row follows the phase the store really holds; a missing record drops it.
+                            syncDownloadPhase(
+                                transferId = transferId,
+                                phase = if (ownsFailure) DownloadPhase.FAILED else resolution.storedPhase,
+                            )
+                            recentlyEnqueuedTransfers.remove(transferId)
+                        }
+
+                        // Only an owned failure is reported, and only one this process watched happen.
+                        if (ownsFailure && changedWhileObserved) {
+                            sendErrorMessage(downloadWorkFailureMessage(info.outputData))
+                        }
                     }
                 }
 
@@ -1972,20 +1986,25 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Mirrors a reported failure into the UI right away and re-asserts it in the store.
+     * Makes the mirrored row agree with the phase the store really holds.
      *
-     * Called only for a transfer the stored phase still calls running, which is also the condition the
-     * store edit re-checks: the record may have been paused or cancelled after the projection was built,
-     * and the phase it has at that moment owns the decision. The worker already persisted the failure
-     * itself, so this is the immediate UI half plus a safety net for a failure the engine could not write.
+     * The mirror is only a projection of the store and can lag one step behind a pause or a cancel the user
+     * just persisted, so a terminal result ends by copying the authoritative phase back instead of leaving
+     * a wrong row behind — not even for a single frame. A `null` phase means the transfer is gone and its
+     * row is dropped.
      */
-    private fun markDownloadFailed(transferId: String) {
-        downloadTransfers = downloadTransfers.map { transfer ->
-            if (transfer.transferId == transferId) transfer.failedAttemptIfRunning() else transfer
+    private fun syncDownloadPhase(transferId: String, phase: DownloadPhase?) {
+        if (phase == null) {
+            downloadTransfers = downloadTransfers.filterNot { it.transferId == transferId }
+            return
         }
 
-        viewModelScope.launch {
-            transferStore.updateDownload(transferId) { current -> current.failedAttemptIfRunning() }
+        downloadTransfers = downloadTransfers.map { current ->
+            when {
+                current.transferId != transferId -> current
+                current.phase == phase -> current
+                else -> current.copy(phase = phase)
+            }
         }
     }
 
