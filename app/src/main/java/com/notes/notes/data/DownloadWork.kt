@@ -15,10 +15,10 @@ import kotlinx.coroutines.flow.Flow
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-/** Identifies the download work this app just enqueued. */
 data class EnqueuedDownloadBatch(
     val workIds: Set<UUID>,
     val transferIds: Set<String>,
+    val workIdByTransferId: Map<String, UUID>,
 )
 
 /**
@@ -73,10 +73,16 @@ object DownloadWork {
     fun transferWorkTag(transferId: String): String = "$TRANSFER_TAG_PREFIX$transferId"
 
     /** Enqueues one independent download per transfer, each with its own unique identity. */
-    fun enqueue(context: Context, accessToken: String, transfers: List<DownloadTransfer>): EnqueuedDownloadBatch? {
+    fun enqueue(
+        context: Context,
+        accessToken: String,
+        transfers: List<DownloadTransfer>,
+    ): EnqueuedDownloadBatch? {
         if (transfers.isEmpty()) return null
+
         val workManager = WorkManager.getInstance(context)
-        val workIds = mutableSetOf<UUID>()
+        val workIdByTransferId = linkedMapOf<String, UUID>()
+
         transfers.forEach { transfer ->
             val request = OneTimeWorkRequestBuilder<DownloadWorker>()
                 .setInputData(
@@ -96,7 +102,7 @@ object DownloadWork {
                 .addTag(TAG)
                 .addTag(transferWorkTag(transfer.transferId))
                 .build()
-            workIds += request.id
+            workIdByTransferId[transfer.transferId] = request.id
             workManager.enqueueUniqueWork(
                 uniqueWorkName(transfer.transferId),
                 // New transfers have unique ids. Resume explicitly replaces any stale WorkManager
@@ -106,8 +112,9 @@ object DownloadWork {
             )
         }
         return EnqueuedDownloadBatch(
-            workIds = workIds,
-            transferIds = transfers.mapTo(mutableSetOf()) { it.transferId },
+            workIds = workIdByTransferId.values.toSet(),
+            transferIds = workIdByTransferId.keys.toSet(),
+            workIdByTransferId = workIdByTransferId.toMap(),
         )
     }
 

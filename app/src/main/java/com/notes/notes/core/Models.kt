@@ -118,6 +118,12 @@ data class SelectedFile(
     val name: String,
 )
 
+enum class DownloadDrawerIndicator {
+    NONE,
+    NEW_DOWNLOAD,
+    FAILED,
+}
+
 @Immutable
 data class DiskScreenState(
     val isLoading: Boolean = false,
@@ -141,6 +147,8 @@ data class DiskScreenState(
     val downloadTransfers: List<DownloadTransferEntry> = emptyList(),
     /** Ring drawn inside the download button of the disk header. */
     val downloadRing: DownloadRingState = DownloadRingState(),
+    /** Unread event indicator shown on the download drawer button. */
+    val downloadDrawerIndicator: DownloadDrawerIndicator = DownloadDrawerIndicator.NONE,
     /** True while a pause/resume/cancel request is being applied, so the UI can lock its actions. */
     val transferActionBusy: Boolean = false,
 ) {

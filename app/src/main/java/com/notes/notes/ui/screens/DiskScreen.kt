@@ -11,7 +11,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -19,14 +18,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Article
 import androidx.compose.material.icons.outlined.BrightnessAuto
-import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Description
@@ -45,9 +46,9 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -81,6 +82,7 @@ import com.notes.notes.core.UploadCandidate
 import com.notes.notes.core.UploadPhase
 import com.notes.notes.core.UploadTransferEntry
 import com.notes.notes.core.stringsFor
+import com.notes.notes.core.DownloadDrawerIndicator
 import com.notes.notes.ui.NotesAppViewModel
 import com.notes.notes.ui.components.ActionChip
 import com.notes.notes.ui.components.BreadcrumbBar
@@ -183,14 +185,14 @@ fun DiskScreen(
                 ScreenHeader(
                     title = strings.nav.disk,
                     trailing = {
-                        // Only unfinished downloads get a transfer entry point. It deliberately sits immediately to the
-                        // left of the completed-download repository.
                         if (uiState.disk.downloadTransfers.isNotEmpty()) {
                             DownloadTransfersActionChip(
                                 ring = uiState.disk.downloadRing,
+                                indicator = uiState.disk.downloadDrawerIndicator,
                                 language = uiState.settings.language,
                                 strings = strings,
                                 onClick = {
+                                    viewModel.clearDownloadDrawerIndicator()
                                     downloadTransfersSheetVisible = true
                                 },
                             )
@@ -335,6 +337,7 @@ fun DiskScreen(
         DownloadTransfersBottomSheet(
             uiState = uiState,
             onDismiss = {
+                viewModel.clearDownloadDrawerIndicator()
                 downloadTransfersSheetVisible = false
             },
             onPauseDownload = viewModel::pauseDownload,
@@ -540,29 +543,134 @@ fun DiskScreen(
 @Composable
 private fun DownloadTransfersActionChip(
     ring: DownloadRingState,
+    indicator: DownloadDrawerIndicator,
     language: AppLanguage,
     strings: AppStrings,
     onClick: () -> Unit,
 ) {
-    val extraColors = LocalNotesExtraColors.current
-    ActionChip(
-        icon = Icons.Outlined.Download,
-        onClick = onClick,
-        contentDescription = strings.transfers.downloadRingButton,
-        stateDescription = downloadRingDescription(ring, language, strings),
-        progressRing = if (ring.visible) {
-            ChipProgressRing(
-                // An unknown file size must never be drawn as a made-up percentage.
-                progress = if (ring.mode == DownloadRingMode.INDETERMINATE) null else ring.progress,
-                color = when (ring.mode) {
-                    DownloadRingMode.PAUSED -> extraColors.warning
-                    else -> extraColors.success
-                },
-            )
+    val extraColors =
+        LocalNotesExtraColors.current
+
+    val ringDescription =
+        downloadRingDescription(
+            ring = ring,
+            language = language,
+            strings = strings,
+        )
+
+    val indicatorDescription =
+        when (indicator) {
+            DownloadDrawerIndicator.NONE ->
+                null
+
+            DownloadDrawerIndicator.NEW_DOWNLOAD ->
+                when (language) {
+                    AppLanguage.ZH_CN ->
+                        "有新的下载任务"
+
+                    AppLanguage.EN_US ->
+                        "New download added"
+                }
+
+            DownloadDrawerIndicator.FAILED ->
+                when (language) {
+                    AppLanguage.ZH_CN ->
+                        "有下载任务失败"
+
+                    AppLanguage.EN_US ->
+                        "A download failed"
+                }
+        }
+
+    val stateDescription =
+        if (
+            indicatorDescription == null
+        ) {
+            ringDescription
         } else {
-            null
-        },
-    )
+            "$ringDescription; $indicatorDescription"
+        }
+
+    /*
+     * ActionChip is 42dp. An 8dp indicator aligned at TopEnd and shifted (-2dp, +2dp)
+     * has its centre at approximately (36dp, 6dp), whose distance from the button centre
+     * (21dp, 21dp) is ~21.2dp: the indicator centre therefore lies essentially on the
+     * button's circular edge, as intended.
+     */
+    Box(
+        modifier =
+            Modifier.size(
+                42.dp
+            )
+    ) {
+        ActionChip(
+            icon =
+                Icons.Outlined.Download,
+            onClick =
+                onClick,
+            contentDescription =
+                strings.transfers.downloadRingButton,
+            stateDescription =
+                stateDescription,
+            progressRing =
+                if (ring.visible) {
+                    ChipProgressRing(
+                        progress =
+                            if (
+                                ring.mode ==
+                                DownloadRingMode.INDETERMINATE
+                            ) {
+                                null
+                            } else {
+                                ring.progress
+                            },
+                        color =
+                            when (ring.mode) {
+                                DownloadRingMode.PAUSED ->
+                                    extraColors.warning
+
+                                else ->
+                                    extraColors.success
+                            },
+                    )
+                } else {
+                    null
+                },
+        )
+
+        val indicatorColor =
+            when (indicator) {
+                DownloadDrawerIndicator.NONE ->
+                    null
+
+                DownloadDrawerIndicator.NEW_DOWNLOAD ->
+                    extraColors.success
+
+                DownloadDrawerIndicator.FAILED ->
+                    extraColors.danger
+            }
+
+        if (indicatorColor != null) {
+            Surface(
+                modifier =
+                    Modifier
+                        .size(8.dp)
+                        .align(
+                            Alignment.TopEnd
+                        )
+                        .offset(
+                            x = (-2).dp,
+                            y = 2.dp,
+                        ),
+                shape =
+                    CircleShape,
+                color =
+                    indicatorColor,
+                shadowElevation =
+                    0.dp,
+            ) {}
+        }
+    }
 }
 
 /** What the ring means, in words, for accessibility services. */

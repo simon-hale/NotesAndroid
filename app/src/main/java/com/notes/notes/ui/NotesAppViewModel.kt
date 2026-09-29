@@ -38,6 +38,7 @@ import com.notes.notes.core.UploadPhase
 import com.notes.notes.core.UploadTransfer
 import com.notes.notes.core.UploadTransferEntry
 import com.notes.notes.core.stringsFor
+import com.notes.notes.core.DownloadDrawerIndicator
 import com.notes.notes.data.AppPreferencesStore
 import com.notes.notes.data.DirectoryListing
 import com.notes.notes.data.DownloadFailureOutcome
@@ -50,7 +51,7 @@ import com.notes.notes.data.FileTransferRepository
 import com.notes.notes.data.NotesBackendService
 import com.notes.notes.data.NotesServiceException
 import com.notes.notes.data.PreviewRepository
-import com.notes.notes.data.TransferAccount
+import com.notes.notes.data.EnqueuedDownloadBatch
 import com.notes.notes.data.TransferStsCredentialProvider
 import com.notes.notes.data.TransferStore
 import com.notes.notes.data.downloadTaskProgress
@@ -132,6 +133,14 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * not be mistaken for "stopped", or a freshly started transfer would immediately look paused.
      */
     private val recentlyEnqueuedTransfers = mutableMapOf<String, Long>()
+
+    /**
+     * Exact WorkManager request currently associated with a logical download in this process.
+     *
+     * This is deliberately in-memory only. Its only purpose is to distinguish a stale finished WorkInfo
+     * from the Work request created by the latest explicit start/resume before WorkManager's Flow catches up.
+     */
+    private val currentDownloadWorkIds = mutableMapOf<String, UUID>()
 
     /**
      * Prevents transfer reconciliation from recreating work while the current account is being torn
@@ -1311,25 +1320,82 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun applyDownloadRecords(records: List<DownloadTransfer>) {
-        val previous = downloadTransfers.associateBy(DownloadTransfer::transferId)
+        val previous =
+            downloadTransfers.associateBy(
+                DownloadTransfer::transferId
+            )
+
         downloadTransfers = records
+
+        /*
+         * A logical transfer id is never reused after its persistent record disappears, so any remembered
+         * Work id for a removed transfer can be dropped here without affecting a later download.
+         */
+        val storedTransferIds =
+            records.mapTo(
+                mutableSetOf(),
+                DownloadTransfer::transferId,
+            )
+
+        currentDownloadWorkIds.keys.retainAll(
+            storedTransferIds
+        )
+
         records
-            // Another account's notices are not this session's to surface or to clear.
+            // Another account's notices and badge events are not this session's to surface.
             .filter { isOwnedByActiveSession(it.accountKey) }
             .forEach { record ->
-                if (record.notice == TransferNotice.NONE) return@forEach
-                if (previous[record.transferId]?.notice == record.notice) return@forEach
-                val message = when (record.notice) {
-                    TransferNotice.RESTARTED_REMOTE_CHANGED -> strings().transfers.downloadRestartedRemoteChanged
-                    TransferNotice.RESTARTED_PARTIAL_MISSING -> strings().transfers.partialDownloadMissingRestarted
-                    TransferNotice.RESTARTED_RANGE_IGNORED -> strings().transfers.rangeIgnoredRestarted
-                    else -> return@forEach
+                /*
+                 * A FAILED transition is an unread drawer event. Repeated DataStore emissions of the same
+                 * FAILED record do not refresh the red indicator.
+                 */
+                if (
+                    record.phase == DownloadPhase.FAILED &&
+                    previous[record.transferId]?.phase != DownloadPhase.FAILED
+                ) {
+                    markDownloadDrawerFailed()
                 }
+
+                if (record.notice == TransferNotice.NONE) {
+                    return@forEach
+                }
+
+                if (
+                    previous[record.transferId]?.notice ==
+                    record.notice
+                ) {
+                    return@forEach
+                }
+
+                val message =
+                    when (record.notice) {
+                        TransferNotice.RESTARTED_REMOTE_CHANGED ->
+                            strings().transfers.downloadRestartedRemoteChanged
+
+                        TransferNotice.RESTARTED_PARTIAL_MISSING ->
+                            strings().transfers.partialDownloadMissingRestarted
+
+                        TransferNotice.RESTARTED_RANGE_IGNORED ->
+                            strings().transfers.rangeIgnoredRestarted
+
+                        else ->
+                            return@forEach
+                    }
+
                 sendWarningMessage(message)
+
                 viewModelScope.launch {
-                    transferStore.updateDownload(record.transferId) { it.copy(notice = TransferNotice.NONE) }
+                    transferStore.updateDownload(
+                        record.transferId
+                    ) {
+                        it.copy(
+                            notice =
+                                TransferNotice.NONE
+                        )
+                    }
                 }
             }
+
         refreshTransferUi()
         reconcileDownloadPhases()
     }
@@ -1802,6 +1868,137 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         return now - enqueuedAt < ENQUEUE_GRACE_MILLIS
     }
 
+    /**
+     * Announces that an existing logical download is about to get a replacement Work request.
+     *
+     * The old Work id is deliberately forgotten before the phase becomes TRANSFERRING. Until the new
+     * request id is known, enqueue grace identifies late terminal results from the preceding attempt.
+     */
+    private fun prepareDownloadReenqueue(
+        transferIds: Collection<String>,
+    ) {
+        transferIds.forEach { transferId ->
+            currentDownloadWorkIds.remove(
+                transferId
+            )
+        }
+
+        markRecentlyEnqueued(
+            transferIds
+        )
+    }
+
+    /** Remembers the exact Work request created by the latest successful enqueue call. */
+    private fun rememberEnqueuedDownloadWork(
+        batch: EnqueuedDownloadBatch?,
+    ) {
+        batch
+            ?.workIdByTransferId
+            ?.forEach { (transferId, workId) ->
+                currentDownloadWorkIds[transferId] =
+                    workId
+            }
+    }
+
+    /**
+     * True when [finishedWorkId] belongs to an older attempt.
+     *
+     * Once the new Work id is known it is authoritative. Before that point, enqueue grace covers the
+     * short replacement window. After a process restart, where neither in-memory fact survives, an
+     * already-visible live Work for the same transfer remains the fallback.
+     */
+    private fun isDownloadFailureSuperseded(
+        transferId: String,
+        finishedWorkId: UUID,
+        liveTransferIds: Set<String>,
+        now: Long,
+    ): Boolean {
+        val currentWorkId =
+            currentDownloadWorkIds[
+                transferId
+            ]
+
+        if (currentWorkId != null) {
+            return currentWorkId !=
+                    finishedWorkId
+        }
+
+        if (
+            isWithinEnqueueGrace(
+                transferId,
+                now,
+            )
+        ) {
+            return true
+        }
+
+        return transferId in
+                liveTransferIds
+    }
+
+    /** New downloads are lower priority than an unread failure. */
+    private fun markDownloadDrawerNew() {
+        _uiState.update { state ->
+            when (
+                state.disk.downloadDrawerIndicator
+            ) {
+                DownloadDrawerIndicator.FAILED,
+                DownloadDrawerIndicator.NEW_DOWNLOAD,
+                    ->
+                    state
+
+                DownloadDrawerIndicator.NONE ->
+                    state.copy(
+                        disk =
+                            state.disk.copy(
+                                downloadDrawerIndicator =
+                                    DownloadDrawerIndicator.NEW_DOWNLOAD
+                            )
+                    )
+            }
+        }
+    }
+
+    /** Failure always replaces an unread green new-download indicator. */
+    private fun markDownloadDrawerFailed() {
+        _uiState.update { state ->
+            if (
+                state.disk.downloadDrawerIndicator ==
+                DownloadDrawerIndicator.FAILED
+            ) {
+                state
+            } else {
+                state.copy(
+                    disk =
+                        state.disk.copy(
+                            downloadDrawerIndicator =
+                                DownloadDrawerIndicator.FAILED
+                        )
+                )
+            }
+        }
+    }
+
+    /** Opening/viewing the download drawer acknowledges all current drawer events. */
+    fun clearDownloadDrawerIndicator() {
+        _uiState.update { state ->
+            if (
+                state.disk.downloadDrawerIndicator ==
+                DownloadDrawerIndicator.NONE
+            ) {
+                state
+            } else {
+                state.copy(
+                    disk =
+                        state.disk.copy(
+                            downloadDrawerIndicator =
+                                DownloadDrawerIndicator.NONE
+                        )
+                )
+            }
+        }
+    }
+
     private fun setTransferActionBusy(busy: Boolean) {
         _uiState.update { it.copy(disk = it.disk.copy(transferActionBusy = busy)) }
     }
@@ -1898,89 +2095,176 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         reconcileUploadPhases()
     }
 
-    private suspend fun applyDownloadWorkInfos(infos: List<WorkInfo>) {
+    private suspend fun applyDownloadWorkInfos(
+        infos: List<WorkInfo>,
+    ) {
         downloadWorkInfos = infos
         downloadWorkInfosObserved = true
-        val liveTransferIds = infos
-            .filterNot { it.state.isFinished }
-            .mapNotNullTo(mutableSetOf(), DownloadWork::transferId)
+
+        val liveTransferIds =
+            infos
+                .filterNot {
+                    it.state.isFinished
+                }
+                .mapNotNullTo(
+                    mutableSetOf(),
+                    DownloadWork::transferId,
+                )
+
+        val now =
+            System.currentTimeMillis()
+
         infos.forEach { info ->
-            val previousState = downloadWorkStates.put(info.id, info.state)
-            val changedWhileObserved = previousState != null && previousState != info.state
-            if (!info.state.isFinished) return@forEach
+            val previousState =
+                downloadWorkStates.put(
+                    info.id,
+                    info.state,
+                )
+
+            val changedWhileObserved =
+                previousState != null &&
+                        previousState != info.state
+
+            if (!info.state.isFinished) {
+                return@forEach
+            }
+
             /*
-             * A finished work item is processed once per item, and deliberately not only when this process
-             * watched it run: a download that failed while the app was closed reports its result here for
-             * the first time, and that result is a persistent fact that still has to be applied.
-             *
-             * Only results this process really watched are additionally reported to the user, so a stale
-             * error is never replayed after a restart.
+             * A finished work item is processed once per item, including one first observed after process
+             * restoration. User-facing error messages still require an actual transition watched here.
              */
-            if (!handledDownloadWorkIds.add(info.id)) return@forEach
-            /*
-             * The round bookkeeping is updated before the UI is refreshed, so the ring and the transfer
-             * rows of this pass are computed from the same facts.
-             *
-             * A downloaded or failed attempt is over, so its enqueue grace is dropped as well: an attempt
-             * that fails right after it started must not keep looking active for the rest of the grace
-             * window. A cancelled attempt keeps its marker, because that is what a resume relies on until
-             * its replacement work item shows up.
-             */
-            val transferId = DownloadWork.transferId(info)
-            when (downloadWorkOutcome(info.outputData.getString(DownloadWorker.KEY_RESULT_OUTCOME))) {
+            if (
+                !handledDownloadWorkIds.add(
+                    info.id
+                )
+            ) {
+                return@forEach
+            }
+
+            val transferId =
+                DownloadWork.transferId(
+                    info
+                )
+
+            when (
+                downloadWorkOutcome(
+                    info.outputData.getString(
+                        DownloadWorker.KEY_RESULT_OUTCOME
+                    )
+                )
+            ) {
                 DownloadWorkOutcome.SUCCEEDED -> {
                     if (transferId != null) {
-                        // A finished download keeps its place in the running round at its full size.
-                        downloadRoundProgress.onTaskCompleted(transferId)
-                        recentlyEnqueuedTransfers.remove(transferId)
+                        downloadRoundProgress.onTaskCompleted(
+                            transferId
+                        )
+
+                        recentlyEnqueuedTransfers.remove(
+                            transferId
+                        )
+
+                        if (
+                            currentDownloadWorkIds[
+                                transferId
+                            ] == info.id
+                        ) {
+                            currentDownloadWorkIds.remove(
+                                transferId
+                            )
+                        }
                     }
-                    // The worker already removed the completed download; only the list has to catch up.
-                    if (changedWhileObserved) loadDownloadedFiles()
+
+                    if (changedWhileObserved) {
+                        loadDownloadedFiles()
+                    }
                 }
 
                 DownloadWorkOutcome.FAILED -> {
                     if (transferId != null) {
                         /*
-                         * Ownership of this failure is decided by the record the store holds right now, never
-                         * by the UI mirror: the mirror can lag one step behind a pause or a cancel the user
-                         * just persisted, and this result must not claim a transfer that is already theirs.
+                         * A replacement request may already exist before WorkManager publishes it through
+                         * workInfos(). Its exact UUID, or the short pre-publication grace window, prevents
+                         * an old FAILED result from taking ownership of the new retry.
                          */
-                        val resolution = transferStore.resolveDownloadFailure(
-                            transferId = transferId,
-                            supersededByLiveWork = transferId in liveTransferIds,
-                        )
+                        val superseded =
+                            isDownloadFailureSuperseded(
+                                transferId =
+                                    transferId,
+                                finishedWorkId =
+                                    info.id,
+                                liveTransferIds =
+                                    liveTransferIds,
+                                now =
+                                    now,
+                            )
+
+                        val resolution =
+                            transferStore.resolveDownloadFailure(
+                                transferId =
+                                    transferId,
+                                // The store only needs the final ownership decision; the decision itself
+                                // now also understands the pre-WorkInfo enqueue window.
+                                supersededByLiveWork =
+                                    superseded,
+                            )
+
                         val ownsFailure =
-                            resolution.outcome == DownloadFailureOutcome.APPLIED ||
-                                resolution.outcome == DownloadFailureOutcome.ALREADY_FAILED
+                            resolution.outcome ==
+                                    DownloadFailureOutcome.APPLIED ||
+                                    resolution.outcome ==
+                                    DownloadFailureOutcome.ALREADY_FAILED
 
                         if (ownsFailure) {
                             downloadRoundProgress.onTaskFailed()
                         }
 
-                        if (resolution.outcome != DownloadFailureOutcome.SUPERSEDED) {
-                            // The row follows the phase the store really holds; a missing record drops it.
+                        if (
+                            resolution.outcome !=
+                            DownloadFailureOutcome.SUPERSEDED
+                        ) {
                             syncDownloadPhase(
-                                transferId = transferId,
-                                phase = if (ownsFailure) DownloadPhase.FAILED else resolution.storedPhase,
+                                transferId =
+                                    transferId,
+                                phase =
+                                    if (ownsFailure) {
+                                        DownloadPhase.FAILED
+                                    } else {
+                                        resolution.storedPhase
+                                    },
                             )
-                            recentlyEnqueuedTransfers.remove(transferId)
+
+                            recentlyEnqueuedTransfers.remove(
+                                transferId
+                            )
                         }
 
-                        // Only an owned failure is reported, and only one this process watched happen.
-                        if (ownsFailure && changedWhileObserved) {
-                            sendErrorMessage(downloadWorkFailureMessage(info.outputData))
+                        if (
+                            ownsFailure &&
+                            changedWhileObserved
+                        ) {
+                            sendErrorMessage(
+                                downloadWorkFailureMessage(
+                                    info.outputData
+                                )
+                            )
                         }
                     }
                 }
 
-                DownloadWorkOutcome.CANCELED, DownloadWorkOutcome.NONE -> Unit
+                DownloadWorkOutcome.CANCELED,
+                DownloadWorkOutcome.NONE,
+                    ->
+                    Unit
             }
         }
-        /*
-         * Only work items WorkManager still reports stay remembered. A stale finished item can therefore
-         * never replay its result while a download is running, and the set stays bounded.
-         */
-        handledDownloadWorkIds.retainAll(infos.mapTo(mutableSetOf(), WorkInfo::id))
+
+        handledDownloadWorkIds.retainAll(
+            infos.mapTo(
+                mutableSetOf(),
+                WorkInfo::id,
+            )
+        )
+
         refreshTransferUi()
         reconcileDownloadPhases()
     }
@@ -2285,119 +2569,205 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /**
-     * Starts one persistent download.
-     *
-     * The MediaStore entry is created up front with `IS_PENDING = 1`, and the presigned URL is only
-     * requested by the worker: it is short lived and must never be persisted as transfer state.
-     */
     private fun startDownload(
         fileId: Long,
         fileName: String,
     ) {
         viewModelScope.launch {
-            if (_uiState.value.disk.transferActionBusy) {
+            if (
+                _uiState.value.disk
+                    .transferActionBusy
+            ) {
                 return@launch
             }
 
-            val session = activeSession() ?: return@launch
+            val session =
+                activeSession()
+                    ?: return@launch
 
             /*
              * Repeated taps on the same cloud file while it already has an unfinished transfer do not
              * create another local destination.
              */
-            val existing = downloadTransfers.firstOrNull {
-                it.fileId == fileId &&
-                        isOwnedByActiveSession(it.accountKey)
-            }
+            val existing =
+                downloadTransfers.firstOrNull {
+                    it.fileId == fileId &&
+                            isOwnedByActiveSession(
+                                it.accountKey
+                            )
+                }
 
             if (existing != null) {
-                // Tapping download again on a paused or failed file retries that transfer.
+                /*
+                 * A paused or failed transfer is a continuation of the existing logical download.
+                 * It deliberately does NOT trigger the green "new download" drawer indicator.
+                 */
                 if (existing.phase.isResumable) {
-                    resumeDownload(existing.transferId)
+                    resumeDownload(
+                        existing.transferId
+                    )
                 }
+
                 return@launch
             }
 
             setTransferActionBusy(true)
 
-            var transfer: DownloadTransfer? = null
+            var transfer: DownloadTransfer? =
+                null
 
             try {
-                val reservedNames = downloadTransfers
-                    .asSequence()
-                    .filter { isOwnedByActiveSession(it.accountKey) }
-                    .map { it.fileName }
-                    .toSet()
+                val reservedNames =
+                    downloadTransfers
+                        .asSequence()
+                        .filter {
+                            isOwnedByActiveSession(
+                                it.accountKey
+                            )
+                        }
+                        .map {
+                            it.fileName
+                        }
+                        .toSet()
 
-                transfer = withContext(Dispatchers.IO) {
-                    val destination =
-                        transferRepository.createPendingDownloadDestination(
-                            fileName = fileName,
-                            reservedNames = reservedNames,
-                        )
+                transfer =
+                    withContext(
+                        Dispatchers.IO
+                    ) {
+                        val destination =
+                            transferRepository
+                                .createPendingDownloadDestination(
+                                    fileName =
+                                        fileName,
+                                    reservedNames =
+                                        reservedNames,
+                                )
 
-                    DownloadTransfer(
-                        transferId = UUID.randomUUID().toString(),
-                        accountKey = session.username,
-                        fileId = fileId,
-                        // Persist the actual local name, including "(1)" if needed.
-                        fileName = destination.displayName,
-                        destinationUri = destination.uri.toString(),
-                        downloadedBytes = 0L,
-                        totalBytes = 0L,
-                        etag = "",
-                        language = _uiState.value.settings.language.code,
-                        phase = DownloadPhase.TRANSFERRING,
-                        notice = TransferNotice.NONE,
-                        createdAt = System.currentTimeMillis(),
-                    )
-                }
-
-                markRecentlyEnqueued(listOf(transfer.transferId))
-
-                try {
-                    transferStore.addDownload(transfer)
-                } catch (throwable: Throwable) {
-                    withContext(Dispatchers.IO) {
-                        transferRepository.deleteDownloadDestination(
-                            transfer.destinationUri
+                        DownloadTransfer(
+                            transferId =
+                                UUID.randomUUID()
+                                    .toString(),
+                            accountKey =
+                                session.username,
+                            fileId =
+                                fileId,
+                            fileName =
+                                destination.displayName,
+                            destinationUri =
+                                destination.uri.toString(),
+                            downloadedBytes =
+                                0L,
+                            totalBytes =
+                                0L,
+                            etag =
+                                "",
+                            language =
+                                _uiState.value.settings.language.code,
+                            phase =
+                                DownloadPhase.TRANSFERRING,
+                            notice =
+                                TransferNotice.NONE,
+                            createdAt =
+                                System.currentTimeMillis(),
                         )
                     }
+
+                markRecentlyEnqueued(
+                    listOf(
+                        transfer.transferId
+                    )
+                )
+
+                try {
+                    transferStore.addDownload(
+                        transfer
+                    )
+                } catch (throwable: Throwable) {
+                    recentlyEnqueuedTransfers.remove(
+                        transfer.transferId
+                    )
+
+                    withContext(
+                        Dispatchers.IO
+                    ) {
+                        transferRepository
+                            .deleteDownloadDestination(
+                                transfer.destinationUri
+                            )
+                    }
+
                     throw throwable
                 }
 
                 downloadTransfers =
                     downloadTransfers.filterNot { current ->
-                        current.transferId == transfer.transferId
+                        current.transferId ==
+                                transfer.transferId
                     } + transfer
+
                 refreshTransferUi()
 
                 try {
-                    DownloadWork.enqueue(
-                        context = getApplication(),
-                        accessToken = session.accessToken,
-                        transfers = listOf(transfer),
+                    val enqueued =
+                        DownloadWork.enqueue(
+                            context =
+                                getApplication(),
+                            accessToken =
+                                session.accessToken,
+                            transfers =
+                                listOf(transfer),
+                        )
+
+                    rememberEnqueuedDownloadWork(
+                        enqueued
                     )
+
+                    /*
+                     * Only a genuinely new transfer gets the green unread indicator.
+                     * Resume/retry paths never call this.
+                     */
+                    markDownloadDrawerNew()
                 } catch (throwable: Throwable) {
-                    transferStore.removeDownload(transfer.transferId)
-                    downloadTransfers = downloadTransfers.filterNot {
-                        it.transferId == transfer.transferId
-                    }
+                    transferStore.removeDownload(
+                        transfer.transferId
+                    )
+
+                    recentlyEnqueuedTransfers.remove(
+                        transfer.transferId
+                    )
+
+                    currentDownloadWorkIds.remove(
+                        transfer.transferId
+                    )
+
+                    downloadTransfers =
+                        downloadTransfers.filterNot {
+                            it.transferId ==
+                                    transfer.transferId
+                        }
+
                     refreshTransferUi()
 
-                    withContext(Dispatchers.IO) {
-                        transferRepository.deleteDownloadDestination(
-                            transfer.destinationUri
-                        )
+                    withContext(
+                        Dispatchers.IO
+                    ) {
+                        transferRepository
+                            .deleteDownloadDestination(
+                                transfer.destinationUri
+                            )
                     }
 
                     throw throwable
                 }
-            } catch (cancellation: CancellationException) {
+            } catch (
+                cancellation:
+                CancellationException
+            ) {
                 throw cancellation
             } catch (throwable: Throwable) {
-                sendThrowableMessage(throwable)
+                sendThrowableMessage(
+                    throwable
+                )
             } finally {
                 setTransferActionBusy(false)
             }
@@ -2457,23 +2827,34 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /**
-     * Resumes a paused or failed download. The worker always asks for a new presigned URL before
-     * continuing.
-     */
-    fun resumeDownload(transferId: String) {
+    fun resumeDownload(
+        transferId: String,
+    ) {
         viewModelScope.launch {
-            if (_uiState.value.disk.transferActionBusy) {
+            if (
+                _uiState.value.disk
+                    .transferActionBusy
+            ) {
                 return@launch
             }
 
-            val transfer = downloadTransfers
-                .firstOrNull { it.transferId == transferId }
-                ?: return@launch
+            val transfer =
+                downloadTransfers
+                    .firstOrNull {
+                        it.transferId ==
+                                transferId
+                    }
+                    ?: return@launch
 
-            val session = activeSession() ?: return@launch
+            val session =
+                activeSession()
+                    ?: return@launch
 
-            if (!isOwnedByActiveSession(transfer.accountKey)) {
+            if (
+                !isOwnedByActiveSession(
+                    transfer.accountKey
+                )
+            ) {
                 return@launch
             }
 
@@ -2481,75 +2862,129 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 return@launch
             }
 
-            // The phase this transfer goes back to when WorkManager refuses to take it over.
-            val previousPhase = transfer.phase
+            val previousPhase =
+                transfer.phase
 
             setTransferActionBusy(true)
 
             try {
                 /*
-                 * The enqueue grace is established before the phase can be seen as TRANSFERRING: the
-                 * first projection based on the new phase must already treat the transfer as the active
-                 * member of a new round, otherwise it would be neither active nor paused for one pass and
-                 * the yellow ring would blink out before the new work item shows up.
+                 * Forget the old Work UUID and establish grace before TRANSFERRING becomes visible.
+                 * Until the replacement UUID is returned, a late result from the preceding attempt is stale.
                  */
-                markRecentlyEnqueued(listOf(transferId))
+                prepareDownloadReenqueue(
+                    listOf(
+                        transferId
+                    )
+                )
 
-                val updated = transferStore.updateDownload(transferId) { current ->
-                    if (current.phase.isTransferring) {
-                        current
-                    } else {
-                        current.copy(phase = DownloadPhase.TRANSFERRING)
+                val updated =
+                    transferStore.updateDownload(
+                        transferId
+                    ) { current ->
+                        if (
+                            current.phase
+                                .isTransferring
+                        ) {
+                            current
+                        } else {
+                            current.copy(
+                                phase =
+                                    DownloadPhase.TRANSFERRING
+                            )
+                        }
                     }
-                }
 
                 if (updated == null) {
-                    recentlyEnqueuedTransfers.remove(transferId)
+                    recentlyEnqueuedTransfers.remove(
+                        transferId
+                    )
+
                     return@launch
                 }
 
-                downloadTransfers = downloadTransfers.map { current ->
-                    if (current.transferId == transferId) {
-                        updated
-                    } else {
-                        current
-                    }
-                }
-                refreshTransferUi()
-
-                try {
-                    DownloadWork.enqueue(
-                        context = getApplication(),
-                        accessToken = session.accessToken,
-                        transfers = listOf(updated),
-                    )
-                } catch (cancellation: CancellationException) {
-                    throw cancellation
-                } catch (throwable: Throwable) {
-                    // WorkManager did not take the transfer over: roll the phase and the ring back to
-                    // exactly what the user saw before, in one pass.
-                    recentlyEnqueuedTransfers.remove(transferId)
-
-                    val restored = transferStore.updateDownload(transferId) { current ->
-                        if (current.phase.isTransferring) {
-                            current.copy(phase = previousPhase)
+                downloadTransfers =
+                    downloadTransfers.map { current ->
+                        if (
+                            current.transferId ==
+                            transferId
+                        ) {
+                            updated
                         } else {
                             current
                         }
                     }
 
-                    if (restored != null) {
-                        downloadTransfers = downloadTransfers.map { current ->
-                            if (current.transferId == transferId) {
-                                restored
+                refreshTransferUi()
+
+                try {
+                    val enqueued =
+                        DownloadWork.enqueue(
+                            context =
+                                getApplication(),
+                            accessToken =
+                                session.accessToken,
+                            transfers =
+                                listOf(updated),
+                        )
+
+                    rememberEnqueuedDownloadWork(
+                        enqueued
+                    )
+                } catch (
+                    cancellation:
+                    CancellationException
+                ) {
+                    throw cancellation
+                } catch (throwable: Throwable) {
+                    /*
+                     * Keep grace alive while the persistent phase is restored. Otherwise a late result from
+                     * the replaced Work could slip into the tiny rollback suspension window.
+                     */
+                    val restored =
+                        transferStore.updateDownload(
+                            transferId
+                        ) { current ->
+                            if (
+                                current.phase
+                                    .isTransferring
+                            ) {
+                                current.copy(
+                                    phase =
+                                        previousPhase
+                                )
                             } else {
                                 current
                             }
                         }
+
+                    recentlyEnqueuedTransfers.remove(
+                        transferId
+                    )
+
+                    currentDownloadWorkIds.remove(
+                        transferId
+                    )
+
+                    if (restored != null) {
+                        downloadTransfers =
+                            downloadTransfers.map { current ->
+                                if (
+                                    current.transferId ==
+                                    transferId
+                                ) {
+                                    restored
+                                } else {
+                                    current
+                                }
+                            }
                     }
 
                     refreshTransferUi()
-                    sendThrowableMessage(throwable)
+
+                    sendThrowableMessage(
+                        throwable
+                    )
                 }
             } finally {
                 setTransferActionBusy(false)
@@ -3456,6 +3891,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             handledUploadWorkIds.clear()
             handledDownloadWorkIds.clear()
             recentlyEnqueuedTransfers.clear()
+            currentDownloadWorkIds.clear()
 
             uploadBatchId = null
             uploadBatchTotalBytes = 0L
@@ -4358,15 +4794,22 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
     fun resumeAllDownloads() {
         viewModelScope.launch {
-            if (_uiState.value.disk.transferActionBusy) {
+            if (
+                _uiState.value.disk
+                    .transferActionBusy
+            ) {
                 return@launch
             }
 
-            val session = activeSession() ?: return@launch
+            val session =
+                activeSession()
+                    ?: return@launch
 
             val targets =
                 downloadTransfers.filter { transfer ->
-                    isOwnedByActiveSession(transfer.accountKey) &&
+                    isOwnedByActiveSession(
+                        transfer.accountKey
+                    ) &&
                             transfer.phase.isResumable
                 }
 
@@ -4374,47 +4817,76 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 return@launch
             }
 
-            // The phase each transfer goes back to when WorkManager refuses to take it over.
             val previousPhases =
-                targets.associate { transfer -> transfer.transferId to transfer.phase }
+                targets.associate { transfer ->
+                    transfer.transferId to
+                            transfer.phase
+                }
 
             setTransferActionBusy(true)
 
-            val resumed = mutableListOf<DownloadTransfer>()
+            val resumed =
+                mutableListOf<DownloadTransfer>()
 
             try {
+                val targetIds =
+                    targets.map(
+                        DownloadTransfer::transferId
+                    )
+
                 /*
-                 * Every grace marker is established before the first transfer can be seen as
-                 * TRANSFERRING, so the very first projection already shows an active new round instead
-                 * of letting the yellow ring blink out while the work items are still being created.
+                 * Every old Work UUID is forgotten and grace is established before the first phase changes.
+                 * This matters because the DataStore updates below suspend independently for every transfer.
                  */
-                markRecentlyEnqueued(targets.map(DownloadTransfer::transferId))
+                prepareDownloadReenqueue(
+                    targetIds
+                )
 
                 targets.forEach { transfer ->
-                    transferStore.updateDownload(transfer.transferId) { current ->
-                        if (current.phase.isTransferring) {
+                    transferStore.updateDownload(
+                        transfer.transferId
+                    ) { current ->
+                        if (
+                            current.phase
+                                .isTransferring
+                        ) {
                             current
                         } else {
                             current.copy(
-                                phase = DownloadPhase.TRANSFERRING
+                                phase =
+                                    DownloadPhase.TRANSFERRING
                             )
                         }
-                    }?.let(resumed::add)
+                    }?.let(
+                        resumed::add
+                    )
                 }
 
                 val resumedById =
-                    resumed.associateBy(DownloadTransfer::transferId)
+                    resumed.associateBy(
+                        DownloadTransfer::transferId
+                    )
 
-                // A transfer that was not actually resumed keeps no enqueue grace behind.
                 targets.forEach { transfer ->
-                    if (transfer.transferId !in resumedById) {
-                        recentlyEnqueuedTransfers.remove(transfer.transferId)
+                    if (
+                        transfer.transferId !in
+                        resumedById
+                    ) {
+                        recentlyEnqueuedTransfers.remove(
+                            transfer.transferId
+                        )
+
+                        currentDownloadWorkIds.remove(
+                            transfer.transferId
+                        )
                     }
                 }
 
                 downloadTransfers =
                     downloadTransfers.map { current ->
-                        resumedById[current.transferId] ?: current
+                        resumedById[
+                            current.transferId
+                        ] ?: current
                     }
 
                 refreshTransferUi()
@@ -4423,12 +4895,23 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     return@launch
                 }
 
-                DownloadWork.enqueue(
-                    context = getApplication(),
-                    accessToken = session.accessToken,
-                    transfers = resumed,
+                val enqueued =
+                    DownloadWork.enqueue(
+                        context =
+                            getApplication(),
+                        accessToken =
+                            session.accessToken,
+                        transfers =
+                            resumed,
+                    )
+
+                rememberEnqueuedDownloadWork(
+                    enqueued
                 )
-            } catch (cancellation: CancellationException) {
+            } catch (
+                cancellation:
+                CancellationException
+            ) {
                 throw cancellation
             } catch (throwable: Throwable) {
                 val ids =
@@ -4437,14 +4920,17 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         DownloadTransfer::transferId,
                     )
 
-                ids.forEach { transferId ->
-                    recentlyEnqueuedTransfers.remove(transferId)
-                }
-
                 val restoredById =
-                    mutableMapOf<String, DownloadTransfer>()
+                    mutableMapOf<
+                            String,
+                            DownloadTransfer
+                            >()
 
                 ids.forEach { transferId ->
+                    /*
+                     * Grace deliberately stays active during cancellation and rollback. Until the previous
+                     * phase is restored, a terminal result from an old/rejected Work must remain stale.
+                     */
                     runCatching {
                         awaitDownloadCancellation(
                             DownloadWork.cancelTransfer(
@@ -4454,31 +4940,53 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         )
                     }
 
-                    // A refused resume rolls back to the phase the transfer had before, so a failed
-                    // attempt does not turn into a pause and a real pause does not turn into a failure.
                     val previousPhase =
-                        previousPhases[transferId] ?: DownloadPhase.PAUSED
+                        previousPhases[
+                            transferId
+                        ] ?: DownloadPhase.PAUSED
 
-                    transferStore.updateDownload(transferId) { current ->
-                        if (current.phase.isTransferring) {
+                    transferStore.updateDownload(
+                        transferId
+                    ) { current ->
+                        if (
+                            current.phase
+                                .isTransferring
+                        ) {
                             current.copy(
-                                phase = previousPhase
+                                phase =
+                                    previousPhase
                             )
                         } else {
                             current
                         }
                     }?.let { restored ->
-                        restoredById[transferId] = restored
+                        restoredById[
+                            transferId
+                        ] = restored
                     }
+                }
+
+                ids.forEach { transferId ->
+                    recentlyEnqueuedTransfers.remove(
+                        transferId
+                    )
+
+                    currentDownloadWorkIds.remove(
+                        transferId
+                    )
                 }
 
                 downloadTransfers =
                     downloadTransfers.map { current ->
-                        restoredById[current.transferId] ?: current
+                        restoredById[
+                            current.transferId
+                        ] ?: current
                     }
 
                 refreshTransferUi()
-                sendThrowableMessage(throwable)
+                sendThrowableMessage(
+                    throwable
+                )
             } finally {
                 setTransferActionBusy(false)
             }
