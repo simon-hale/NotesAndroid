@@ -33,6 +33,86 @@ class DownloadProgressStateTest {
     }
 
     @Test
+    fun `fresh response metadata survives a restart from byte zero`() {
+        val state =
+            DownloadProgressState(
+                downloadedBytes = 0L,
+                totalBytes = 8_000L,
+                etag = "\"old-object\"",
+            )
+
+        /*
+         * Starting from byte zero first discards metadata belonging to the previous
+         * representation and arms destination truncation.
+         */
+        state.requestRestartFromZero()
+
+        assertEquals(
+            0L,
+            state.downloadedBytes,
+        )
+
+        assertEquals(
+            0L,
+            state.totalBytes,
+        )
+
+        assertEquals(
+            "",
+            state.etag,
+        )
+
+        /*
+         * Metadata from the response that is actually about to be downloaded must
+         * then remain available for progress accounting.
+         */
+        state.takeFreshTotal(
+            contentLength = 20_000L
+        )
+
+        state.takeETag(
+            "\"fresh-object\""
+        )
+
+        assertEquals(
+            0L,
+            state.downloadedBytes,
+        )
+
+        assertEquals(
+            20_000L,
+            state.totalBytes,
+        )
+
+        assertEquals(
+            "\"fresh-object\"",
+            state.etag,
+        )
+
+        assertTrue(
+            state.hasKnownTotal
+        )
+
+        assertEquals(
+            0f,
+            state.fraction,
+            0.0001f,
+        )
+
+        /*
+         * The local destination still has to be truncated even though the fresh
+         * response metadata has already been adopted.
+         */
+        assertTrue(
+            state.consumeRestartFromZero()
+        )
+
+        assertFalse(
+            state.consumeRestartFromZero()
+        )
+    }
+
+    @Test
     fun `unknown content length after a restart does not inherit the old total`() {
         val state = DownloadProgressState(totalBytes = 10_000L, etag = "\"old-object\"")
 

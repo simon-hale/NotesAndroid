@@ -31,8 +31,8 @@ android {
         applicationId = "com.notes.notes"
         minSdk = 35
         targetSdk = 36
-        versionCode = 17
-        versionName = "1.2.4"
+        versionCode = 18
+        versionName = "1.3.0"
 
         buildConfigField("String", "NOTES_BASE_URL", "\"${notesBaseUrl.escapeBuildConfigString()}\"")
 

@@ -194,48 +194,115 @@ class DownloadWorker(
 
             var retry = false
             try {
-                when (DownloadResumePolicy.planForResponse(response.statusCode, run.downloadedBytes)) {
+                /*
+                 * A zero-offset response will be written from the beginning of the destination.
+                 *
+                 * requestRestartFromZero() deliberately clears metadata that belongs to an older
+                 * representation, so it must run BEFORE this response contributes its fresh
+                 * Content-Length and ETag. Running it afterwards would erase the total size we
+                 * just learned and leave the UI permanently indeterminate.
+                 */
+                if (run.downloadedBytes == 0L) {
+                    run.requestRestartFromZero()
+                }
+
+                when (
+                    DownloadResumePolicy.planForResponse(
+                        response.statusCode,
+                        run.downloadedBytes,
+                    )
+                ) {
                     DownloadPlan.CONTINUE_FROM_OFFSET -> {
                         if (response.statusCode == HTTP_PARTIAL_CONTENT) {
-                            run.takeResumedTotal(response.statusCode, response.contentLength)
+                            run.takeResumedTotal(
+                                response.statusCode,
+                                response.contentLength,
+                            )
                         } else {
-                            run.takeFreshTotal(response.contentLength)
+                            run.takeFreshTotal(
+                                response.contentLength
+                            )
                         }
-                        run.takeETag(response.etag)
+
+                        run.takeETag(
+                            response.etag
+                        )
                     }
 
                     DownloadPlan.RESTART_FROM_ZERO -> {
-                        if (response.statusCode == HTTP_OK && run.downloadedBytes > 0L) {
-                            // The server ignored the Range header: never append, an old prefix must
-                            // not be combined with a new object's suffix. The new representation also
-                            // gets its own length and ETag.
-                            Log.i(TAG, "Server ignored Range for ${transfer.fileName}; restarting")
-                            run.resetForRestart(TransferNotice.RESTARTED_RANGE_IGNORED)
-                            run.takeFreshTotal(response.contentLength)
-                            run.takeETag(response.etag)
+                        if (
+                            response.statusCode == HTTP_OK &&
+                            run.downloadedBytes > 0L
+                        ) {
+                            /*
+                             * The server ignored the Range header: never append, an old prefix
+                             * must not be combined with a new object's suffix. The replacement
+                             * representation establishes its own size and ETag.
+                             */
+                            Log.i(
+                                TAG,
+                                "Server ignored Range for ${transfer.fileName}; restarting",
+                            )
+
+                            run.resetForRestart(
+                                TransferNotice.RESTARTED_RANGE_IGNORED
+                            )
+
+                            run.takeFreshTotal(
+                                response.contentLength
+                            )
+
+                            run.takeETag(
+                                response.etag
+                            )
                         } else {
-                            // The remote object changed or the range is unusable: discard the partial
-                            // file and fetch the current object from byte zero.
+                            /*
+                             * The remote object changed or the range is unusable: discard the
+                             * partial file and fetch the current object from byte zero.
+                             */
                             if (attempt > MAX_RESTART_ATTEMPTS) {
                                 throw NotesServiceException.Http(
                                     response.statusCode,
                                     "Download restart limit reached",
                                 )
                             }
-                            Log.i(TAG, "Restarting download of ${transfer.fileName} after ${response.statusCode}")
-                            run.resetForRestart(TransferNotice.RESTARTED_REMOTE_CHANGED)
+
+                            Log.i(
+                                TAG,
+                                "Restarting download of ${transfer.fileName} after ${response.statusCode}",
+                            )
+
+                            run.resetForRestart(
+                                TransferNotice.RESTARTED_REMOTE_CHANGED
+                            )
+
                             persistRun(run)
+
                             retry = true
                         }
                     }
                 }
 
-                if (retry) continue
-
-                if (run.downloadedBytes == 0L) {
-                    run.requestRestartFromZero()
+                if (retry) {
+                    continue
                 }
-                val completed = streamIntoDestination(transfer, run, response)
+
+                /*
+                 * Publish the response metadata immediately instead of waiting for the first
+                 * 500 ms byte-progress tick. When Content-Length is known, the download ring
+                 * can therefore become determinate immediately at 0 / total and then grow
+                 * from its fixed start angle.
+                 */
+                setProgress(
+                    run.toWorkData()
+                )
+
+                val completed =
+                    streamIntoDestination(
+                        transfer,
+                        run,
+                        response,
+                    )
                 if (!completed) {
                     // The worker was stopped (pause) or the connection ended early: the MediaStore item
                     // stays pending and the transfer keeps the bytes it really has.
