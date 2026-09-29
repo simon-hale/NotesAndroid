@@ -564,22 +564,12 @@ private fun DownloadTransfersActionChip(
                 null
 
             DownloadDrawerIndicator.NEW_DOWNLOAD ->
-                when (language) {
-                    AppLanguage.ZH_CN ->
-                        "有新的下载任务"
-
-                    AppLanguage.EN_US ->
-                        "New download added"
-                }
+                strings.transfers
+                    .downloadDrawerNewIndicator
 
             DownloadDrawerIndicator.FAILED ->
-                when (language) {
-                    AppLanguage.ZH_CN ->
-                        "有下载任务失败"
-
-                    AppLanguage.EN_US ->
-                        "A download failed"
-                }
+                strings.transfers
+                    .downloadDrawerFailedIndicator
         }
 
     val stateDescription =
@@ -914,11 +904,7 @@ private fun DownloadTransfersBottomSheet(
             it.phase.isTransferring
         }
 
-    // Paused and failed downloads are both resumable, so "resume all" covers either of them.
-    val hasPaused =
-        uiState.disk.downloadTransfers.any {
-            it.phase.isResumable
-        }
+    val hasResumable = uiState.disk.downloadTransfers.any { it.phase.isResumable }
 
     val globalActionLabel =
         when (uiState.settings.language) {
@@ -949,7 +935,7 @@ private fun DownloadTransfersBottomSheet(
                     style = MaterialTheme.typography.titleLarge,
                 )
 
-                if (hasTransferring || hasPaused) {
+                if (hasTransferring || hasResumable) {
                     TextButton(
                         enabled = !busy,
                         onClick = {

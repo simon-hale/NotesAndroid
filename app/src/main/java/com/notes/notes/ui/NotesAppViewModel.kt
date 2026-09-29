@@ -1467,7 +1467,10 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     withinEnqueueGrace = isWithinEnqueueGrace(record.transferId, now),
                 )
             }
-        val round = downloadRoundProgress.reduce(downloadTasks, now)
+        val round =
+            downloadRoundProgress.reduce(
+                downloadTasks
+            )
 
         // Enqueue grace entries of settled transfers are no longer needed.
         val knownTransferIds =
@@ -1506,8 +1509,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
             uploadEntries = uploadEntries,
             downloadEntries = downloadEntries,
             ring = round.ring,
-            immediate = round.publishNow ||
-                rowsChangedBeyondBytes(uploadEntries, downloadEntries),
+            immediate =
+                round.structural ||
+                        rowsChangedBeyondBytes(
+                            uploadEntries,
+                            downloadEntries,
+                        ),
         )
     }
 
@@ -1548,13 +1555,11 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     )
 
     /**
-     * Publishes the transfer projection, coalescing plain byte-progress refreshes.
+     * Publishes the transfer projection.
      *
-     * The ring decides its own pacing in [DownloadRoundProgress.reduce]: a structural change — a round
-     * starting or ending, a member joining, completing, failing, being cancelled, or a pause and resume
-     * — arrives with `publishNow` set. This window only covers the remaining case, a pure byte tick, and
-     * a changed transfer row or any other state change always publishes at once, replacing any pending
-     * update, so no intermediate percentage can reach the screen.
+     * Structural state changes are applied immediately. Only plain byte-progress updates are coalesced,
+     * so the UI does not redraw for every progress emission while pause/resume/complete/failure/cancel and
+     * round transitions remain immediate.
      */
     private fun publishTransferUi(
         uploadEntries: List<UploadTransferEntry>,
@@ -1562,26 +1567,72 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         ring: DownloadRingState,
         immediate: Boolean,
     ) {
-        val now = System.currentTimeMillis()
-        val elapsed = now - lastTransferUiPublishAt
-        if (immediate || elapsed >= DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS) {
+        val now =
+            System.currentTimeMillis()
+
+        val elapsed =
+            now -
+                    lastTransferUiPublishAt
+
+        if (
+            immediate ||
+            elapsed >=
+            TRANSFER_UI_PUBLISH_INTERVAL_MILLIS
+        ) {
             cancelPendingTransferUi()
-            lastTransferUiPublishAt = now
-            applyTransferUi(uploadEntries, downloadEntries, ring)
+
+            lastTransferUiPublishAt =
+                now
+
+            applyTransferUi(
+                uploadEntries,
+                downloadEntries,
+                ring,
+            )
+
             return
         }
 
-        pendingTransferUi = PendingTransferUi(uploadEntries, downloadEntries, ring)
-        if (transferUiFlushJob != null) return
+        pendingTransferUi =
+            PendingTransferUi(
+                uploadEntries =
+                    uploadEntries,
+                downloadEntries =
+                    downloadEntries,
+                ring =
+                    ring,
+            )
 
-        transferUiFlushJob = viewModelScope.launch {
-            delay(DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS - elapsed)
-            transferUiFlushJob = null
-            val pending = pendingTransferUi ?: return@launch
-            pendingTransferUi = null
-            lastTransferUiPublishAt = System.currentTimeMillis()
-            applyTransferUi(pending.uploadEntries, pending.downloadEntries, pending.ring)
+        if (transferUiFlushJob != null) {
+            return
         }
+
+        transferUiFlushJob =
+            viewModelScope.launch {
+                delay(
+                    TRANSFER_UI_PUBLISH_INTERVAL_MILLIS -
+                            elapsed
+                )
+
+                transferUiFlushJob =
+                    null
+
+                val pending =
+                    pendingTransferUi
+                        ?: return@launch
+
+                pendingTransferUi =
+                    null
+
+                lastTransferUiPublishAt =
+                    System.currentTimeMillis()
+
+                applyTransferUi(
+                    pending.uploadEntries,
+                    pending.downloadEntries,
+                    pending.ring,
+                )
+            }
     }
 
     private fun cancelPendingTransferUi() {
@@ -2200,12 +2251,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
                         val resolution =
                             transferStore.resolveDownloadFailure(
-                                transferId =
-                                    transferId,
-                                // The store only needs the final ownership decision; the decision itself
-                                // now also understands the pre-WorkInfo enqueue window.
-                                supersededByLiveWork =
-                                    superseded,
+                                transferId = transferId,
+                                superseded = superseded,
                             )
 
                         val ownsFailure =
@@ -4550,12 +4597,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         /** How long a just-enqueued transfer may be missing from the WorkManager snapshot. */
         const val ENQUEUE_GRACE_MILLIS = 5_000L
 
-        /**
-         * Coalescing window for plain byte-progress publishes, shared with the download ring.
-         * State transitions are published immediately and never wait for this window.
-         */
-        const val DOWNLOAD_PROGRESS_PUBLISH_INTERVAL_MILLIS =
-            DownloadRoundProgress.DEFAULT_PUBLISH_INTERVAL_MILLIS
+        /** Coalescing window for plain transfer byte-progress UI updates. */
+        const val TRANSFER_UI_PUBLISH_INTERVAL_MILLIS = 80L
 
         /** A destructive cancel is best effort; the UI must never wait on it for long. */
         const val CANCEL_ABORT_TIMEOUT_MILLIS = 15_000L

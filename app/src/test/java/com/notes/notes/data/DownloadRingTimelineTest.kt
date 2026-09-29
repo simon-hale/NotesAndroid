@@ -18,14 +18,19 @@ import org.junit.Test
  */
 class DownloadRingTimelineTest {
 
-    /** Mirrors one `refreshTransferUi()` pass: project, reduce, and publish when the ring asks for it. */
     private class DownloadUi {
 
-        val round = DownloadRoundProgress()
+        val round =
+            DownloadRoundProgress()
 
-        private var clock = 0L
+        private var clock =
+            0L
 
-        private val passes = mutableListOf<Pass>()
+        private var lastPublishedAt: Long? =
+            null
+
+        private val passes =
+            mutableListOf<Pass>()
 
         data class Pass(
             val atMillis: Long,
@@ -35,27 +40,78 @@ class DownloadRingTimelineTest {
             val phases: List<DownloadPhase>,
         )
 
-        /** The ring the user currently sees: the last state that was really published. */
         val visibleRing: DownloadRingState
-            get() = passes.lastOrNull { it.publishNow }?.ring ?: DownloadRingState.Hidden
+            get() =
+                passes
+                    .lastOrNull {
+                        it.publishNow
+                    }
+                    ?.ring
+                    ?: DownloadRingState.Hidden
 
-        /** Modes of every ring that was published, in order. */
         val publishedModes: List<DownloadRingMode>
-            get() = passes.filter { it.publishNow }.map { it.ring.mode }
+            get() =
+                passes
+                    .filter {
+                        it.publishNow
+                    }
+                    .map {
+                        it.ring.mode
+                    }
 
-        fun advance(millis: Long) {
-            clock += millis
+        fun advance(
+            millis: Long,
+        ) {
+            clock +=
+                millis
         }
 
-        fun refresh(tasks: List<DownloadTaskProgress>): Pass {
-            val update = round.reduce(tasks, clock)
+        fun refresh(
+            tasks: List<DownloadTaskProgress>,
+        ): Pass {
+            val update =
+                round.reduce(
+                    tasks
+                )
+
+            val intervalElapsed =
+                lastPublishedAt
+                    ?.let {
+                        clock - it >=
+                                PUBLISH_INTERVAL_MILLIS
+                    }
+                    ?: true
+
+            val publishNow =
+                update.structural ||
+                        intervalElapsed
+
+            if (publishNow) {
+                lastPublishedAt =
+                    clock
+            }
+
             return Pass(
-                atMillis = clock,
-                structural = update.structural,
-                publishNow = update.publishNow,
-                ring = update.ring,
-                phases = tasks.map(DownloadTaskProgress::phase),
-            ).also(passes::add)
+                atMillis =
+                    clock,
+                structural =
+                    update.structural,
+                publishNow =
+                    publishNow,
+                ring =
+                    update.ring,
+                phases =
+                    tasks.map(
+                        DownloadTaskProgress::phase
+                    ),
+            ).also(
+                passes::add
+            )
+        }
+
+        private companion object {
+            const val PUBLISH_INTERVAL_MILLIS =
+                80L
         }
     }
 

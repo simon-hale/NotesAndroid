@@ -65,10 +65,10 @@ data class DownloadFailureResolution(
  */
 fun resolveDownloadFailureOutcome(
     storedPhase: DownloadPhase?,
-    supersededByLiveWork: Boolean,
+    superseded: Boolean,
 ): DownloadFailureOutcome = when {
     storedPhase == null -> DownloadFailureOutcome.MISSING
-    supersededByLiveWork -> DownloadFailureOutcome.SUPERSEDED
+    superseded -> DownloadFailureOutcome.SUPERSEDED
     storedPhase == DownloadPhase.FAILED -> DownloadFailureOutcome.ALREADY_FAILED
     storedPhase.isTransferring -> DownloadFailureOutcome.APPLIED
     else -> DownloadFailureOutcome.IGNORED_PHASE
@@ -327,29 +327,65 @@ class TransferStore(private val context: Context) {
      */
     suspend fun resolveDownloadFailure(
         transferId: String,
-        supersededByLiveWork: Boolean,
+        superseded: Boolean,
     ): DownloadFailureResolution {
-        var storedPhase: DownloadPhase? = null
-        var outcome = DownloadFailureOutcome.MISSING
+        var storedPhase: DownloadPhase? =
+            null
+
+        var outcome =
+            DownloadFailureOutcome.MISSING
 
         context.transfersDataStore.edit { preferences ->
-            val current = decodeDownloads(preferences[Keys.downloads])
-            val index = current.indexOfFirst { it.transferId == transferId }
-            val stored = current.getOrNull(index)
-
-            storedPhase = stored?.phase
-            outcome = resolveDownloadFailureOutcome(stored?.phase, supersededByLiveWork)
-
-            if (outcome == DownloadFailureOutcome.APPLIED && stored != null) {
-                preferences[Keys.downloads] = encodeDownloads(
-                    current.toMutableList().apply {
-                        this[index] = stored.failedAttemptIfRunning()
-                    }
+            val current =
+                decodeDownloads(
+                    preferences[Keys.downloads]
                 )
+
+            val index =
+                current.indexOfFirst {
+                    it.transferId ==
+                            transferId
+                }
+
+            val stored =
+                current.getOrNull(
+                    index
+                )
+
+            storedPhase =
+                stored?.phase
+
+            outcome =
+                resolveDownloadFailureOutcome(
+                    storedPhase =
+                        stored?.phase,
+                    superseded =
+                        superseded,
+                )
+
+            if (
+                outcome ==
+                DownloadFailureOutcome.APPLIED &&
+                stored != null
+            ) {
+                preferences[Keys.downloads] =
+                    encodeDownloads(
+                        current
+                            .toMutableList()
+                            .apply {
+                                this[index] =
+                                    stored.failedAttemptIfRunning()
+                            }
+                    )
             }
         }
 
-        return DownloadFailureResolution(outcome = outcome, storedPhase = storedPhase)
+        return DownloadFailureResolution(
+            outcome =
+                outcome,
+            storedPhase =
+                storedPhase,
+        )
     }
 
     suspend fun removeDownload(transferId: String): DownloadTransfer? =

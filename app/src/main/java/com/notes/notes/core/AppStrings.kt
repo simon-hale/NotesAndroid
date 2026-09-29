@@ -231,6 +231,10 @@ data class TransferStrings(
     val downloadRingPaused: String,
     /** Accessibility state without any download to show. */
     val downloadRingIdle: String,
+    /** Accessibility hint for an unread newly-created download. */
+    val downloadDrawerNewIndicator: String,
+    /** Accessibility hint for an unread failed download. */
+    val downloadDrawerFailedIndicator: String,
 )
 
 data class AppStrings(
@@ -490,6 +494,8 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             downloadRingIndeterminate = "正在下载，文件大小未知",
             downloadRingPaused = "全部暂停",
             downloadRingIdle = "无下载任务",
+            downloadDrawerNewIndicator = "有新的下载任务",
+            downloadDrawerFailedIndicator = "有下载任务失败",
         ),
     )
 
@@ -704,6 +710,8 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             downloadRingIndeterminate = "Downloading, file size unknown",
             downloadRingPaused = "All paused",
             downloadRingIdle = "No downloads",
+            downloadDrawerNewIndicator = "New download added",
+            downloadDrawerFailedIndicator = "A download failed",
         ),
     )
 }

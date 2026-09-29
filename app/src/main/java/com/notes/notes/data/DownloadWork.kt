@@ -16,8 +16,6 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 data class EnqueuedDownloadBatch(
-    val workIds: Set<UUID>,
-    val transferIds: Set<String>,
     val workIdByTransferId: Map<String, UUID>,
 )
 
@@ -112,8 +110,6 @@ object DownloadWork {
             )
         }
         return EnqueuedDownloadBatch(
-            workIds = workIdByTransferId.values.toSet(),
-            transferIds = workIdByTransferId.keys.toSet(),
             workIdByTransferId = workIdByTransferId.toMap(),
         )
     }

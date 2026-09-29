@@ -21,7 +21,6 @@ import com.notes.notes.core.DownloadTransfer
 import com.notes.notes.core.TransferNotice
 import com.notes.notes.core.stringsFor
 import kotlinx.coroutines.CancellationException
-import com.notes.notes.core.DownloadPhase
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext

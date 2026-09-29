@@ -147,32 +147,51 @@ internal class DownloadFailureChain(initial: DownloadTransfer) {
      */
     fun applyWorkResult(
         watchedWhileRunning: Boolean,
-        supersededByLiveWork: Boolean = false,
+        superseded: Boolean = false,
     ): FailureReport {
-        val stored = records.firstOrNull()
-        val outcome = resolveDownloadFailureOutcome(
-            storedPhase = stored?.phase,
-            supersededByLiveWork = supersededByLiveWork,
-        )
+        val stored =
+            records.firstOrNull()
+
+        val outcome =
+            resolveDownloadFailureOutcome(
+                storedPhase =
+                    stored?.phase,
+                superseded =
+                    superseded,
+            )
 
         when (outcome) {
-            DownloadFailureOutcome.APPLIED -> update { it.failedAttemptIfRunning() }
+            DownloadFailureOutcome.APPLIED ->
+                update {
+                    it.failedAttemptIfRunning()
+                }
 
             DownloadFailureOutcome.ALREADY_FAILED,
             DownloadFailureOutcome.IGNORED_PHASE,
-            -> mirror = stored
+                ->
+                mirror =
+                    stored
 
-            DownloadFailureOutcome.MISSING -> mirror = null
+            DownloadFailureOutcome.MISSING ->
+                mirror =
+                    null
 
-            DownloadFailureOutcome.SUPERSEDED -> Unit
+            DownloadFailureOutcome.SUPERSEDED ->
+                Unit
         }
 
         val ownsFailure =
-            outcome == DownloadFailureOutcome.APPLIED || outcome == DownloadFailureOutcome.ALREADY_FAILED
+            outcome ==
+                    DownloadFailureOutcome.APPLIED ||
+                    outcome ==
+                    DownloadFailureOutcome.ALREADY_FAILED
 
         return FailureReport(
-            outcome = outcome,
-            reported = ownsFailure && watchedWhileRunning,
+            outcome =
+                outcome,
+            reported =
+                ownsFailure &&
+                        watchedWhileRunning,
         )
     }
 

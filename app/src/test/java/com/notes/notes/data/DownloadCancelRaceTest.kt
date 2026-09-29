@@ -185,9 +185,9 @@ class DownloadCancelRaceTest {
         chain.attemptPublishedProgress(downloadedBytes = 40_000L, totalBytes = 100_000L)
 
         val report = chain.applyWorkResult(
-            watchedWhileRunning = true,
-            supersededByLiveWork = true,
-        )
+                watchedWhileRunning = true,
+                superseded = true,
+            )
 
         assertEquals(DownloadFailureOutcome.SUPERSEDED, report.outcome)
         assertFalse(report.applied)
