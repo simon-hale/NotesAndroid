@@ -128,14 +128,12 @@ class DownloadRoundProgress {
     fun onTaskCancelled(transferId: String) {
         pendingStructuralChange = true
         members.remove(transferId)
-        roundRevision++
     }
 
     fun reset() {
         members.clear()
         roundLoadedBytes = 0L
         roundTotalBytes = 0L
-        roundRevision++
         ring = DownloadRingState.Hidden
         pendingStructuralChange = false
     }

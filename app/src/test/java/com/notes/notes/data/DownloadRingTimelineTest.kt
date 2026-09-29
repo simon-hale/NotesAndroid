@@ -13,8 +13,9 @@ import org.junit.Test
  *
  * Every test replays a real sequence — write a phase, refresh the projection, hand a WorkManager
  * snapshot in, observe a terminal outcome — through the production projection rule
- * ([downloadTaskProgress]) and the production publish policy ([DownloadRoundProgress]), and then
- * asserts what the user sees over time: which ring, and above all which ring was published *first*.
+ * ([downloadTaskProgress]), round accounting ([DownloadRoundProgress]), and the ViewModel-style
+ * publish policy, and then assert what the user sees over time: which ring, and above all which ring
+ * was published *first*.
  */
 class DownloadRingTimelineTest {
 
@@ -33,7 +34,6 @@ class DownloadRingTimelineTest {
             mutableListOf<Pass>()
 
         data class Pass(
-            val atMillis: Long,
             val structural: Boolean,
             val publishNow: Boolean,
             val ring: DownloadRingState,
@@ -92,8 +92,6 @@ class DownloadRingTimelineTest {
             }
 
             return Pass(
-                atMillis =
-                    clock,
                 structural =
                     update.structural,
                 publishNow =
