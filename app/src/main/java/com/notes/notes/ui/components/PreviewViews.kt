@@ -16,14 +16,10 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -41,76 +37,251 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 @Composable
-fun HtmlPreviewView(html: String, modifier: Modifier = Modifier) {
-    val holder = remember { HtmlPreviewWebViewHolder() }
-    DisposableEffect(holder) {
-        onDispose { holder.release() }
-    }
+fun HtmlPreviewView(
+    html: String,
+    active: Boolean,
+    modifier: Modifier = Modifier,
+) {
     AndroidView(
         modifier = modifier,
+
         factory = { context ->
             WebView(context).apply {
-                settings.javaScriptEnabled = false
-                settings.loadsImagesAutomatically = true
-                settings.allowFileAccess = false
-                settings.domStorageEnabled = false
-                settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                settings.builtInZoomControls = true
-                settings.displayZoomControls = false
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                webChromeClient = WebChromeClient()
-                webViewClient = WebViewClient()
-                holder.webView = this
+                settings.javaScriptEnabled =
+                    false
+
+                settings.loadsImagesAutomatically =
+                    true
+
+                settings.allowFileAccess =
+                    false
+
+                settings.domStorageEnabled =
+                    false
+
+                settings.cacheMode =
+                    WebSettings.LOAD_NO_CACHE
+
+                settings.builtInZoomControls =
+                    true
+
+                settings.displayZoomControls =
+                    false
+
+                setBackgroundColor(
+                    android.graphics.Color.TRANSPARENT
+                )
+
+                webChromeClient =
+                    WebChromeClient()
+
+                webViewClient =
+                    WebViewClient()
             }
         },
+
+        /*
+         * Keep support for AndroidView reuse if the surrounding lazy
+         * container ever decides to recycle this node.
+         */
+        onReset = { webView ->
+            webView.onPause()
+        },
+
         update = { webView ->
-            webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+            /*
+             * The Reading page remains composed inside HorizontalPager even
+             * while another tab is visible. Pause WebView work while hidden.
+             */
+            if (active) {
+                webView.onResume()
+            } else {
+                webView.onPause()
+            }
+
+            /*
+             * Compare String CONTENT rather than object identity.
+             *
+             * `!==` can reload an equal HTML document merely because a new
+             * String instance was produced.
+             */
+            if (
+                webView.tag != html
+            ) {
+                webView.tag =
+                    html
+
+                webView.loadDataWithBaseURL(
+                    null,
+                    html,
+                    "text/html",
+                    "utf-8",
+                    null,
+                )
+            }
+        },
+
+        onRelease = { webView ->
+            webView.tag =
+                null
+
+            webView.stopLoading()
+            webView.onPause()
+            webView.clearHistory()
+            webView.removeAllViews()
+            webView.destroy()
         },
     )
 }
 
 @Composable
-fun PdfPreviewView(filePath: String, pageCount: Int, modifier: Modifier = Modifier) {
-    val holder = remember(filePath) { PdfRendererHolder(File(filePath)) }
-    DisposableEffect(holder) {
-        onDispose { holder.close() }
-    }
-    val configuration = LocalConfiguration.current
-    val density = LocalDensity.current
-    val targetWidthPx = remember(configuration.screenWidthDp, density) {
-        with(density) { (configuration.screenWidthDp.dp - 32.dp).roundToPx() }
-    }
-    LazyColumn(
-        modifier = modifier,
-        contentPadding = PaddingValues(0.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        items(count = pageCount, key = { it }) { pageIndex ->
-            val bitmap = produceState<Bitmap?>(initialValue = null, filePath, pageIndex, targetWidthPx) {
-                value = withContext(Dispatchers.IO) {
-                    holder.render(pageIndex, targetWidthPx)
+fun PdfPreviewView(
+    filePath: String,
+    pageCount: Int,
+    modifier: Modifier = Modifier,
+) {
+    /*
+     * Opening ParcelFileDescriptor / PdfRenderer no longer happens during
+     * the main-thread composition that enters the Reading tab.
+     */
+    val holder =
+        produceState<PdfRendererHolder?>(
+            initialValue = null,
+            key1 = filePath,
+        ) {
+            val openedHolder =
+                withContext(
+                    Dispatchers.IO
+                ) {
+                    PdfRendererHolder(
+                        File(filePath)
+                    )
                 }
-            }.value
+
+            value =
+                openedHolder
+
+            /*
+             * Dispose when this particular PDF producer is permanently
+             * replaced or removed.
+             */
+            awaitDispose {
+                openedHolder.close()
+            }
+        }.value
+
+    /*
+     * The lightweight Reading shell can already be displayed while the
+     * document resource is opening in the IO dispatcher.
+     */
+    if (holder == null) {
+        Box(
+            modifier =
+                modifier.fillMaxSize(),
+            contentAlignment =
+                Alignment.Center,
+        ) {
+            CircularProgressIndicator()
+        }
+
+        return
+    }
+
+    val configuration =
+        LocalConfiguration.current
+
+    val density =
+        LocalDensity.current
+
+    val targetWidthPx =
+        remember(
+            configuration.screenWidthDp,
+            density,
+        ) {
+            with(density) {
+                (
+                        configuration
+                            .screenWidthDp
+                            .dp -
+                                32.dp
+                        )
+                    .roundToPx()
+            }
+        }
+
+    LazyColumn(
+        modifier =
+            modifier,
+        contentPadding =
+            PaddingValues(0.dp),
+        verticalArrangement =
+            Arrangement.spacedBy(8.dp),
+    ) {
+        items(
+            count =
+                pageCount,
+            key = { pageIndex ->
+                "$filePath:$pageIndex"
+            },
+        ) { pageIndex ->
+            val bitmap =
+                produceState<Bitmap?>(
+                    initialValue = null,
+                    filePath,
+                    pageIndex,
+                    targetWidthPx,
+                ) {
+                    value =
+                        withContext(
+                            Dispatchers.IO
+                        ) {
+                            holder.render(
+                                pageIndex =
+                                    pageIndex,
+                                targetWidthPx =
+                                    targetWidthPx,
+                            )
+                        }
+                }.value
+
             Surface(
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
-                color = Color.White,
-                border = BorderStroke(1.dp, LocalNotesExtraColors.current.borderStrong),
+                shape =
+                    androidx.compose
+                        .foundation
+                        .shape
+                        .RoundedCornerShape(
+                            14.dp
+                        ),
+                color =
+                    Color.White,
+                border =
+                    BorderStroke(
+                        1.dp,
+                        LocalNotesExtraColors
+                            .current
+                            .borderStrong,
+                    ),
             ) {
                 if (bitmap == null) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(200.dp),
-                        contentAlignment = Alignment.Center,
+                        contentAlignment =
+                            Alignment.Center,
                     ) {
                         CircularProgressIndicator()
                     }
                 } else {
                     Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxWidth(),
-                        contentScale = ContentScale.FillWidth,
+                        bitmap =
+                            bitmap.asImageBitmap(),
+                        contentDescription =
+                            null,
+                        modifier =
+                            Modifier.fillMaxWidth(),
+                        contentScale =
+                            ContentScale.FillWidth,
                     )
                 }
             }
@@ -154,20 +325,5 @@ private class PdfRendererHolder(private val file: File) {
         }
         renderer.close()
         descriptor.close()
-    }
-}
-
-private class HtmlPreviewWebViewHolder {
-    var webView: WebView? = null
-
-    fun release() {
-        webView?.apply {
-            stopLoading()
-            loadUrl("about:blank")
-            clearHistory()
-            removeAllViews()
-            destroy()
-        }
-        webView = null
     }
 }

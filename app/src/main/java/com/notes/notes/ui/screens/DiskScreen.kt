@@ -64,6 +64,19 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.foundation.layout.height
+import androidx.compose.runtime.snapshotFlow
 import com.notes.notes.core.AppLanguage
 import com.notes.notes.core.AppStrings
 import com.notes.notes.core.AppTab
@@ -104,6 +117,7 @@ import com.notes.notes.ui.components.SelectionCheck
 import com.notes.notes.ui.components.StatusCard
 import com.notes.notes.ui.theme.LocalNotesExtraColors
 import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.distinctUntilChanged
 import com.notes.notes.ui.components.IconBubble
 
 @Composable
@@ -177,66 +191,144 @@ fun DiskScreen(
                 .padding(horizontal = 16.dp),
             contentPadding = PaddingValues(
                 top = 16.dp,
-                bottom = contentBottomPadding + viewportExtension,
+                bottom =
+                    contentBottomPadding +
+                            viewportExtension,
             ),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+
+            /*
+             * Major sections add their own 12dp gaps below.
+             * File/directory rows themselves must have zero LazyColumn spacing
+             * so they continue to look like one continuous SectionListCard.
+             */
+            verticalArrangement =
+                Arrangement.Top,
         ) {
-            item {
+            item(
+                key = "disk-header",
+            ) {
                 ScreenHeader(
                     title = strings.nav.disk,
                     trailing = {
-                        if (uiState.disk.downloadTransfers.isNotEmpty()) {
+                        if (
+                            uiState.disk.downloadTransfers
+                                .isNotEmpty()
+                        ) {
                             DownloadTransfersActionChip(
-                                ring = uiState.disk.downloadRing,
-                                indicator = uiState.disk.downloadDrawerIndicator,
-                                language = uiState.settings.language,
-                                strings = strings,
+                                ring =
+                                    uiState.disk.downloadRing,
+                                indicator =
+                                    uiState.disk
+                                        .downloadDrawerIndicator,
+                                language =
+                                    uiState.settings.language,
+                                strings =
+                                    strings,
                                 onClick = {
-                                    viewModel.clearDownloadDrawerIndicator()
-                                    downloadTransfersSheetVisible = true
+                                    viewModel
+                                        .clearDownloadDrawerIndicator()
+
+                                    downloadTransfersSheetVisible =
+                                        true
                                 },
                             )
                         }
 
                         ActionChip(
-                            icon = Icons.Outlined.Inventory2,
+                            icon =
+                                Icons.Outlined.Inventory2,
                             onClick = {
-                                downloadedFilesSheetVisible = true
-                                viewModel.loadDownloadedFiles()
+                                downloadedFilesSheetVisible =
+                                    true
+
+                                viewModel
+                                    .loadDownloadedFiles()
                             },
                         )
 
                         ActionChip(
-                            icon = diskThemeModeIcon(uiState.settings.theme.mode),
-                            onClick = viewModel::toggleThemeMode,
+                            icon =
+                                diskThemeModeIcon(
+                                    uiState.settings.theme.mode
+                                ),
+                            onClick =
+                                viewModel::toggleThemeMode,
                         )
                     },
                 )
             }
 
-            item {
+            item(
+                key = "disk-header-gap",
+            ) {
+                Spacer(
+                    modifier =
+                        Modifier.height(12.dp)
+                )
+            }
+
+            item(
+                key = "disk-controls",
+            ) {
                 GlassPanel {
                     Column(
-                        modifier = Modifier.padding(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(
+                            start = 16.dp,
+                            top = 12.dp,
+                            end = 16.dp,
+                            bottom = 16.dp,
+                        ),
+                        verticalArrangement =
+                            Arrangement.spacedBy(8.dp),
                     ) {
                         BreadcrumbBar(
-                            paths = uiState.disk.paths,
-                            rootLabel = strings.fileDisk.root,
-                            onOpenRoot = viewModel::openRootDirectory,
-                            onPathClick = viewModel::jumpToPath,
+                            paths =
+                                uiState.disk.paths,
+                            rootLabel =
+                                strings.fileDisk.root,
+                            onOpenRoot =
+                                viewModel::openRootDirectory,
+                            onPathClick =
+                                viewModel::jumpToPath,
                         )
+
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
+                            modifier =
+                                Modifier.fillMaxWidth(),
+                            horizontalArrangement =
+                                Arrangement.End,
                         ) {
                             Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement =
+                                    Arrangement.spacedBy(8.dp),
+                                verticalAlignment =
+                                    Alignment.CenterVertically,
                             ) {
-                                ActionChip(icon = Icons.Outlined.UploadFile, onClick = { uploadSheetVisible = true })
-                                ActionChip(icon = Icons.Outlined.SwapVert, onClick = { sortSheetVisible = true })
-                                ActionChip(icon = Icons.Outlined.Refresh, onClick = viewModel::refreshCurrentDirectory)
+                                ActionChip(
+                                    icon =
+                                        Icons.Outlined.UploadFile,
+                                    onClick = {
+                                        uploadSheetVisible =
+                                            true
+                                    },
+                                )
+
+                                ActionChip(
+                                    icon =
+                                        Icons.Outlined.SwapVert,
+                                    onClick = {
+                                        sortSheetVisible =
+                                            true
+                                    },
+                                )
+
+                                ActionChip(
+                                    icon =
+                                        Icons.Outlined.Refresh,
+                                    onClick =
+                                        viewModel::
+                                        refreshCurrentDirectory,
+                                )
                             }
                         }
                     }
@@ -244,77 +336,254 @@ fun DiskScreen(
             }
 
             if (!uiState.session.isLoggedIn) {
-                item {
+                item(
+                    key = "disk-login-gap",
+                ) {
+                    Spacer(
+                        modifier =
+                            Modifier.height(12.dp)
+                    )
+                }
+
+                item(
+                    key = "disk-login-reminder",
+                ) {
                     LoginReminderCard(
-                        message = strings.auth.loginFirst,
-                        actionLabel = strings.common.login,
-                        onAction = { viewModel.setCurrentTab(AppTab.ACCOUNT) },
+                        message =
+                            strings.auth.loginFirst,
+                        actionLabel =
+                            strings.common.login,
+                        onAction = {
+                            viewModel.setCurrentTab(
+                                AppTab.ACCOUNT
+                            )
+                        },
                     )
                 }
             } else {
                 when {
-                    uiState.disk.errorMessage.isNotBlank() -> {
-                        item {
+                    uiState.disk.errorMessage
+                        .isNotBlank() -> {
+
+                        item(
+                            key = "disk-status-gap",
+                        ) {
+                            Spacer(
+                                modifier =
+                                    Modifier.height(12.dp)
+                            )
+                        }
+
+                        item(
+                            key = "disk-error",
+                        ) {
                             StatusCard(
-                                title = strings.fileDisk.directoryLoadFailed,
-                                body = uiState.disk.errorMessage,
-                                actionLabel = strings.common.retry,
-                                onAction = viewModel::refreshCurrentDirectory,
+                                title =
+                                    strings.fileDisk
+                                        .directoryLoadFailed,
+                                body =
+                                    uiState.disk.errorMessage,
+                                actionLabel =
+                                    strings.common.retry,
+                                onAction =
+                                    viewModel::
+                                    refreshCurrentDirectory,
                             )
                         }
                     }
 
                     uiState.disk.isLoading -> {
-                        item {
-                            LoadingCard(strings.fileDisk.directoryLoading)
+                        item(
+                            key = "disk-status-gap",
+                        ) {
+                            Spacer(
+                                modifier =
+                                    Modifier.height(12.dp)
+                            )
+                        }
+
+                        item(
+                            key = "disk-loading",
+                        ) {
+                            LoadingCard(
+                                strings.fileDisk
+                                    .directoryLoading
+                            )
                         }
                     }
 
-                    uiState.disk.statusMessage.isNotBlank() &&
-                        uiState.disk.directories.isEmpty() &&
-                        uiState.disk.files.isEmpty() -> {
-                        item {
+                    uiState.disk.statusMessage
+                        .isNotBlank() &&
+                            uiState.disk.directories
+                                .isEmpty() &&
+                            uiState.disk.files
+                                .isEmpty() -> {
+
+                        item(
+                            key = "disk-status-gap",
+                        ) {
+                            Spacer(
+                                modifier =
+                                    Modifier.height(12.dp)
+                            )
+                        }
+
+                        item(
+                            key = "disk-empty",
+                        ) {
                             StatusCard(
-                                title = strings.fileDisk.directoryEmpty,
-                                body = strings.reading.refreshHint,
+                                title =
+                                    strings.fileDisk
+                                        .directoryEmpty,
+                                body =
+                                    strings.reading
+                                        .refreshHint,
                             )
                         }
                     }
                 }
 
-                if (!uiState.disk.isLoading && (uiState.disk.directories.isNotEmpty() || uiState.disk.files.isNotEmpty())) {
-                    item {
-                        SectionListCard {
-                            uiState.disk.directories.forEachIndexed { index, directory ->
-                                DirectoryCard(
-                                    directory = directory,
-                                    onOpen = { viewModel.openDirectory(directory) },
-                                    onRename = {
-                                        renameDirectoryTarget = directory
-                                        renameDraft = directory.name
-                                    },
-                                    onDelete = { deleteDirectoryTarget = directory },
-                                )
-                                if (index < uiState.disk.directories.lastIndex || uiState.disk.files.isNotEmpty()) {
-                                    SectionDivider()
-                                }
-                            }
-                            uiState.disk.files.forEachIndexed { index, file ->
-                                FileCard(
-                                    file = file,
-                                    selected = uiState.reading.selectedFile?.id == file.id,
-                                    onSelect = { viewModel.selectReadingFile(file) },
-                                    onRename = {
-                                        renameFileTarget = file
-                                        renameDraft = file.name
-                                    },
-                                    onDelete = { deleteFileTarget = file },
-                                    onDownload = { viewModel.downloadFile(file) },
-                                )
-                                if (index < uiState.disk.files.lastIndex) {
-                                    SectionDivider()
-                                }
-                            }
+                val hasEntries =
+                    !uiState.disk.isLoading &&
+                            (
+                                    uiState.disk.directories
+                                        .isNotEmpty() ||
+                                            uiState.disk.files
+                                                .isNotEmpty()
+                                    )
+
+                if (hasEntries) {
+                    item(
+                        key = "disk-entry-gap",
+                    ) {
+                        Spacer(
+                            modifier =
+                                Modifier.height(12.dp)
+                        )
+                    }
+
+                    val directoryCount =
+                        uiState.disk.directories.size
+
+                    val totalEntryCount =
+                        directoryCount +
+                                uiState.disk.files.size
+
+                    itemsIndexed(
+                        items =
+                            uiState.disk.directories,
+                        key = {
+                                _,
+                                directory,
+                            ->
+                            "directory-${directory.id}"
+                        },
+                        contentType = {
+                                _,
+                                _,
+                            ->
+                            "disk-directory"
+                        },
+                    ) {
+                            index,
+                            directory,
+                        ->
+
+                        DiskLazyEntryContainer(
+                            globalIndex = index,
+                            totalCount =
+                                totalEntryCount,
+                        ) {
+                            DirectoryCard(
+                                directory =
+                                    directory,
+                                onOpen = {
+                                    viewModel
+                                        .openDirectory(
+                                            directory
+                                        )
+                                },
+                                onRename = {
+                                    renameDirectoryTarget =
+                                        directory
+
+                                    renameDraft =
+                                        directory.name
+                                },
+                                onDelete = {
+                                    deleteDirectoryTarget =
+                                        directory
+                                },
+                            )
+                        }
+                    }
+
+                    /*
+                     * Files continue directly after directories in the same
+                     * visual card, but are independently lazy.
+                     */
+                    itemsIndexed(
+                        items =
+                            uiState.disk.files,
+                        key = {
+                                _,
+                                file,
+                            ->
+                            "file-${file.id}"
+                        },
+                        contentType = {
+                                _,
+                                _,
+                            ->
+                            "disk-file"
+                        },
+                    ) {
+                            index,
+                            file,
+                        ->
+
+                        val globalIndex =
+                            directoryCount +
+                                    index
+
+                        DiskLazyEntryContainer(
+                            globalIndex =
+                                globalIndex,
+                            totalCount =
+                                totalEntryCount,
+                        ) {
+                            FileCard(
+                                file =
+                                    file,
+                                selected =
+                                    uiState.reading
+                                        .selectedFile
+                                        ?.id ==
+                                            file.id,
+                                onSelect = {
+                                    viewModel
+                                        .selectReadingFile(
+                                            file
+                                        )
+                                },
+                                onRename = {
+                                    renameFileTarget =
+                                        file
+
+                                    renameDraft =
+                                        file.name
+                                },
+                                onDelete = {
+                                    deleteFileTarget =
+                                        file
+                                },
+                                onDownload = {
+                                    viewModel
+                                        .downloadFile(
+                                            file
+                                        )
+                                },
+                            )
                         }
                     }
                 }
@@ -682,6 +951,199 @@ private fun downloadRingDescription(
 
     DownloadRingMode.HIDDEN -> strings.transfers.downloadRingIdle
 }
+
+/*
+ * One lazy row of the directory/file group.
+ *
+ * Every row is independently lazy while adjacent rows visually join into
+ * the same rounded SectionListCard used by the previous eager implementation.
+ */
+@Composable
+private fun DiskLazyEntryContainer(
+    globalIndex: Int,
+    totalCount: Int,
+    content: @Composable () -> Unit,
+) {
+    if (totalCount <= 0) {
+        return
+    }
+
+    val isFirst =
+        globalIndex == 0
+
+    val isLast =
+        globalIndex ==
+                totalCount - 1
+
+    val shape =
+        remember(
+            isFirst,
+            isLast,
+        ) {
+            when {
+                isFirst && isLast -> {
+                    RoundedCornerShape(
+                        24.dp
+                    )
+                }
+
+                isFirst -> {
+                    RoundedCornerShape(
+                        topStart = 24.dp,
+                        topEnd = 24.dp,
+                        bottomEnd = 0.dp,
+                        bottomStart = 0.dp,
+                    )
+                }
+
+                isLast -> {
+                    RoundedCornerShape(
+                        topStart = 0.dp,
+                        topEnd = 0.dp,
+                        bottomEnd = 24.dp,
+                        bottomStart = 24.dp,
+                    )
+                }
+
+                else -> {
+                    RoundedCornerShape(
+                        0.dp
+                    )
+                }
+            }
+        }
+
+    val extraColors =
+        LocalNotesExtraColors.current
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .diskGroupedEntrySurface(
+                shape = shape,
+                backgroundColor =
+                    extraColors.panelTop,
+                borderColor =
+                    extraColors.borderStrong,
+                keepTopBorder =
+                    isFirst,
+                keepBottomBorder =
+                    isLast,
+            )
+            .padding(
+                top =
+                    if (isFirst) {
+                        4.dp
+                    } else {
+                        0.dp
+                    },
+                bottom =
+                    if (isLast) {
+                        4.dp
+                    } else {
+                        0.dp
+                    },
+            ),
+    ) {
+        content()
+
+        if (!isLast) {
+            SectionDivider()
+        }
+    }
+}
+
+private fun Modifier.diskGroupedEntrySurface(
+    shape: Shape,
+    backgroundColor: Color,
+    borderColor: Color,
+    keepTopBorder: Boolean,
+    keepBottomBorder: Boolean,
+): Modifier =
+    this
+        .clip(shape)
+        .background(
+            color =
+                backgroundColor,
+            shape =
+                shape,
+        )
+        .drawWithCache {
+            val strokeWidth =
+                1.dp.toPx()
+
+            val coverHeight =
+                strokeWidth * 2f
+
+            val outline =
+                shape.createOutline(
+                    size =
+                        size,
+                    layoutDirection =
+                        layoutDirection,
+                    density =
+                        this,
+                )
+
+            val stroke =
+                Stroke(
+                    width =
+                        strokeWidth
+                )
+
+            onDrawBehind {
+                drawOutline(
+                    outline =
+                        outline,
+                    color =
+                        borderColor,
+                    style =
+                        stroke,
+                )
+
+                if (!keepTopBorder) {
+                    drawRect(
+                        color =
+                            backgroundColor,
+                        topLeft =
+                            Offset.Zero,
+                        size =
+                            Size(
+                                width =
+                                    size.width,
+                                height =
+                                    coverHeight,
+                            ),
+                    )
+                }
+
+                if (!keepBottomBorder) {
+                    drawRect(
+                        color =
+                            backgroundColor,
+                        topLeft =
+                            Offset(
+                                x = 0f,
+                                y =
+                                    (
+                                            size.height -
+                                                    coverHeight
+                                            )
+                                        .coerceAtLeast(
+                                            0f
+                                        ),
+                            ),
+                        size =
+                            Size(
+                                width =
+                                    size.width,
+                                height =
+                                    coverHeight,
+                            ),
+                    )
+                }
+            }
+        }
 
 @Composable
 private fun DirectoryCard(
@@ -1666,40 +2128,122 @@ private fun resolveUploadCandidate(context: android.content.Context, uri: Uri): 
     }
 }
 
+private data class LazyViewportSnapshot(
+    val isAtTop: Boolean,
+    val totalItemsCount: Int,
+    val lastVisibleIndex: Int?,
+    val lastVisibleOffset: Int?,
+    val lastVisibleSize: Int?,
+)
+
 @Composable
 private fun rememberLazyViewportExtensionPadding(
     listState: LazyListState,
     viewportHeight: Dp,
     contentKey: Any,
 ): Dp {
-    val density = LocalDensity.current
-    val viewportHeightPx = remember(density, viewportHeight) {
-        with(density) { viewportHeight.roundToPx() }
-    }
-    var extensionPx by remember(contentKey, viewportHeightPx) { mutableStateOf(0) }
-    val layoutInfo = listState.layoutInfo
-    val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
-    val isAtTop = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0
+    val density =
+        LocalDensity.current
 
-    LaunchedEffect(
+    val viewportHeightPx =
+        remember(
+            density,
+            viewportHeight,
+        ) {
+            with(density) {
+                viewportHeight.roundToPx()
+            }
+        }
+
+    var extensionPx by
+    remember(
         contentKey,
         viewportHeightPx,
-        isAtTop,
-        layoutInfo.totalItemsCount,
-        lastVisibleItem?.index,
-        lastVisibleItem?.offset,
-        lastVisibleItem?.size,
     ) {
-        if (!isAtTop || lastVisibleItem == null || layoutInfo.totalItemsCount == 0) {
-            return@LaunchedEffect
-        }
-        if (lastVisibleItem.index == layoutInfo.totalItemsCount - 1) {
-            extensionPx = (viewportHeightPx - (lastVisibleItem.offset + lastVisibleItem.size)).coerceAtLeast(0)
-        }
+        mutableStateOf(0)
     }
 
-    return remember(density, extensionPx) {
-        with(density) { extensionPx.toDp() }
+    /*
+     * LazyListState.layoutInfo and scroll position are observable and can
+     * change on every scroll/layout pass.
+     *
+     * Reading them directly during composition would cause DiskScreen to
+     * recompose continuously while scrolling. Observe them as a side effect
+     * instead.
+     */
+    LaunchedEffect(
+        listState,
+        contentKey,
+        viewportHeightPx,
+    ) {
+        snapshotFlow {
+            val layoutInfo =
+                listState.layoutInfo
+
+            val lastVisibleItem =
+                layoutInfo
+                    .visibleItemsInfo
+                    .lastOrNull()
+
+            LazyViewportSnapshot(
+                isAtTop =
+                    listState.firstVisibleItemIndex == 0 &&
+                            listState.firstVisibleItemScrollOffset == 0,
+                totalItemsCount =
+                    layoutInfo.totalItemsCount,
+                lastVisibleIndex =
+                    lastVisibleItem?.index,
+                lastVisibleOffset =
+                    lastVisibleItem?.offset,
+                lastVisibleSize =
+                    lastVisibleItem?.size,
+            )
+        }
+            .distinctUntilChanged()
+            .collect { snapshot ->
+                if (
+                    !snapshot.isAtTop ||
+                    snapshot.totalItemsCount == 0
+                ) {
+                    return@collect
+                }
+
+                val lastIndex =
+                    snapshot.lastVisibleIndex
+                        ?: return@collect
+
+                val lastOffset =
+                    snapshot.lastVisibleOffset
+                        ?: return@collect
+
+                val lastSize =
+                    snapshot.lastVisibleSize
+                        ?: return@collect
+
+                if (
+                    lastIndex ==
+                    snapshot.totalItemsCount - 1
+                ) {
+                    extensionPx =
+                        (
+                                viewportHeightPx -
+                                        (
+                                                lastOffset +
+                                                        lastSize
+                                                )
+                                )
+                            .coerceAtLeast(0)
+                }
+            }
+    }
+
+    return remember(
+        density,
+        extensionPx,
+    ) {
+        with(density) {
+            extensionPx.toDp()
+        }
     }
 }
 

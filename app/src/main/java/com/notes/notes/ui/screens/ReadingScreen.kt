@@ -153,7 +153,11 @@ fun ReadingScreen(uiState: NotesUiState, viewModel: NotesAppViewModel) {
                             val content = uiState.reading.content as PreviewContent.Html
                             HtmlPreviewView(
                                 html = content.html,
-                                modifier = Modifier.fillMaxSize(),
+                                active =
+                                    uiState.currentTab ==
+                                            AppTab.READING,
+                                modifier =
+                                    Modifier.fillMaxSize(),
                             )
                         }
 

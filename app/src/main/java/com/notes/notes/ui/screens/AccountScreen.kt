@@ -1,22 +1,18 @@
 package com.notes.notes.ui.screens
 
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.BrightnessAuto
 import androidx.compose.material.icons.outlined.DarkMode
@@ -47,6 +43,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import com.notes.notes.core.AppLanguage
 import com.notes.notes.core.NotesUiState
 import com.notes.notes.core.SettingsSubPage
@@ -75,231 +74,540 @@ fun AccountScreen(
     viewModel: NotesAppViewModel,
     contentBottomPadding: Dp,
 ) {
-    val strings = stringsFor(uiState.settings.language)
-    var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
-    var showLogoutAllConfirm by rememberSaveable { mutableStateOf(false) }
-    var deleteCurPassword by rememberSaveable { mutableStateOf("") }
-    val scrollState = rememberScrollState()
-    val showingAccountDetails =
-        uiState.session.isLoggedIn && uiState.settingsSubPage == SettingsSubPage.ACCOUNT
+    val strings =
+        stringsFor(
+            uiState.settings.language
+        )
 
-    BoxWithConstraints(
+    var showDeleteConfirm by
+    rememberSaveable {
+        mutableStateOf(false)
+    }
+
+    var showLogoutAllConfirm by
+    rememberSaveable {
+        mutableStateOf(false)
+    }
+
+    var deleteCurPassword by
+    rememberSaveable {
+        mutableStateOf("")
+    }
+
+    /*
+     * Lazy list state is saveable and therefore works naturally with the
+     * SaveableStateProvider used by NotesApp for each tab.
+     */
+    val listState =
+        rememberLazyListState()
+
+    val showingAccountDetails =
+        uiState.session.isLoggedIn &&
+                uiState.settingsSubPage ==
+                SettingsSubPage.ACCOUNT
+
+    /*
+     * Top-level Account content is now truly lazy.
+     *
+     * Only the cards close to the visible viewport are composed and measured.
+     * Individual small option groups inside each SettingsCard stay eager,
+     * which avoids nested lazy scrolling and keeps the original UI structure.
+     */
+    LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding()
             .imePadding()
+            .padding(horizontal = 16.dp),
+        contentPadding = PaddingValues(
+            top = 16.dp,
+            bottom = contentBottomPadding,
+        ),
+        verticalArrangement =
+            Arrangement.spacedBy(12.dp),
     ) {
-        val viewportHeight = maxHeight
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 16.dp)
-                .verticalScroll(scrollState),
+        item(
+            key = "account-header",
+            contentType = "header",
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = viewportHeight + contentBottomPadding)
-                    .padding(top = 16.dp, bottom = contentBottomPadding),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                ScreenHeader(
-                    title = if (showingAccountDetails) strings.account.currentAccount else strings.nav.account,
-                    trailing = {
-                        if (showingAccountDetails) {
-                            ActionChip(
-                                icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                                onClick = viewModel::closeSettingsSubPage,
-                            )
-                        } else {
-                            ActionChip(
-                                icon = themeModeIcon(uiState.settings.theme.mode),
-                                onClick = viewModel::toggleThemeMode,
-                            )
-                        }
+            ScreenHeader(
+                title =
+                    if (showingAccountDetails) {
+                        strings.account
+                            .currentAccount
+                    } else {
+                        strings.nav.account
                     },
-                )
+                trailing = {
+                    if (showingAccountDetails) {
+                        ActionChip(
+                            icon =
+                                Icons.AutoMirrored
+                                    .Outlined
+                                    .ArrowBack,
+                            onClick =
+                                viewModel::
+                                closeSettingsSubPage,
+                        )
+                    } else {
+                        ActionChip(
+                            icon =
+                                themeModeIcon(
+                                    uiState.settings
+                                        .theme.mode
+                                ),
+                            onClick =
+                                viewModel::
+                                toggleThemeMode,
+                        )
+                    }
+                },
+            )
+        }
 
-                if (uiState.session.isLoggedIn) {
-                    AccountSummaryCard(
-                        uiState = uiState,
-                        onClick = if (showingAccountDetails) {
-                            viewModel::closeSettingsSubPage
+        if (uiState.session.isLoggedIn) {
+            item(
+                key = "account-summary",
+                contentType = "account-summary",
+            ) {
+                AccountSummaryCard(
+                    uiState = uiState,
+                    onClick =
+                        if (showingAccountDetails) {
+                            viewModel::
+                            closeSettingsSubPage
                         } else {
-                            viewModel::openSettingsAccountPage
+                            viewModel::
+                            openSettingsAccountPage
                         },
-                        showLogoutButton = showingAccountDetails,
-                        onLogout = if (showingAccountDetails) {
+                    showLogoutButton =
+                        showingAccountDetails,
+                    onLogout =
+                        if (showingAccountDetails) {
                             viewModel::logout
                         } else {
                             null
                         },
-                        onLogoutAll = if (showingAccountDetails) {
+                    onLogoutAll =
+                        if (showingAccountDetails) {
                             {
-                                showLogoutAllConfirm = true
+                                showLogoutAllConfirm =
+                                    true
                             }
                         } else {
                             null
                         },
+                )
+            }
+        } else {
+            item(
+                key = "account-auth-entry",
+                contentType = "auth-entry",
+            ) {
+                AuthEntryCard(
+                    uiState = uiState,
+                    viewModel = viewModel,
+                )
+            }
+        }
+
+        if (!showingAccountDetails) {
+            /*
+             * Language card.
+             *
+             * The card itself is lazy at page level; its small fixed number
+             * of rows remains eager.
+             */
+            item(
+                key = "account-language-settings",
+                contentType = "settings-card",
+            ) {
+                SettingsCard(
+                    title =
+                        strings.account
+                            .languagePanelTitle,
+                    icon =
+                        Icons.Outlined.Language,
+                ) {
+                    SectionListCard {
+                        AppLanguage.entries
+                            .forEachIndexed {
+                                    index,
+                                    language,
+                                ->
+
+                                val selected =
+                                    uiState.settings
+                                        .language ==
+                                            language
+
+                                SectionRow(
+                                    title =
+                                        language.label(
+                                            strings
+                                        ),
+                                    selected =
+                                        selected,
+                                    onClick = {
+                                        viewModel
+                                            .setLanguage(
+                                                language
+                                            )
+                                    },
+                                    trailing = {
+                                        SelectionCheck(
+                                            selected
+                                        )
+                                    },
+                                )
+
+                                if (
+                                    index <
+                                    AppLanguage.entries
+                                        .lastIndex
+                                ) {
+                                    SectionDivider()
+                                }
+                            }
+                    }
+                }
+            }
+
+            /*
+             * Theme card.
+             */
+            item(
+                key = "account-theme-settings",
+                contentType = "settings-card",
+            ) {
+                SettingsCard(
+                    title =
+                        strings.theme.settingsTitle,
+                    icon =
+                        Icons.Outlined.Palette,
+                ) {
+                    Text(
+                        text =
+                            strings.theme.mode,
+                        style =
+                            MaterialTheme
+                                .typography
+                                .labelLarge,
+                        color =
+                            LocalNotesExtraColors
+                                .current
+                                .textMuted,
                     )
-                } else {
-                    AuthEntryCard(uiState = uiState, viewModel = viewModel)
-                }
 
-                if (!showingAccountDetails) {
-                    SettingsCard(
-                        title = strings.account.languagePanelTitle,
-                        icon = Icons.Outlined.Language,
-                    ) {
-                        SectionListCard {
-                            AppLanguage.entries.forEachIndexed { index, language ->
+                    SectionListCard {
+                        ThemeMode.entries
+                            .forEachIndexed {
+                                    index,
+                                    mode,
+                                ->
+
+                                val selected =
+                                    uiState.settings
+                                        .theme.mode ==
+                                            mode
+
                                 SectionRow(
-                                    title = language.label(strings),
-                                    selected = uiState.settings.language == language,
-                                    onClick = { viewModel.setLanguage(language) },
-                                    trailing = { SelectionCheck(uiState.settings.language == language) },
+                                    title =
+                                        mode.label(
+                                            strings
+                                        ),
+                                    selected =
+                                        selected,
+                                    onClick = {
+                                        viewModel
+                                            .setThemeMode(
+                                                mode
+                                            )
+                                    },
+                                    trailing = {
+                                        SelectionCheck(
+                                            selected
+                                        )
+                                    },
                                 )
-                                if (index < AppLanguage.entries.lastIndex) {
+
+                                if (
+                                    index <
+                                    ThemeMode.entries
+                                        .lastIndex
+                                ) {
                                     SectionDivider()
                                 }
                             }
-                        }
                     }
 
-                    SettingsCard(
-                        title = strings.theme.settingsTitle,
-                        icon = Icons.Outlined.Palette,
-                    ) {
-                        Text(
-                            text = strings.theme.mode,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = LocalNotesExtraColors.current.textMuted,
-                        )
-                        SectionListCard {
-                            ThemeMode.entries.forEachIndexed { index, mode ->
+                    Text(
+                        text =
+                            strings.theme.palette,
+                        style =
+                            MaterialTheme
+                                .typography
+                                .labelLarge,
+                        color =
+                            LocalNotesExtraColors
+                                .current
+                                .textMuted,
+                    )
+
+                    SectionListCard {
+                        ThemePalette.entries
+                            .forEachIndexed {
+                                    index,
+                                    palette,
+                                ->
+
+                                val selected =
+                                    uiState.settings
+                                        .theme.palette ==
+                                            palette
+
                                 SectionRow(
-                                    title = mode.label(strings),
-                                    selected = uiState.settings.theme.mode == mode,
-                                    onClick = { viewModel.setThemeMode(mode) },
-                                    trailing = { SelectionCheck(uiState.settings.theme.mode == mode) },
+                                    title =
+                                        palette.label(
+                                            strings
+                                        ),
+                                    selected =
+                                        selected,
+                                    onClick = {
+                                        viewModel
+                                            .setThemePalette(
+                                                palette
+                                            )
+                                    },
+                                    trailing = {
+                                        SelectionCheck(
+                                            selected
+                                        )
+                                    },
                                 )
-                                if (index < ThemeMode.entries.lastIndex) {
+
+                                if (
+                                    index <
+                                    ThemePalette.entries
+                                        .lastIndex
+                                ) {
                                     SectionDivider()
                                 }
                             }
-                        }
-                        Text(
-                            text = strings.theme.palette,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = LocalNotesExtraColors.current.textMuted,
-                        )
-                        SectionListCard {
-                            ThemePalette.entries.forEachIndexed { index, palette ->
-                                SectionRow(
-                                    title = palette.label(strings),
-                                    selected = uiState.settings.theme.palette == palette,
-                                    onClick = { viewModel.setThemePalette(palette) },
-                                    trailing = { SelectionCheck(uiState.settings.theme.palette == palette) },
-                                )
-                                if (index < ThemePalette.entries.lastIndex) {
-                                    SectionDivider()
-                                }
-                            }
-                        }
                     }
                 }
+            }
+        }
 
-                if (showingAccountDetails) {
-                    ChangePasswordCard(uiState = uiState, viewModel = viewModel)
+        if (showingAccountDetails) {
+            item(
+                key = "account-change-password",
+                contentType = "form-card",
+            ) {
+                ChangePasswordCard(
+                    uiState = uiState,
+                    viewModel = viewModel,
+                )
+            }
 
-                    SettingsCard(
-                        title = strings.account.deleteAccount,
-                        description = strings.deleteAccount.warning,
-                        icon = Icons.Outlined.Delete,
+            item(
+                key = "account-delete-account",
+                contentType = "form-card",
+            ) {
+                SettingsCard(
+                    title =
+                        strings.account
+                            .deleteAccount,
+                    description =
+                        strings.deleteAccount
+                            .warning,
+                    icon =
+                        Icons.Outlined.Delete,
+                ) {
+                    OutlinedTextField(
+                        value =
+                            deleteCurPassword,
+                        onValueChange = {
+                            deleteCurPassword =
+                                it
+                        },
+                        modifier =
+                            Modifier.fillMaxWidth(),
+                        label = {
+                            Text(
+                                strings.deleteAccount
+                                    .curPassword
+                            )
+                        },
+                        visualTransformation =
+                            PasswordVisualTransformation(),
+                        singleLine = true,
+                    )
+
+                    Button(
+                        onClick = {
+                            showDeleteConfirm =
+                                true
+                        },
+                        enabled =
+                            !uiState.accountBusy,
+                        modifier =
+                            Modifier.fillMaxWidth(),
+                        shape =
+                            androidx.compose
+                                .foundation
+                                .shape
+                                .RoundedCornerShape(
+                                    999.dp
+                                ),
+                        colors =
+                            androidx.compose
+                                .material3
+                                .ButtonDefaults
+                                .buttonColors(
+                                    containerColor =
+                                        MaterialTheme
+                                            .colorScheme
+                                            .error
+                                            .copy(
+                                                alpha =
+                                                    0.14f
+                                            ),
+                                    contentColor =
+                                        MaterialTheme
+                                            .colorScheme
+                                            .error,
+                                ),
                     ) {
-                        OutlinedTextField(
-                            value = deleteCurPassword,
-                            onValueChange = { deleteCurPassword = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            label = { Text(strings.deleteAccount.curPassword) },
-                            visualTransformation = PasswordVisualTransformation(),
-                            singleLine = true,
+                        Text(
+                            strings.deleteAccount
+                                .confirmFirst
                         )
-                        Button(
-                            onClick = { showDeleteConfirm = true },
-                            enabled = !uiState.accountBusy,
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
-                            colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.14f),
-                                contentColor = MaterialTheme.colorScheme.error,
-                            ),
-                        ) {
-                            Text(strings.deleteAccount.confirmFirst)
-                        }
                     }
                 }
             }
         }
     }
 
+    /*
+     * Dialogs deliberately remain outside the LazyColumn.
+     * Their lifetime and business behavior are unchanged.
+     */
     if (showDeleteConfirm) {
         NotesAlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showDeleteConfirm = false
-                        viewModel.deleteAccount(deleteCurPassword)
-                    },
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
-                ) {
-                    Text(strings.deleteAccount.confirmSecond)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) {
-                    Text(strings.common.cancel)
-                }
-            },
-            title = { Text(strings.deleteAccount.modalTitle) },
-            text = { Text(strings.deleteAccount.modalBody) },
-        )
-    }
-    if (showLogoutAllConfirm) {
-        NotesAlertDialog(
             onDismissRequest = {
-                if (!uiState.accountBusy) {
-                    showLogoutAllConfirm = false
-                }
+                showDeleteConfirm =
+                    false
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        showLogoutAllConfirm = false
-                        viewModel.logoutAll()
+                        showDeleteConfirm =
+                            false
+
+                        viewModel.deleteAccount(
+                            deleteCurPassword
+                        )
                     },
-                    enabled = !uiState.accountBusy,
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
+                    shape =
+                        androidx.compose
+                            .foundation
+                            .shape
+                            .RoundedCornerShape(
+                                999.dp
+                            ),
                 ) {
-                    Text(strings.account.logoutAllConfirmButton)
+                    Text(
+                        strings.deleteAccount
+                            .confirmSecond
+                    )
                 }
             },
             dismissButton = {
                 TextButton(
                     onClick = {
-                        showLogoutAllConfirm = false
+                        showDeleteConfirm =
+                            false
                     },
-                    enabled = !uiState.accountBusy,
                 ) {
-                    Text(strings.common.cancel)
+                    Text(
+                        strings.common.cancel
+                    )
                 }
             },
             title = {
-                Text(strings.account.logoutAllConfirmTitle)
+                Text(
+                    strings.deleteAccount
+                        .modalTitle
+                )
             },
             text = {
-                Text(strings.account.logoutAllConfirmBody)
+                Text(
+                    strings.deleteAccount
+                        .modalBody
+                )
+            },
+        )
+    }
+
+    if (showLogoutAllConfirm) {
+        NotesAlertDialog(
+            onDismissRequest = {
+                if (!uiState.accountBusy) {
+                    showLogoutAllConfirm =
+                        false
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showLogoutAllConfirm =
+                            false
+
+                        viewModel.logoutAll()
+                    },
+                    enabled =
+                        !uiState.accountBusy,
+                    shape =
+                        androidx.compose
+                            .foundation
+                            .shape
+                            .RoundedCornerShape(
+                                999.dp
+                            ),
+                ) {
+                    Text(
+                        strings.account
+                            .logoutAllConfirmButton
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showLogoutAllConfirm =
+                            false
+                    },
+                    enabled =
+                        !uiState.accountBusy,
+                ) {
+                    Text(
+                        strings.common.cancel
+                    )
+                }
+            },
+            title = {
+                Text(
+                    strings.account
+                        .logoutAllConfirmTitle
+                )
+            },
+            text = {
+                Text(
+                    strings.account
+                        .logoutAllConfirmBody
+                )
             },
         )
     }

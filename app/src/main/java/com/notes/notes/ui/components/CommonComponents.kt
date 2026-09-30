@@ -1,6 +1,5 @@
 package com.notes.notes.ui.components
 
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -8,7 +7,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,15 +25,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.Article
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ErrorOutline
-import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.ManageAccounts
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -53,15 +48,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -74,7 +65,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import com.notes.notes.core.AppTab
 import com.notes.notes.core.MessageTone
 import com.notes.notes.core.PathSegment
 import com.notes.notes.ui.theme.LocalNotesExtraColors
@@ -708,73 +698,6 @@ private fun BreadcrumbItem(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-        }
-    }
-}
-
-@Composable
-fun FloatingBottomBar(
-    currentTab: AppTab,
-    onSelectTab: (AppTab) -> Unit,
-    modifier: Modifier = Modifier,
-    strings: com.notes.notes.core.AppStrings,
-) {
-    val extraColors = LocalNotesExtraColors.current
-    val items = listOf(
-        Triple(AppTab.DISK, Icons.Rounded.FolderOpen, strings.nav.disk),
-        Triple(AppTab.READING, Icons.AutoMirrored.Rounded.Article, strings.nav.read),
-        Triple(AppTab.ACCOUNT, Icons.Rounded.ManageAccounts, strings.nav.account),
-    )
-    Row(
-        modifier = modifier.wrapContentWidth(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        items.forEach { (tab, icon, _) ->
-            val selected = currentTab == tab
-            val containerColor = animateColorAsState(
-                targetValue = if (selected) {
-                    MaterialTheme.colorScheme.primary.copy(alpha = 0.20f)
-                } else {
-                    extraColors.panelTop.copy(alpha = 0.18f)
-                },
-                label = "floating-bar-container",
-            )
-            val contentColor = animateColorAsState(
-                targetValue = if (selected) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    extraColors.textMuted
-                },
-                label = "floating-bar-content",
-            )
-            val borderColor = animateColorAsState(
-                targetValue = if (selected) {
-                    MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)
-                } else {
-                    Color.White.copy(alpha = 0.22f)
-                },
-                label = "floating-bar-border",
-            )
-            Surface(
-                modifier = Modifier.size(DefaultBottomBarMetrics.buttonSize),
-                onClick = { onSelectTab(tab) },
-                shape = CircleShape,
-                color = containerColor.value,
-                contentColor = contentColor.value,
-                border = BorderStroke(1.dp, borderColor.value),
-                shadowElevation = 0.dp,
-            ) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        imageVector = icon,
-                        contentDescription = null,
-                        modifier = Modifier.size(if (selected) 24.dp else 22.dp),
-                    )
-                }
-            }
         }
     }
 }

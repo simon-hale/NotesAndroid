@@ -1,6 +1,5 @@
 package com.notes.notes.ui
 
-import androidx.compose.animation.AnimatedContent
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -18,6 +17,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.notes.notes.core.AppTab
@@ -35,6 +37,20 @@ import com.notes.notes.ui.theme.LocalNotesExtraColors
 import com.notes.notes.ui.theme.NotesTheme
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+
+private val MAIN_TABS =
+    listOf(
+        AppTab.DISK,
+        AppTab.READING,
+        AppTab.ACCOUNT,
+    )
+
+private fun AppTab.pageIndex(): Int =
+    when (this) {
+        AppTab.DISK -> 0
+        AppTab.READING -> 1
+        AppTab.ACCOUNT -> 2
+    }
 
 @Composable
 fun NotesApp(viewModel: NotesAppViewModel = viewModel()) {
@@ -54,7 +70,38 @@ private fun NotesAppContent(
 ) {
     val strings = stringsFor(uiState.settings.language)
     val extraColors = LocalNotesExtraColors.current
-    val snackbarHostState = remember { SnackbarHostState() }
+    val snackbarHostState =
+        remember {
+            SnackbarHostState()
+        }
+
+    val tabStateHolder =
+        rememberSaveableStateHolder()
+
+    val pagerState =
+        rememberPagerState(
+            initialPage =
+                uiState.currentTab.pageIndex(),
+            pageCount = {
+                MAIN_TABS.size
+            },
+        )
+
+    LaunchedEffect(
+        uiState.currentTab
+    ) {
+        val targetPage =
+            uiState.currentTab.pageIndex()
+
+        if (
+            pagerState.currentPage !=
+            targetPage
+        ) {
+            pagerState.scrollToPage(
+                targetPage
+            )
+        }
+    }
     val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val isBottomBarVisible = uiState.currentTab != AppTab.READING || uiState.reading.isBottomBarVisible
     val canNavigateBack =
@@ -100,23 +147,67 @@ private fun NotesAppContent(
                         .fillMaxSize()
                         .background(extraColors.backgroundTop)
                 ) {
-                    AnimatedContent(
-                        targetState = uiState.currentTab,
-                        modifier = Modifier.fillMaxSize(),
-                        label = "notes-tab-switch",
-                    ) { tab ->
-                        when (tab) {
-                            AppTab.DISK -> DiskScreen(
-                                uiState = uiState,
-                                viewModel = viewModel,
-                                contentBottomPadding = layoutPadding.contentBottom,
-                            )
-                            AppTab.READING -> ReadingScreen(uiState = uiState, viewModel = viewModel)
-                            AppTab.ACCOUNT -> AccountScreen(
-                                uiState = uiState,
-                                viewModel = viewModel,
-                                contentBottomPadding = layoutPadding.contentBottom,
-                            )
+
+                    HorizontalPager(
+                        state = pagerState,
+                        modifier =
+                            Modifier.fillMaxSize(),
+
+                        /*
+                         * There are only three tabs.
+                         *
+                         * Keeping two pages beyond the viewport means all three screens remain
+                         * composed and laid out instead of being cold-created on every switch.
+                         */
+                        beyondViewportPageCount =
+                            MAIN_TABS.lastIndex,
+
+                        /*
+                         * Tab navigation continues to belong exclusively to LiquidGlassBottomBar.
+                         *
+                         * This also avoids introducing a second horizontal gesture recognizer.
+                         */
+                        userScrollEnabled = false,
+
+                        key = { page ->
+                            MAIN_TABS[page].name
+                        },
+                    ) { page ->
+                        val tab =
+                            MAIN_TABS[page]
+
+                        tabStateHolder.SaveableStateProvider(
+                            key =
+                                "tab-${tab.name}",
+                        ) {
+                            when (tab) {
+                                AppTab.DISK -> {
+                                    DiskScreen(
+                                        uiState = uiState,
+                                        viewModel = viewModel,
+                                        contentBottomPadding =
+                                            layoutPadding
+                                                .contentBottom,
+                                    )
+                                }
+
+                                AppTab.READING -> {
+                                    ReadingScreen(
+                                        uiState = uiState,
+                                        viewModel = viewModel,
+                                    )
+                                }
+
+                                AppTab.ACCOUNT -> {
+                                    AccountScreen(
+                                        uiState = uiState,
+                                        viewModel = viewModel,
+                                        contentBottomPadding =
+                                            layoutPadding
+                                                .contentBottom,
+                                    )
+                                }
+                            }
                         }
                     }
 

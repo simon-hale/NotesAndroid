@@ -1,5 +1,5 @@
 [versions]
-agp = "9.1.0"
+agp = "9.2.0"
 coreKtx = "1.18.0"
 junit = "4.13.2"
 junitVersion = "1.3.0"
@@ -9,13 +9,15 @@ lifecycleRuntimeCompose = "2.10.0"
 lifecycleViewmodelCompose = "2.10.0"
 datastore = "1.1.7"
 activityCompose = "1.13.0"
-kotlin = "2.2.10"
-composeBom = "2026.02.01"
+kotlin = "2.4.20"
+composeBom = "2026.09.00"
 coroutines = "1.10.2"
 commonmark = "0.24.0"
 poi = "5.4.1"
 oss = "2.9.21"
 work = "2.11.2"
+haze = "2.0.0"
+webkit = "1.17.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -47,6 +49,11 @@ commonmark-ext-gfm-strikethrough = { group = "org.commonmark", name = "commonmar
 poi-ooxml = { group = "org.apache.poi", name = "poi-ooxml", version.ref = "poi" }
 oss-android-sdk = { group = "com.aliyun.dpa", name = "oss-android-sdk", version.ref = "oss" }
 androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
+
+haze-core = { module = "dev.chrisbanes.haze:haze", version.ref = "haze" }
+haze-glass = { module = "dev.chrisbanes.haze:haze-glass", version.ref = "haze" }
+
+androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "webkit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -1,6 +1,5 @@
 package com.notes.notes.ui.components
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.WindowInsets
@@ -10,9 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
@@ -21,21 +17,50 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.notes.notes.core.AppStrings
 import com.notes.notes.core.AppTab
-import com.notes.notes.ui.theme.LocalNotesExtraColors
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
+
+private const val SCREEN_SOURCE_Z_INDEX = 0f
 
 @Immutable
 data class BottomBarLayoutMetrics(
-    val buttonSize: Dp = 56.dp,
-    val railPadding: Dp = 10.dp,
+    /*
+     * Enlarged from the previous compact version.
+     *
+     * 3 × 60dp tab slots + 2 × 7dp rail padding = 194dp resting width.
+     * Resting height = 74dp.
+     */
+    val itemTouchSize: Dp = 60.dp,
+    val lensVisualSize: Dp = 60.dp,
+    val railPadding: Dp = 7.dp,
+
+    /*
+     * Added symmetrically while the liquid lens is active.
+     *
+     * Resting: 194dp
+     * Pressed: 290dp
+     */
+    val pressedRailExtraWidth: Dp = 30.dp,
+
     val screenBottomGap: Dp = 8.dp,
-    val contentSeparationGap: Dp = 12.dp,
-    val cornerRadius: Dp = 34.dp,
+    val contentSeparationGap: Dp = 10.dp,
+    val cornerRadius: Dp = 37.dp,
 ) {
     val railHeight: Dp
-        get() = buttonSize + railPadding + railPadding
+        get() = itemTouchSize + railPadding + railPadding
 
-    fun reservedContentSpace(contentHeight: Dp = railHeight): Dp =
-        contentHeight + screenBottomGap + contentSeparationGap
+    fun railWidth(itemCount: Int): Dp =
+        itemTouchSize * itemCount.toFloat() +
+                railPadding +
+                railPadding
+
+    fun reservedContentSpace(
+        contentHeight: Dp = railHeight,
+    ): Dp =
+        contentHeight +
+                screenBottomGap +
+                contentSeparationGap
 }
 
 @Immutable
@@ -56,23 +81,73 @@ fun BottomBarLayout(
     metrics: BottomBarLayoutMetrics = DefaultBottomBarMetrics,
     content: @Composable BoxScope.(BottomBarLayoutPadding) -> Unit,
 ) {
-    val navigationBarPadding = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-    val reservedSpace = metrics.reservedContentSpace()
+    val navigationBarPadding =
+        WindowInsets.navigationBars
+            .asPaddingValues()
+            .calculateBottomPadding()
+
+    val reservedSpace =
+        metrics.reservedContentSpace()
+
     val padding = BottomBarLayoutPadding(
-        contentBottom = if (visible) reservedSpace else 0.dp,
-        snackbarBottom = if (visible) reservedSpace + navigationBarPadding else navigationBarPadding,
+        contentBottom =
+            if (visible) {
+                reservedSpace
+            } else {
+                0.dp
+            },
+        snackbarBottom =
+            if (visible) {
+                reservedSpace + navigationBarPadding
+            } else {
+                navigationBarPadding
+            },
     )
 
-    Box(modifier = modifier.fillMaxSize()) {
-        content(padding)
+    /*
+     * One shared HazeState is intentional.
+     *
+     * z = 0 -> real screen content.
+     * z = 1 -> rendered bottom rail + tab icons.
+     *
+     * The moving lens is not itself a source, so when it consumes
+     * HazeInput.Sources(state) it sees the already-composited scene:
+     *
+     * screen -> glass rail -> icons -> liquid lens.
+     */
+    val hazeState = rememberHazeState()
+
+    Box(
+        modifier = modifier.fillMaxSize(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .let { base ->
+                    if (visible) {
+                        base.hazeSource(
+                            state = hazeState,
+                            zIndex = SCREEN_SOURCE_Z_INDEX,
+                            key = "notes-screen-content",
+                        )
+                    } else {
+                        base
+                    }
+                },
+        ) {
+            content(padding)
+        }
 
         if (visible) {
             BottomBarHost(
                 currentTab = currentTab,
                 onSelectTab = onSelectTab,
                 strings = strings,
+                hazeState = hazeState,
                 metrics = metrics,
-                modifier = Modifier.align(Alignment.BottomCenter),
+                modifier = Modifier.align(
+                    Alignment.BottomCenter
+                ),
             )
         }
     }
@@ -83,31 +158,28 @@ private fun BottomBarHost(
     currentTab: AppTab,
     onSelectTab: (AppTab) -> Unit,
     strings: AppStrings,
+    hazeState: HazeState,
     metrics: BottomBarLayoutMetrics,
     modifier: Modifier = Modifier,
 ) {
-    val extraColors = LocalNotesExtraColors.current
-
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .windowInsetsPadding(WindowInsets.navigationBars)
-            .padding(top = metrics.contentSeparationGap, bottom = metrics.screenBottomGap),
+            .windowInsetsPadding(
+                WindowInsets.navigationBars
+            )
+            .padding(
+                top = metrics.contentSeparationGap,
+                bottom = metrics.screenBottomGap,
+            ),
         contentAlignment = Alignment.Center,
     ) {
-        Surface(
-            shape = RoundedCornerShape(metrics.cornerRadius),
-            color = extraColors.panelTop.copy(alpha = 0.94f),
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            border = BorderStroke(1.dp, extraColors.borderStrong.copy(alpha = 0.9f)),
-            shadowElevation = 18.dp,
-        ) {
-            FloatingBottomBar(
-                currentTab = currentTab,
-                onSelectTab = onSelectTab,
-                strings = strings,
-                modifier = Modifier.padding(horizontal = metrics.railPadding, vertical = metrics.railPadding),
-            )
-        }
+        LiquidGlassBottomBar(
+            currentTab = currentTab,
+            onSelectTab = onSelectTab,
+            strings = strings,
+            hazeState = hazeState,
+            metrics = metrics,
+        )
     }
 }
