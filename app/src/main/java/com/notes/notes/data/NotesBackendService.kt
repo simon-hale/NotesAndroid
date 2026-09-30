@@ -626,15 +626,22 @@ class NotesBackendService {
         }
     }
 
-    private fun JSONObject.optLongFlexible(key: String): Long {
+    private fun JSONObject.optLongFlexible(
+        key: String,
+    ): Long {
         val raw = opt(key)
-        return when (raw) {
-            null,
-            JSONObject.NULL -> 0L
-            is Number -> raw.toLong()
-            is String ->
-                raw.toLongOrNull() ?: 0L
-            else -> 0L
+        if (
+            raw == null ||
+            raw === JSONObject.NULL
+        ) {
+            return 0L
         }
+        if (raw is Number) {
+            return raw.toLong()
+        }
+        if (raw is String) {
+            return raw.toLongOrNull() ?: 0L
+        }
+        return 0L
     }
 }

@@ -309,12 +309,17 @@ class UploadWorker(
                     progress.update(currentBytes, totalBytes)
                 },
                 onUploadId = { uploadId ->
-                    // Captured while the SDK task runs, so a destructive cancel can abort the
-                    // multipart upload without reading the SDK's private checkpoint file.
-                    transferStore.updateUpload(transfer.transferId) { current ->
-                        if (current.uploadId == uploadId) current else current.copy(uploadId = uploadId)
+                    transferStore.updateUpload(
+                        transfer.transferId
+                    ) { current ->
+                        if (current.uploadId == uploadId) {
+                            current
+                        } else {
+                            current.copy(
+                                uploadId = uploadId
+                            )
+                        }
                     }
-                    Unit
                 },
             )
         } finally {

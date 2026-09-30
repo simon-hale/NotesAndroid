@@ -117,57 +117,76 @@ fun ReadingScreen(uiState: NotesUiState, viewModel: NotesAppViewModel) {
                 color = previewSurfaceColor,
                 contentColor = MaterialTheme.colorScheme.onSurface,
             ) {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    when {
-                        uiState.reading.isRefreshing -> {
-                            PreviewStatus(
-                                title = strings.reading.loadingPreview,
-                                body = strings.reading.refreshHint,
-                                loading = true,
-                                isDarkTheme = isDarkTheme,
-                            )
-                        }
+                Box(
+                    modifier =
+                        Modifier.fillMaxSize()
+                ) {
+                    if (uiState.reading.isRefreshing) {
+                        PreviewStatus(
+                            title =
+                                strings.reading.loadingPreview,
+                            body =
+                                strings.reading.refreshHint,
+                            loading = true,
+                            isDarkTheme =
+                                isDarkTheme,
+                        )
+                    } else {
+                        when (
+                            val content =
+                                uiState.reading.content
+                        ) {
+                            PreviewContent.Empty -> {
+                                PreviewStatus(
+                                    title =
+                                        readingTitle
+                                            ?: strings.reading.emptyState,
+                                    body =
+                                        if (selectedName == null) {
+                                            strings.reading
+                                                .selectFileFirst
+                                        } else {
+                                            strings.reading
+                                                .refreshToLoad
+                                        },
+                                    isDarkTheme =
+                                        isDarkTheme,
+                                )
+                            }
 
-                        uiState.reading.content is PreviewContent.Empty -> {
-                            PreviewStatus(
-                                title = readingTitle ?: strings.reading.emptyState,
-                                body = if (selectedName == null) {
-                                    strings.reading.selectFileFirst
-                                } else {
-                                    strings.reading.refreshToLoad
-                                },
-                                isDarkTheme = isDarkTheme,
-                            )
-                        }
+                            is PreviewContent.Error -> {
+                                PreviewStatus(
+                                    title =
+                                        content.title,
+                                    body =
+                                        content.message,
+                                    isDarkTheme =
+                                        isDarkTheme,
+                                )
+                            }
 
-                        uiState.reading.content is PreviewContent.Error -> {
-                            val content = uiState.reading.content as PreviewContent.Error
-                            PreviewStatus(
-                                title = content.title,
-                                body = content.message,
-                                isDarkTheme = isDarkTheme,
-                            )
-                        }
+                            is PreviewContent.Html -> {
+                                HtmlPreviewView(
+                                    html =
+                                        content.html,
+                                    active =
+                                        uiState.currentTab ==
+                                                AppTab.READING,
+                                    modifier =
+                                        Modifier.fillMaxSize(),
+                                )
+                            }
 
-                        uiState.reading.content is PreviewContent.Html -> {
-                            val content = uiState.reading.content as PreviewContent.Html
-                            HtmlPreviewView(
-                                html = content.html,
-                                active =
-                                    uiState.currentTab ==
-                                            AppTab.READING,
-                                modifier =
-                                    Modifier.fillMaxSize(),
-                            )
-                        }
-
-                        uiState.reading.content is PreviewContent.Pdf -> {
-                            val content = uiState.reading.content as PreviewContent.Pdf
-                            PdfPreviewView(
-                                filePath = content.filePath,
-                                pageCount = content.pageCount,
-                                modifier = Modifier.fillMaxSize(),
-                            )
+                            is PreviewContent.Pdf -> {
+                                PdfPreviewView(
+                                    filePath =
+                                        content.filePath,
+                                    pageCount =
+                                        content.pageCount,
+                                    modifier =
+                                        Modifier.fillMaxSize(),
+                                )
+                            }
                         }
                     }
                 }

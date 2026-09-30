@@ -3,7 +3,6 @@ package com.notes.notes.ui.components
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBars
@@ -59,7 +58,6 @@ data class BottomBarLayoutMetrics(
 @Immutable
 data class BottomBarLayoutPadding(
     val contentBottom: Dp,
-    val snackbarBottom: Dp,
 )
 
 internal val DefaultBottomBarMetrics = BottomBarLayoutMetrics()
@@ -74,28 +72,18 @@ fun BottomBarLayout(
     metrics: BottomBarLayoutMetrics = DefaultBottomBarMetrics,
     content: @Composable BoxScope.(BottomBarLayoutPadding) -> Unit,
 ) {
-    val navigationBarPadding =
-        WindowInsets.navigationBars
-            .asPaddingValues()
-            .calculateBottomPadding()
-
     val reservedSpace =
         metrics.reservedContentSpace()
 
-    val padding = BottomBarLayoutPadding(
-        contentBottom =
-            if (visible) {
-                reservedSpace
-            } else {
-                0.dp
-            },
-        snackbarBottom =
-            if (visible) {
-                reservedSpace + navigationBarPadding
-            } else {
-                navigationBarPadding
-            },
-    )
+    val padding =
+        BottomBarLayoutPadding(
+            contentBottom =
+                if (visible) {
+                    reservedSpace
+                } else {
+                    0.dp
+                },
+        )
 
     /*
      * One shared HazeState is intentional.
