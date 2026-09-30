@@ -35,17 +35,10 @@ data class BottomBarLayoutMetrics(
     val lensVisualSize: Dp = 60.dp,
     val railPadding: Dp = 7.dp,
 
-    /*
-     * Added symmetrically while the liquid lens is active.
-     *
-     * Resting: 194dp
-     * Pressed: 290dp
-     */
     val pressedRailExtraWidth: Dp = 30.dp,
 
     val screenBottomGap: Dp = 8.dp,
     val contentSeparationGap: Dp = 10.dp,
-    val cornerRadius: Dp = 37.dp,
 ) {
     val railHeight: Dp
         get() = itemTouchSize + railPadding + railPadding

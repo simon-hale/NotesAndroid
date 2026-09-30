@@ -175,14 +175,6 @@ internal fun LiquidGlassBottomBar(
                 ).toPx()
     }
 
-    /*
-     * No artificial upward translation is required anymore.
-     *
-     * The pressed lens grows around its own center and therefore protrudes
-     * above and below the rail symmetrically.
-     */
-    val lensLiftPx = 0f
-
     val velocityLeadPx = with(density) {
         4.dp.toPx()
     }
@@ -1552,9 +1544,7 @@ internal fun LiquidGlassBottomBar(
                                 progress
 
                     translationY =
-                        lensTopPx -
-                                lensLiftPx *
-                                progress
+                        lensTopPx
 
                     alpha =
                         progress

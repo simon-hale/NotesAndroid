@@ -1063,10 +1063,8 @@ private fun Modifier.diskGroupedEntrySurface(
     this
         .clip(shape)
         .background(
-            color =
-                backgroundColor,
-            shape =
-                shape,
+            color = backgroundColor,
+            shape = shape,
         )
         .drawWithCache {
             val strokeWidth =
@@ -1075,42 +1073,51 @@ private fun Modifier.diskGroupedEntrySurface(
             val coverHeight =
                 strokeWidth * 2f
 
+            val coverWidth =
+                (
+                        size.width -
+                                strokeWidth * 2f
+                        ).coerceAtLeast(0f)
+
             val outline =
                 shape.createOutline(
-                    size =
-                        size,
+                    size = size,
                     layoutDirection =
                         layoutDirection,
-                    density =
-                        this,
+                    density = this,
                 )
 
             val stroke =
                 Stroke(
-                    width =
-                        strokeWidth
+                    width = strokeWidth
                 )
 
             onDrawBehind {
                 drawOutline(
-                    outline =
-                        outline,
-                    color =
-                        borderColor,
-                    style =
-                        stroke,
+                    outline = outline,
+                    color = borderColor,
+                    style = stroke,
                 )
 
+                /*
+                 * Erase only the INNER horizontal border.
+                 *
+                 * Keep one stroke-width on each side so adjacent lazy rows
+                 * still form one continuous outer card border.
+                 */
                 if (!keepTopBorder) {
                     drawRect(
                         color =
                             backgroundColor,
                         topLeft =
-                            Offset.Zero,
+                            Offset(
+                                x = strokeWidth,
+                                y = 0f,
+                            ),
                         size =
                             Size(
                                 width =
-                                    size.width,
+                                    coverWidth,
                                 height =
                                     coverHeight,
                             ),
@@ -1123,7 +1130,7 @@ private fun Modifier.diskGroupedEntrySurface(
                             backgroundColor,
                         topLeft =
                             Offset(
-                                x = 0f,
+                                x = strokeWidth,
                                 y =
                                     (
                                             size.height -
@@ -1136,7 +1143,7 @@ private fun Modifier.diskGroupedEntrySurface(
                         size =
                             Size(
                                 width =
-                                    size.width,
+                                    coverWidth,
                                 height =
                                     coverHeight,
                             ),

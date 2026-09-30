@@ -16,7 +16,7 @@ commonmark = "0.24.0"
 poi = "5.4.1"
 oss = "2.9.21"
 work = "2.11.2"
-haze = "2.0.0"
+haze = "2.0.1"
 webkit = "1.17.1"
 
 [libraries]
@@ -57,5 +57,5 @@ androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "w
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+#kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
