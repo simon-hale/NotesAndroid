@@ -208,6 +208,17 @@ private fun NotesAppContent(
                             }
                         }
                     }
+
+                    NotesSnackbarHost(
+                        hostState = snackbarHostState,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(
+                                top =
+                                    statusBarTopPadding +
+                                            14.dp
+                            ),
+                    )
                 }
             }
 
