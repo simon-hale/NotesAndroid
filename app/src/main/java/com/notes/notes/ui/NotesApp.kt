@@ -141,7 +141,7 @@ private fun NotesAppContent(
                 currentTab = uiState.currentTab,
                 onSelectTab = viewModel::setCurrentTab,
                 strings = strings,
-            ) { layoutPadding ->
+            ) { contentBottomPadding ->
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -186,8 +186,7 @@ private fun NotesAppContent(
                                         uiState = uiState,
                                         viewModel = viewModel,
                                         contentBottomPadding =
-                                            layoutPadding
-                                                .contentBottom,
+                                            contentBottomPadding,
                                     )
                                 }
 
@@ -203,20 +202,12 @@ private fun NotesAppContent(
                                         uiState = uiState,
                                         viewModel = viewModel,
                                         contentBottomPadding =
-                                            layoutPadding
-                                                .contentBottom,
+                                            contentBottomPadding,
                                     )
                                 }
                             }
                         }
                     }
-
-                    NotesSnackbarHost(
-                        hostState = snackbarHostState,
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = statusBarTopPadding + 14.dp),
-                    )
                 }
             }
 
