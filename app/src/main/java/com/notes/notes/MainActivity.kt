@@ -12,7 +12,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         WebViewWarmUp.start(applicationContext)
-        setContent { NotesApp()
+        setContent {
+            NotesApp()
         }
     }
 }
