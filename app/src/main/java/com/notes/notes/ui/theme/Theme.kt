@@ -21,7 +21,6 @@ fun NotesTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as? Activity)?.window ?: return@SideEffect
-            WindowCompat.setDecorFitsSystemWindows(window, false)
             window.isNavigationBarContrastEnforced = false
             val controller = WindowCompat.getInsetsController(window, view)
             val isDark = settings.mode.resolveIsDark(systemInDarkTheme)

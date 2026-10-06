@@ -93,7 +93,6 @@ class DownloadSink internal constructor(
  */
 class FileTransferRepository(
     private val context: Context,
-    private val backendService: NotesBackendService = NotesBackendService(),
 ) {
 
     private val downloadRelativePath = "${Environment.DIRECTORY_DOWNLOADS}/Notes"
@@ -269,7 +268,6 @@ class FileTransferRepository(
     // Downloads
     // ---------------------------------------------------------------------------------------------
 
-    /** Creates the pending MediaStore entry a download writes into, hidden until it completes. */
     /**
      * Creates a hidden MediaStore destination using a deterministic non-overwriting local name.
      *

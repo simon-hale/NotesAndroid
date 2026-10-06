@@ -11,7 +11,6 @@ import org.apache.poi.ss.usermodel.DataFormatter
 import org.apache.poi.ss.usermodel.WorkbookFactory
 import org.apache.poi.xslf.usermodel.XSLFTextShape
 import org.apache.poi.xslf.usermodel.XMLSlideShow
-import org.apache.poi.xwpf.usermodel.IBodyElement
 import org.apache.poi.xwpf.usermodel.XWPFParagraph
 import org.apache.poi.xwpf.usermodel.XWPFTable
 import org.apache.poi.xwpf.usermodel.XWPFDocument

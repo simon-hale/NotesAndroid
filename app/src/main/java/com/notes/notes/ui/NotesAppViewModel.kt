@@ -2072,10 +2072,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun ownedUploadTransfers(): List<UploadTransfer> =
         uploadTransfers.filter { isOwnedByActiveSession(it.accountKey) }
 
-    /** Records belonging to another account: left completely untouched for their owner. */
-    private fun foreignUploadTransfers(): List<UploadTransfer> =
-        uploadTransfers.filterNot { isOwnedByActiveSession(it.accountKey) }
-
     private suspend fun currentAccessToken(): String? {
         val stored = runCatching { preferencesStore.preferences.first() }.getOrNull()
         val storedToken = stored?.savedAccessToken.orEmpty()
@@ -2606,14 +2602,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun downloadSelectedReadingFile() {
-        viewModelScope.launch {
-            val targetFile = _uiState.value.reading.displayedFile ?: _uiState.value.reading.selectedFile
-            if (targetFile == null) {
-                sendWarningMessage(strings().reading.selectFileFirst)
-                return@launch
-            }
-            startDownload(fileId = targetFile.id, fileName = targetFile.name)
+        val targetFile = _uiState.value.reading.displayedFile ?: _uiState.value.reading.selectedFile
+        if (targetFile == null) {
+            sendWarningMessage(strings().reading.selectFileFirst)
+            return
         }
+        startDownload(fileId = targetFile.id, fileName = targetFile.name)
     }
 
     private fun startDownload(
@@ -4426,16 +4420,6 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun registrationCompletedMessage(): String = when (_uiState.value.settings.language) {
-        AppLanguage.ZH_CN -> "注册成功，请切换到登录"
-        AppLanguage.EN_US -> "Registration succeeded. Switch back to Login."
-    }
-
-    private fun blankFieldMessage(): String = when (_uiState.value.settings.language) {
-        AppLanguage.ZH_CN -> "请输入完整信息"
-        AppLanguage.EN_US -> "Please fill in all required fields."
-    }
-
-    private fun registrationSuccessMessage(): String = when (_uiState.value.settings.language) {
         AppLanguage.ZH_CN -> "注册成功，请切换到登录"
         AppLanguage.EN_US -> "Registration succeeded. Switch back to Login."
     }

@@ -18,7 +18,6 @@ import androidx.work.workDataOf
 import com.notes.notes.MainActivity
 import com.notes.notes.R
 import com.notes.notes.core.AppLanguage
-import com.notes.notes.core.TransferNotice
 import com.notes.notes.core.UploadPhase
 import com.notes.notes.core.UploadTransfer
 import com.notes.notes.core.stringsFor

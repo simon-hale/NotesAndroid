@@ -31,7 +31,6 @@ import com.notes.notes.core.AppTab
 import com.notes.notes.core.HtmlPreviewStyle
 import com.notes.notes.core.NotesUiState
 import com.notes.notes.core.PreviewContent
-import com.notes.notes.core.ThemeMode
 import com.notes.notes.core.stringsFor
 import com.notes.notes.ui.NotesAppViewModel
 import com.notes.notes.ui.components.ActionChip

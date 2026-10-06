@@ -86,7 +86,6 @@ import com.notes.notes.core.DownloadRingMode
 import com.notes.notes.core.DownloadRingState
 import com.notes.notes.core.DownloadedFileEntry
 import com.notes.notes.core.FileEntry
-import com.notes.notes.core.FileDiskStrings
 import com.notes.notes.core.NotesUiState
 import com.notes.notes.core.SortDirection
 import com.notes.notes.core.SortKey
@@ -2277,29 +2276,6 @@ private fun downloadedFileMetadata(file: DownloadedFileEntry, language: AppLangu
         if (file.sizeBytes > 0) add(formatFileSize(file.sizeBytes, language))
     }
     return pieces.joinToString("\n")
-}
-
-private fun diskSortSummary(strings: FileDiskStrings, nameLabel: String, uiState: NotesUiState): String {
-    val keyLabel = when (uiState.disk.sortKey) {
-        SortKey.NAME -> nameLabel
-        SortKey.CREATED -> strings.creationTime
-        SortKey.UPDATED -> strings.lastModified
-    }
-    val direction = if (uiState.disk.sortKey == SortKey.NAME) {
-        uiState.disk.directorySortDirection
-    } else {
-        uiState.disk.sortDirection
-    }
-    val directionLabel = when (direction) {
-        SortDirection.ASC -> strings.sortAscending
-        SortDirection.DESC -> strings.sortDescending
-    }
-    return stringsFor(uiState.settings.language).format(
-        strings.sortByColumnWithDirectionTemplate,
-        uiState.settings.language.asLocale(),
-        keyLabel,
-        directionLabel,
-    )
 }
 
 private fun fileMetadata(file: FileEntry): String {

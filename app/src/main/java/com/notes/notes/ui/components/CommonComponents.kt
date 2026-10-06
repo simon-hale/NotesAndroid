@@ -976,43 +976,6 @@ private fun NotesSnackbar(data: SnackbarData) {
     }
 }
 
-private enum class SnackbarTone {
-    SUCCESS,
-    ERROR,
-    WARNING,
-    INFO,
-}
-
-private fun resolveSnackbarTone(message: String): SnackbarTone {
-    val value = message.lowercase()
-    return when {
-        listOf(
-            "失败",
-            "错误",
-            "无法",
-            "不能",
-            "非空",
-            "不存在",
-            "不允许",
-            "为空",
-            "未授权",
-            "无权",
-            "error",
-            "failed",
-            "unauthorized",
-            "forbidden",
-            "cannot",
-            "unable",
-            "invalid",
-            "not allowed",
-            "denied",
-        ).any(value::contains) -> SnackbarTone.ERROR
-        listOf("警告", "谨慎", "warning", "注意").any(value::contains) -> SnackbarTone.WARNING
-        listOf("成功", "完成", "已", "欢迎", "success", "completed", "download started").any(value::contains) -> SnackbarTone.SUCCESS
-        else -> SnackbarTone.INFO
-    }
-}
-
 data class NotesSnackbarVisuals(
     override val message: String,
     val tone: MessageTone,

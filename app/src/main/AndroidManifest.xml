@@ -31,7 +31,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Uploads run as a long-running WorkManager worker, promoted to a dataSync foreground service. -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"

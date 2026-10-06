@@ -29,16 +29,14 @@ android {
         applicationId = "com.notes.notes"
         minSdk = 35
         targetSdk = 36
-        versionCode = 19
-        versionName = "1.4.0"
+        versionCode = 20
+        versionName = "1.4.1"
 
         buildConfigField(
             "String",
             "NOTES_BASE_URL",
             "\"${notesBaseUrl.escapeBuildConfigString()}\""
         )
-
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -91,7 +89,6 @@ dependencies {
     implementation(libs.androidx.compose.animation)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
 
@@ -111,11 +108,5 @@ dependencies {
 
     testImplementation(libs.junit)
 
-    androidTestImplementation(libs.androidx.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(platform(libs.androidx.compose.bom))
-    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
-
     debugImplementation(libs.androidx.compose.ui.tooling)
-    debugImplementation(libs.androidx.compose.ui.test.manifest)
 }
