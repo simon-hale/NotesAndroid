@@ -78,7 +78,6 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
-import kotlin.plus
 
 class NotesAppViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -147,6 +146,18 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
      * down by logout, password change, account deletion or rejected automatic login.
      */
     private var sessionResetInProgress = false
+
+    /*
+     * Only one Reading preview request belongs to the current UI selection.
+     *
+     * generation invalidates results from an older request even when a
+     * third-party parser cannot react to coroutine cancellation immediately.
+     */
+    private var readingPreviewJob: Job? =
+        null
+
+    private var readingPreviewGeneration =
+        0L
 
     /**
      * WorkManager and TransferStore collectors can both notice the same orphaned METADATA_PENDING record.
@@ -336,16 +347,36 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun selectReadingFile(file: FileEntry) {
+    fun selectReadingFile(
+        file: FileEntry,
+    ) {
+        /*
+         * Selecting another file invalidates any preview that is currently being
+         * downloaded or parsed. The previously displayed preview itself remains
+         * available until the user successfully refreshes the new selection.
+         */
+        cancelReadingPreviewLoad()
+
         _uiState.update {
             it.copy(
-                reading = it.reading.copy(
-                    selectedFile = SelectedFile(file.id, file.name),
-                    isRefreshing = false,
-                )
+                reading =
+                    it.reading.copy(
+                        selectedFile =
+                            SelectedFile(
+                                file.id,
+                                file.name,
+                            ),
+                        isRefreshing =
+                            false,
+                    )
             )
         }
-        sendInfoMessage(strings().fileDisk.selected)
+
+        sendInfoMessage(
+            strings()
+                .fileDisk
+                .selected
+        )
     }
 
     fun chooseUploadCandidates(candidates: List<UploadCandidate>) {
@@ -626,59 +657,147 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun deleteFile(file: FileEntry) {
+    fun deleteFile(
+        file: FileEntry,
+    ) {
         viewModelScope.launch {
-            val session = activeSession() ?: return@launch
+            val session =
+                activeSession()
+                    ?: return@launch
+
             runCatching {
-                backendService.deleteFile(
-                    accessToken = session.accessToken,
-                    fileId = file.id,
-                    language = uiState.value.settings.language,
-                )
+                backendService
+                    .deleteFile(
+                        accessToken =
+                            session.accessToken,
+                        fileId =
+                            file.id,
+                        language =
+                            uiState.value
+                                .settings
+                                .language,
+                    )
             }.onSuccess {
-                val readingBeforeDelete = _uiState.value.reading
-                val cacheFilesToDelete = if (readingBeforeDelete.displayedFile?.id == file.id) {
-                    readingBeforeDelete.activeCacheFiles
-                } else {
-                    emptyList()
+                val readingBeforeDelete =
+                    _uiState.value
+                        .reading
+
+                val affectsReading =
+                    readingBeforeDelete
+                        .selectedFile
+                        ?.id ==
+                            file.id ||
+                            readingBeforeDelete
+                                .displayedFile
+                                ?.id ==
+                            file.id
+
+                /*
+                 * Cancel only after the backend delete actually succeeded.
+                 * A failed delete should not unnecessarily terminate a valid
+                 * preview.
+                 */
+                if (
+                    affectsReading
+                ) {
+                    cancelReadingPreviewLoad()
                 }
+
+                val cacheFilesToDelete =
+                    if (
+                        readingBeforeDelete
+                            .displayedFile
+                            ?.id ==
+                        file.id
+                    ) {
+                        readingBeforeDelete
+                            .activeCacheFiles
+                    } else {
+                        emptyList()
+                    }
+
                 _uiState.update { state ->
-                    val reading = state.reading
-                    val deletedSelected = reading.selectedFile?.id == file.id
-                    val deletedDisplayed = reading.displayedFile?.id == file.id
+                    val reading =
+                        state.reading
+
+                    val deletedSelected =
+                        reading
+                            .selectedFile
+                            ?.id ==
+                                file.id
+
+                    val deletedDisplayed =
+                        reading
+                            .displayedFile
+                            ?.id ==
+                                file.id
+
                     when {
                         deletedDisplayed -> {
                             state.copy(
-                                reading = reading.copy(
-                                    selectedFile = when {
-                                        deletedSelected -> null
-                                        reading.selectedFile != null -> reading.selectedFile
-                                        else -> null
-                                    },
-                                    displayedFile = null,
-                                    isRefreshing = false,
-                                    content = PreviewContent.Empty,
-                                    activeCacheFiles = emptyList(),
-                                )
+                                reading =
+                                    reading.copy(
+                                        selectedFile =
+                                            when {
+                                                deletedSelected ->
+                                                    null
+
+                                                reading
+                                                    .selectedFile !=
+                                                        null ->
+                                                    reading
+                                                        .selectedFile
+
+                                                else ->
+                                                    null
+                                            },
+                                        displayedFile =
+                                            null,
+                                        isRefreshing =
+                                            false,
+                                        content =
+                                            PreviewContent.Empty,
+                                        activeCacheFiles =
+                                            emptyList(),
+                                    )
                             )
                         }
 
                         deletedSelected -> {
                             state.copy(
-                                reading = reading.copy(
-                                    selectedFile = reading.displayedFile,
-                                )
+                                reading =
+                                    reading.copy(
+                                        selectedFile =
+                                            reading
+                                                .displayedFile,
+                                        isRefreshing =
+                                            false,
+                                    )
                             )
                         }
 
-                        else -> state
+                        else ->
+                            state
                     }
                 }
-                cleanupPreviewCacheFiles(cacheFilesToDelete)
+
+                cleanupPreviewCacheFiles(
+                    cacheFilesToDelete
+                )
+
                 refreshCurrentDirectory()
-                sendSuccessMessage(strings().fileDisk.deleted)
-            }.onFailure { throwable ->
-                sendThrowableMessage(throwable)
+
+                sendSuccessMessage(
+                    strings()
+                        .fileDisk
+                        .deleted
+                )
+            }.onFailure {
+                    throwable ->
+
+                sendThrowableMessage(
+                    throwable
+                )
             }
         }
     }
@@ -3126,79 +3245,288 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun refreshReadingPreview(isDarkTheme: Boolean) {
-        viewModelScope.launch {
-            val strings = strings()
-            val readingBeforeRefresh = _uiState.value.reading
-            val selectedFile = readingBeforeRefresh.selectedFile ?: readingBeforeRefresh.displayedFile
-            val session = activeSession() ?: return@launch
-            if (selectedFile == null) {
-                sendWarningMessage(strings.reading.selectFileFirst)
-                return@launch
-            }
-            _uiState.update { it.copy(reading = it.reading.copy(isRefreshing = true)) }
-            runCatching {
-                val descriptor = backendService.getFilePreview(
-                    accessToken = session.accessToken,
-                    fileId = selectedFile.id,
-                    language = uiState.value.settings.language,
-                )
-                previewRepository.loadPreview(
-                    descriptor = descriptor,
-                    fileName = selectedFile.name,
-                    isDarkTheme = isDarkTheme,
-                    themePalette = _uiState.value.settings.theme.palette,
-                    officePreviewHint = strings.reading.officePreviewFallback,
-                    markdownLoadFailed = strings.reading.markdownLoadFailed,
-                )
-            }.onSuccess { loadedPreview ->
-                _uiState.update { state ->
-                    state.copy(
-                        reading = state.reading.copy(
-                            selectedFile = selectedFile,
-                            displayedFile = selectedFile,
-                            isRefreshing = false,
-                            content = loadedPreview.content,
-                            activeCacheFiles = loadedPreview.cacheFiles,
-                        )
-                    )
-                }
-                cleanupPreviewCacheFiles(
-                    readingBeforeRefresh.activeCacheFiles.filterNot { it in loadedPreview.cacheFiles }
-                )
-            }.onFailure { throwable ->
-                val message = when (throwable) {
-                    is NotesServiceException.Business -> throwable.errorMessage
-                    is NotesServiceException.Http -> strings.httpErrorMessage(throwable.statusCode)
-                    is NotesServiceException.MissingBaseUrl -> strings.common.baseUrlMissing
-                    else -> strings.reading.previewLoadFailed
-                }
-                _uiState.update {
-                    val reading = it.reading
-                    it.copy(
-                        reading = if (reading.displayedFile != null && reading.content !is PreviewContent.Empty) {
-                            reading.copy(isRefreshing = false)
-                        } else {
-                            reading.copy(
-                                isRefreshing = false,
-                                content = PreviewContent.Error(selectedFile.name, message),
+    fun refreshReadingPreview(
+        isDarkTheme: Boolean,
+    ) {
+        if (
+            _uiState.value
+                .reading
+                .isRefreshing
+        ) {
+            return
+        }
+
+        /*
+         * A previous successful job may still be finishing cache cleanup even
+         * though isRefreshing is already false. Cancel that tail before starting
+         * another preview generation.
+         */
+        readingPreviewJob
+            ?.cancel()
+
+        readingPreviewGeneration +=
+            1L
+
+        val generation =
+            readingPreviewGeneration
+
+        readingPreviewJob =
+            viewModelScope.launch {
+                try {
+                    val strings =
+                        strings()
+
+                    val readingBeforeRefresh =
+                        _uiState.value
+                            .reading
+
+                    val selectedFile =
+                        readingBeforeRefresh
+                            .selectedFile
+                            ?: readingBeforeRefresh
+                                .displayedFile
+
+                    if (
+                        selectedFile == null
+                    ) {
+                        if (
+                            generation ==
+                            readingPreviewGeneration
+                        ) {
+                            sendWarningMessage(
+                                strings.reading
+                                    .selectFileFirst
                             )
                         }
-                    )
-                }
-                if (readingBeforeRefresh.displayedFile == null || readingBeforeRefresh.content is PreviewContent.Empty) {
+
+                        return@launch
+                    }
+
+                    val session =
+                        activeSession()
+                            ?: return@launch
+
+                    /*
+                     * The generation may already have been invalidated between
+                     * launch and execution.
+                     */
+                    if (
+                        generation !=
+                        readingPreviewGeneration
+                    ) {
+                        return@launch
+                    }
+
                     _uiState.update {
                         it.copy(
-                            reading = it.reading.copy(
-                                displayedFile = null,
-                                activeCacheFiles = emptyList(),
-                            )
+                            reading =
+                                it.reading.copy(
+                                    isRefreshing =
+                                        true
+                                )
                         )
                     }
+
+                    try {
+                        val descriptor =
+                            backendService
+                                .getFilePreview(
+                                    accessToken =
+                                        session.accessToken,
+                                    fileId =
+                                        selectedFile.id,
+                                    language =
+                                        uiState.value
+                                            .settings
+                                            .language,
+                                )
+
+                        val loadedPreview =
+                            previewRepository
+                                .loadPreview(
+                                    descriptor =
+                                        descriptor,
+                                    fileName =
+                                        selectedFile.name,
+                                    isDarkTheme =
+                                        isDarkTheme,
+                                    themePalette =
+                                        _uiState.value
+                                            .settings
+                                            .theme
+                                            .palette,
+                                    officePreviewHint =
+                                        strings.reading
+                                            .officePreviewFallback,
+                                    markdownLoadFailed =
+                                        strings.reading
+                                            .markdownLoadFailed,
+                                    previewTruncated =
+                                        strings.reading
+                                            .previewTruncated,
+                                    previewTooLarge =
+                                        strings.reading
+                                            .previewTooLarge,
+                                )
+
+                        /*
+                         * Do not let A.docx overwrite B.pdf if the selection,
+                         * account or Reading state changed while A was parsing.
+                         */
+                        if (
+                            generation !=
+                            readingPreviewGeneration
+                        ) {
+                            return@launch
+                        }
+
+                        _uiState.update { state ->
+                            state.copy(
+                                reading =
+                                    state.reading.copy(
+                                        selectedFile =
+                                            selectedFile,
+                                        displayedFile =
+                                            selectedFile,
+                                        isRefreshing =
+                                            false,
+                                        content =
+                                            loadedPreview
+                                                .content,
+                                        activeCacheFiles =
+                                            loadedPreview
+                                                .cacheFiles,
+                                    )
+                            )
+                        }
+
+                        cleanupPreviewCacheFiles(
+                            readingBeforeRefresh
+                                .activeCacheFiles
+                                .filterNot {
+                                    it in
+                                            loadedPreview
+                                                .cacheFiles
+                                }
+                        )
+                    } catch (
+                        cancellation:
+                        CancellationException
+                    ) {
+                        /*
+                         * Never convert structured coroutine cancellation into a
+                         * user-facing preview failure.
+                         */
+                        throw cancellation
+                    } catch (
+                        throwable: Throwable
+                    ) {
+                        if (
+                            generation !=
+                            readingPreviewGeneration
+                        ) {
+                            return@launch
+                        }
+
+                        val message =
+                            when (
+                                throwable
+                            ) {
+                                is NotesServiceException
+                                .Business ->
+                                    throwable
+                                        .errorMessage
+
+                                is NotesServiceException
+                                .Http ->
+                                    strings.httpErrorMessage(
+                                        throwable
+                                            .statusCode
+                                    )
+
+                                is NotesServiceException
+                                .MissingBaseUrl ->
+                                    strings.common
+                                        .baseUrlMissing
+
+                                else ->
+                                    strings.reading
+                                        .previewLoadFailed
+                            }
+
+                        _uiState.update {
+                            val reading =
+                                it.reading
+
+                            it.copy(
+                                reading =
+                                    if (
+                                        reading
+                                            .displayedFile !=
+                                        null &&
+                                        reading.content !is
+                                                PreviewContent.Empty
+                                    ) {
+                                        reading.copy(
+                                            isRefreshing =
+                                                false
+                                        )
+                                    } else {
+                                        reading.copy(
+                                            isRefreshing =
+                                                false,
+                                            content =
+                                                PreviewContent
+                                                    .Error(
+                                                        selectedFile
+                                                            .name,
+                                                        message,
+                                                    ),
+                                        )
+                                    }
+                            )
+                        }
+
+                        if (
+                            readingBeforeRefresh
+                                .displayedFile ==
+                            null ||
+                            readingBeforeRefresh
+                                .content is
+                                    PreviewContent.Empty
+                        ) {
+                            _uiState.update {
+                                it.copy(
+                                    reading =
+                                        it.reading
+                                            .copy(
+                                                displayedFile =
+                                                    null,
+                                                activeCacheFiles =
+                                                    emptyList(),
+                                            )
+                                )
+                            }
+                        }
+
+                        sendErrorMessage(
+                            message
+                        )
+                    }
+                } finally {
+                    /*
+                     * An old finishing job must never clear the reference of a
+                     * newer generation.
+                     */
+                    if (
+                        generation ==
+                        readingPreviewGeneration
+                    ) {
+                        readingPreviewJob =
+                            null
+                    }
                 }
-                sendErrorMessage(message)
             }
-        }
     }
 
     fun login(username: String, password: String, rememberMe: Boolean) {
@@ -3508,6 +3836,7 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     }
 
     private suspend fun onLoginSucceeded(username: String, accessToken: String, welcomeBack: Boolean) {
+        cancelReadingPreviewLoad()
         val cacheFilesToDelete = _uiState.value.reading.activeCacheFiles
         cleanupPreviewCacheFiles(cacheFilesToDelete)
         invalidateDiskRequests()
@@ -3888,6 +4217,8 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
 
         sessionResetInProgress = true
 
+        cancelReadingPreviewLoad()
+
         try {
             val cacheFilesToDelete =
                 _uiState.value.reading.activeCacheFiles
@@ -4189,7 +4520,40 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
     private fun belongsToDepartingAccount(accountKey: String, departingAccount: String): Boolean =
         accountKey.isBlank() || accountKey == departingAccount
 
-    private fun cleanupPreviewCacheFiles(paths: Collection<String>) {
+    private fun cancelReadingPreviewLoad() {
+        /*
+         * Invalidate first. Even if a blocking Office parser takes a little
+         * longer to return after cancellation, its result can no longer be
+         * committed into ReadingScreenState.
+         */
+        readingPreviewGeneration +=
+            1L
+
+        readingPreviewJob
+            ?.cancel()
+
+        readingPreviewJob =
+            null
+
+        _uiState.update { state ->
+            if (
+                !state.reading
+                    .isRefreshing
+            ) {
+                state
+            } else {
+                state.copy(
+                    reading =
+                        state.reading.copy(
+                            isRefreshing =
+                                false
+                        )
+                )
+            }
+        }
+    }
+
+    private suspend fun cleanupPreviewCacheFiles(paths: Collection<String>) {
         if (paths.isEmpty()) return
         previewRepository.deleteCacheFiles(paths)
     }

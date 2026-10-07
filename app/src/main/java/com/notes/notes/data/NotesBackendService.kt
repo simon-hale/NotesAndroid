@@ -40,6 +40,17 @@ data class FilePreviewDescriptor(
     val type: String,
 )
 
+data class DownloadedTextPreview(
+    val text: String,
+    val truncated: Boolean,
+)
+
+class DownloadSizeLimitExceededException(
+    val maxBytes: Long,
+) : Exception(
+    "Download exceeds preview limit: $maxBytes bytes"
+)
+
 data class OssStsToken(
     val overwriteSameName: Boolean,
     val region: String,
@@ -388,30 +399,257 @@ class NotesBackendService {
         }
     }
 
-    suspend fun downloadToFile(url: String, destination: File) = withContext(Dispatchers.IO) {
-        val parentDir = destination.parentFile?.apply { mkdirs() }
-        val tempFile = File.createTempFile(
-            destination.nameWithoutExtension.takeIf { it.length >= 3 } ?: "tmp",
-            ".download",
-            parentDir,
-        )
+    suspend fun downloadTextPreview(
+        url: String,
+        maxChars: Int,
+    ): DownloadedTextPreview = withContext(Dispatchers.IO) {
+        require(maxChars > 0)
+
         val connection = openRawConnection(url)
+
         try {
             val statusCode = connection.responseCode
+
             if (statusCode !in 200..299) {
-                val body = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                throw NotesServiceException.Http(statusCode, body)
+                val body =
+                    connection.errorStream
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                        .orEmpty()
+
+                throw NotesServiceException.Http(
+                    statusCode,
+                    body,
+                )
             }
-            BufferedInputStream(connection.inputStream).use { input ->
-                BufferedOutputStream(tempFile.outputStream()).use { output ->
-                    input.copyTo(output)
+
+            val stream =
+                connection.inputStream
+                    ?: return@withContext DownloadedTextPreview(
+                        text = "",
+                        truncated = false,
+                    )
+
+            stream.bufferedReader().use { reader ->
+                val result =
+                    StringBuilder(
+                        minOf(
+                            maxChars,
+                            64 * 1024,
+                        )
+                    )
+
+                val buffer =
+                    CharArray(
+                        8 * 1024
+                    )
+
+                var remaining =
+                    maxChars
+
+                while (remaining > 0) {
+                    val read =
+                        reader.read(
+                            buffer,
+                            0,
+                            minOf(
+                                buffer.size,
+                                remaining,
+                            ),
+                        )
+
+                    if (read < 0) {
+                        return@withContext DownloadedTextPreview(
+                            text = result.toString(),
+                            truncated = false,
+                        )
+                    }
+
+                    result.append(
+                        buffer,
+                        0,
+                        read,
+                    )
+
+                    remaining -=
+                        read
+                }
+
+                /*
+                 * Read one extra character only to determine whether the remote
+                 * document contains more content. We deliberately do not keep it.
+                 */
+                DownloadedTextPreview(
+                    text = result.toString(),
+                    truncated =
+                        reader.read() >= 0,
+                )
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    suspend fun downloadToFile(
+        url: String,
+        destination: File,
+        maxBytes: Long? = null,
+    ) = withContext(
+        Dispatchers.IO
+    ) {
+        require(
+            maxBytes == null ||
+                    maxBytes > 0L
+        )
+
+        val parentDir =
+            destination.parentFile
+                ?.apply {
+                    mkdirs()
+                }
+
+        val tempFile =
+            File.createTempFile(
+                destination
+                    .nameWithoutExtension
+                    .takeIf {
+                        it.length >= 3
+                    }
+                    ?: "tmp",
+                ".download",
+                parentDir,
+            )
+
+        val connection =
+            openRawConnection(
+                url
+            )
+
+        try {
+            /*
+             * Keep HTTP byte counts aligned with the object itself. The streaming
+             * counter below remains authoritative even when Content-Length is not
+             * supplied.
+             */
+            connection.setRequestProperty(
+                "Accept-Encoding",
+                "identity",
+            )
+
+            val statusCode =
+                connection.responseCode
+
+            if (
+                statusCode !in
+                200..299
+            ) {
+                val body =
+                    connection
+                        .errorStream
+                        ?.bufferedReader()
+                        ?.use {
+                            it.readText()
+                        }
+                        .orEmpty()
+
+                throw NotesServiceException.Http(
+                    statusCode,
+                    body,
+                )
+            }
+
+            val contentLength =
+                connection.getHeaderFieldLong(
+                    "Content-Length",
+                    -1L,
+                )
+
+            /*
+             * Fast path: if the server supplies an object length, refuse the
+             * preview before downloading the response body.
+             */
+            if (
+                maxBytes != null &&
+                contentLength >
+                maxBytes
+            ) {
+                throw DownloadSizeLimitExceededException(
+                    maxBytes
+                )
+            }
+
+            BufferedInputStream(
+                connection.inputStream
+            ).use { input ->
+                BufferedOutputStream(
+                    tempFile.outputStream()
+                ).use { output ->
+                    val buffer =
+                        ByteArray(
+                            8 * 1024
+                        )
+
+                    var copiedBytes =
+                        0L
+
+                    while (true) {
+                        val read =
+                            input.read(
+                                buffer
+                            )
+
+                        if (
+                            read < 0
+                        ) {
+                            break
+                        }
+
+                        val nextCopiedBytes =
+                            copiedBytes +
+                                    read.toLong()
+
+                        /*
+                         * Content-Length is optional and cannot be treated as the
+                         * safety boundary. Enforce the same limit while streaming.
+                         */
+                        if (
+                            maxBytes != null &&
+                            nextCopiedBytes >
+                            maxBytes
+                        ) {
+                            throw DownloadSizeLimitExceededException(
+                                maxBytes
+                            )
+                        }
+
+                        output.write(
+                            buffer,
+                            0,
+                            read,
+                        )
+
+                        copiedBytes =
+                            nextCopiedBytes
+                    }
+
                     output.flush()
                 }
             }
-            moveDownloadedFile(tempFile, destination)
+
+            moveDownloadedFile(
+                tempFile,
+                destination,
+            )
         } finally {
             connection.disconnect()
-            if (tempFile.exists()) {
+
+            /*
+             * Also removes a partially downloaded oversized preview. Once the
+             * atomic move succeeded tempFile no longer exists.
+             */
+            if (
+                tempFile.exists()
+            ) {
                 tempFile.delete()
             }
         }

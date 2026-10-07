@@ -195,6 +195,8 @@ data class ReadingStrings(
     val selectFileFirst: String,
     val refreshToLoad: String,
     val officePreviewFallback: String,
+    val previewTruncated: String,
+    val previewTooLarge: String,
 )
 
 data class TransferStrings(
@@ -464,6 +466,8 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             selectFileFirst = "请先在云盘页选中文件",
             refreshToLoad = "选中文件后，点击右上角刷新开始预览",
             officePreviewFallback = "这里使用结构化文档预览，以兼顾 Android 端稳定性",
+            previewTruncated = "内容较大，预览已截断；完整内容请下载后使用本地阅读器打开",
+            previewTooLarge = "文件过大，为避免占用过多内存，请下载后使用本地阅读器打开",
         ),
         transfers = TransferStrings(
             activeTransfers = "进行中的传输",
@@ -680,6 +684,8 @@ fun stringsFor(language: AppLanguage): AppStrings = when (language) {
             selectFileFirst = "Select a file in Disk first.",
             refreshToLoad = "After selecting a file, tap refresh in the top-right corner to preview it.",
             officePreviewFallback = "A structured office preview is used here for stability on Android.",
+            previewTruncated = "This preview was truncated to keep memory use reasonable. Download the file to view the full content.",
+            previewTooLarge = "This file is too large for the lightweight preview. Download it and open it with a local reader instead.",
         ),
         transfers = TransferStrings(
             activeTransfers = "Active transfers",
