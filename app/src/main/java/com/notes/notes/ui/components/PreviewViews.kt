@@ -12,6 +12,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -20,12 +21,12 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -36,11 +37,15 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -57,6 +62,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.math.abs
 
 @Composable
 fun HtmlPreviewView(
@@ -165,10 +171,9 @@ fun PdfPreviewView(
                             File(filePath)
                         ).also { holder ->
                             /*
-                             * Keep a reference before returning from the IO
-                             * dispatcher. If cancellation happens while switching
-                             * back to the producer context, finally can still
-                             * close the renderer.
+                             * Keep a reference before returning from IO so the
+                             * renderer can still be closed if cancellation
+                             * happens during dispatcher hand-off.
                              */
                             openedHolder =
                                 holder
@@ -186,10 +191,6 @@ fun PdfPreviewView(
                 if (
                     holderToClose != null
                 ) {
-                    /*
-                     * Cleanup itself must survive cancellation, while the
-                     * potentially blocking PdfRenderer close still belongs on IO.
-                     */
                     withContext(
                         NonCancellable
                     ) {
@@ -241,7 +242,17 @@ fun PdfPreviewView(
         )
     }
 
-    var zoom by
+    /*
+     * This is the real PDF layout zoom.
+     *
+     * IMPORTANT:
+     * It does NOT change while a pinch is active.
+     *
+     * LazyColumn therefore keeps exactly the same measured page geometry for
+     * the whole gesture. The final zoom is committed once when all fingers
+     * are released.
+     */
+    var committedZoom by
     remember(
         filePath
     ) {
@@ -251,10 +262,10 @@ fun PdfPreviewView(
     }
 
     /*
-     * `zoom` controls the visual/layout width immediately.
+     * Actual PdfRenderer resolution.
      *
-     * `renderScale` changes only after the pinch settles, so PdfRenderer is
-     * not asked to rerasterize every frame of the gesture.
+     * It follows committedZoom only after the usual settle delay. It remains
+     * capped at MAX_PDF_RASTER_SCALE independently of the 3x visual layout.
      */
     var renderScale by
     remember(
@@ -265,17 +276,133 @@ fun PdfPreviewView(
         )
     }
 
+    var isPinching by
+    remember(
+        filePath
+    ) {
+        mutableStateOf(
+            false
+        )
+    }
+
     /*
-     * A new document always starts fit-to-width at the first page.
+     * Temporary draw-only transform used during an active pinch.
+     *
+     * graphicsLayer does not participate in layout measurement, which is the
+     * important difference from the previous implementation.
+     */
+    var gestureScale by
+    remember(
+        filePath
+    ) {
+        mutableFloatStateOf(
+            1f
+        )
+    }
+
+    var gestureTranslationX by
+    remember(
+        filePath
+    ) {
+        mutableFloatStateOf(
+            0f
+        )
+    }
+
+    var gestureTranslationY by
+    remember(
+        filePath
+    ) {
+        mutableFloatStateOf(
+            0f
+        )
+    }
+
+    /*
+     * Final horizontal scroll requested by the most recently committed pinch.
+     *
+     * ScrollState.maxValue updates only after committedZoom has reached layout,
+     * so retain the logical target independently until the new range exists.
+     */
+    var requestedHorizontalScrollPx by
+    remember(
+        filePath
+    ) {
+        mutableFloatStateOf(
+            0f
+        )
+    }
+
+    /*
+     * Final vertical page anchor used for the one real layout transition at
+     * gesture end.
+     */
+    var pendingVerticalAnchorIndex by
+    remember(
+        filePath
+    ) {
+        mutableIntStateOf(
+            -1
+        )
+    }
+
+    var pendingVerticalScrollOffsetPx by
+    remember(
+        filePath
+    ) {
+        mutableIntStateOf(
+            0
+        )
+    }
+
+    /*
+     * Guarantees that every completed pinch receives one final correction,
+     * even when it happens to end on the same page/zoom as the previous one.
+     */
+    var commitSequence by
+    remember(
+        filePath
+    ) {
+        mutableIntStateOf(
+            0
+        )
+    }
+
+    /*
+     * A new document always starts fit-to-width at page 1.
      */
     LaunchedEffect(
         filePath
     ) {
-        zoom =
+        isPinching =
+            false
+
+        committedZoom =
             MIN_PDF_ZOOM
 
         renderScale =
             MIN_PDF_ZOOM
+
+        gestureScale =
+            1f
+
+        gestureTranslationX =
+            0f
+
+        gestureTranslationY =
+            0f
+
+        requestedHorizontalScrollPx =
+            0f
+
+        pendingVerticalAnchorIndex =
+            -1
+
+        pendingVerticalScrollOffsetPx =
+            0
+
+        commitSequence =
+            0
 
         horizontalScrollState
             .scrollTo(
@@ -292,12 +419,14 @@ fun PdfPreviewView(
     }
 
     /*
-     * Debounce expensive native rasterization and quantize the requested
-     * resolution. A slow pinch therefore produces at most a few useful
-     * resolution levels rather than dozens of nearly identical bitmaps.
+     * Expensive native rasterization starts only after the committed layout
+     * zoom has settled.
+     *
+     * Since committedZoom never changes inside the active gesture, rapid
+     * pinching can no longer repeatedly restart page rendering.
      */
     LaunchedEffect(
-        zoom
+        committedZoom
     ) {
         delay(
             PDF_RENDER_SETTLE_MILLIS
@@ -305,24 +434,112 @@ fun PdfPreviewView(
 
         renderScale =
             quantizePdfRenderScale(
-                zoom
+                committedZoom
             )
     }
 
     /*
-     * Returning to fit-width also returns horizontal position to the left
-     * edge, avoiding a stale pan offset if the user zooms in again later.
+     * The horizontal scroll range changes only after committedZoom has been
+     * measured. Re-run whenever that range changes and converge on the final
+     * logical target.
      */
+    val horizontalMaxScrollPx =
+        horizontalScrollState
+            .maxValue
+
     LaunchedEffect(
-        zoom <=
-                MIN_PDF_ZOOM +
-                PDF_ZOOM_EPSILON
+        filePath,
+        committedZoom,
+        horizontalMaxScrollPx,
+        isPinching,
     ) {
         if (
-            zoom <=
+            isPinching
+        ) {
+            return@LaunchedEffect
+        }
+
+        val target =
+            requestedHorizontalScrollPx
+                .roundToInt()
+                .coerceIn(
+                    0,
+                    horizontalMaxScrollPx,
+                )
+
+        if (
+            horizontalScrollState.value !=
+            target
+        ) {
+            horizontalScrollState
+                .scrollTo(
+                    target
+                )
+        }
+    }
+
+    /*
+     * requestScrollToItem() performs the layout-time anchor request when the
+     * gesture ends.
+     *
+     * Once the new committed zoom has actually reached measurement, perform
+     * one final exact scroll. No vertical correction is performed per pinch
+     * frame anymore.
+     */
+    LaunchedEffect(
+        filePath,
+        commitSequence,
+    ) {
+        if (
+            commitSequence <=
+            0
+        ) {
+            return@LaunchedEffect
+        }
+
+        val anchorIndex =
+            pendingVerticalAnchorIndex
+
+        if (
+            anchorIndex !in
+            0 until pageCount
+        ) {
+            return@LaunchedEffect
+        }
+
+        withFrameNanos {
+            // Allow committedZoom to participate in one real measurement pass.
+        }
+
+        listState.scrollToItem(
+            index =
+                anchorIndex,
+            scrollOffset =
+                pendingVerticalScrollOffsetPx,
+        )
+
+        pendingVerticalAnchorIndex =
+            -1
+    }
+
+    /*
+     * Fit-to-width never has horizontal overflow.
+     */
+    LaunchedEffect(
+        committedZoom <=
+                MIN_PDF_ZOOM +
+                PDF_ZOOM_EPSILON,
+        isPinching,
+    ) {
+        if (
+            !isPinching &&
+            committedZoom <=
             MIN_PDF_ZOOM +
             PDF_ZOOM_EPSILON
         ) {
+            requestedHorizontalScrollPx =
+                0f
+
             horizontalScrollState
                 .scrollTo(
                     0
@@ -338,97 +555,540 @@ fun PdfPreviewView(
                     viewportWidthPx =
                         size.width
                 }
-                /*
-                 * Only intercept an actual multi-touch gesture.
-                 *
-                 * A normal one-finger gesture is deliberately left
-                 * unconsumed:
-                 *   vertical -> LazyColumn
-                 *   horizontal while zoomed -> horizontalScroll
-                 */
                 .pointerInput(
                     filePath
                 ) {
-                    awaitEachGesture {
-                        awaitFirstDown(
-                            requireUnconsumed =
-                                false,
-                            pass =
-                                PointerEventPass
-                                    .Initial,
-                        )
-
-                        var multiTouchStarted =
-                            false
-
-                        while (true) {
-                            val event =
-                                awaitPointerEvent(
+                    try {
+                        awaitEachGesture {
+                            awaitFirstDown(
+                                requireUnconsumed =
+                                    false,
+                                pass =
                                     PointerEventPass
-                                        .Initial
-                                )
+                                        .Initial,
+                            )
 
-                            val pressedPointers =
-                                event.changes
-                                    .count {
-                                        it.pressed
-                                    }
+                            var multiTouchStarted =
+                                false
 
-                            if (
-                                pressedPointers >=
-                                2
-                            ) {
-                                multiTouchStarted =
-                                    true
+                            var gestureBaseReady =
+                                false
 
-                                val zoomChange =
-                                    event.calculateZoom()
+                            /*
+                             * One gesture uses one immutable real-layout base.
+                             *
+                             * None of these values are rebuilt from an
+                             * intermediate LazyColumn remeasure because there
+                             * are no intermediate remeasures anymore.
+                             */
+                            var gestureBaseZoom =
+                                committedZoom
+
+                            var gestureBaseHorizontalScroll =
+                                horizontalScrollState
+                                    .value
+                                    .toFloat()
+
+                            var gestureBaseCentroidX =
+                                0f
+
+                            var gestureBaseCentroidY =
+                                0f
+
+                            var gestureAnchorIndex =
+                                -1
+
+                            var gestureAnchorLocalY =
+                                0f
+
+                            /*
+                             * If the fingers begin inside the fixed 8dp
+                             * inter-page gap, keep that out-of-page component
+                             * unscaled for the eventual layout commit.
+                             */
+                            var gestureAnchorFixedYOffset =
+                                0f
+
+                            var gestureScaleValue =
+                                1f
+
+                            var lastCentroidX =
+                                0f
+
+                            var lastCentroidY =
+                                0f
+
+                            /*
+                             * Once a third pointer participates, freeze this
+                             * gesture until all pointers are released.
+                             *
+                             * Re-basing a draw-only transform while the real
+                             * layout remains unchanged introduces more edge
+                             * cases than it solves. Standard two-finger PDF
+                             * interaction remains deterministic.
+                             */
+                            var pointerMembershipInvalid =
+                                false
+
+                            while (true) {
+                                val event =
+                                    awaitPointerEvent(
+                                        PointerEventPass
+                                            .Initial
+                                    )
+
+                                val pressedPointers =
+                                    event.changes
+                                        .count {
+                                            it.pressed
+                                        }
 
                                 if (
-                                    zoomChange.isFinite() &&
-                                    zoomChange >
-                                    0f
+                                    pressedPointers >=
+                                    2
                                 ) {
-                                    zoom =
-                                        (
-                                                zoom *
-                                                        zoomChange
-                                                )
-                                            .coerceIn(
-                                                MIN_PDF_ZOOM,
-                                                MAX_PDF_ZOOM,
+                                    if (
+                                        !multiTouchStarted
+                                    ) {
+                                        multiTouchStarted =
+                                            true
+
+                                        isPinching =
+                                            true
+
+                                        gestureBaseReady =
+                                            false
+
+                                        pointerMembershipInvalid =
+                                            pressedPointers !=
+                                                    2
+
+                                        event.changes
+                                            .forEach {
+                                                it.consume()
+                                            }
+
+                                        continue
+                                    }
+
+                                    if (
+                                        pressedPointers !=
+                                        2
+                                    ) {
+                                        pointerMembershipInvalid =
+                                            true
+                                    }
+
+                                    val stablePointerCount =
+                                        event.changes
+                                            .count {
+                                                it.pressed &&
+                                                        it.previousPressed
+                                            }
+
+                                    if (
+                                        !pointerMembershipInvalid &&
+                                        pressedPointers ==
+                                        2 &&
+                                        stablePointerCount ==
+                                        2
+                                    ) {
+                                        val previousCentroid =
+                                            event.calculateCentroid(
+                                                useCurrent =
+                                                    false
                                             )
+
+                                        val currentCentroid =
+                                            event.calculateCentroid(
+                                                useCurrent =
+                                                    true
+                                            )
+
+                                        val zoomChange =
+                                            event.calculateZoom()
+
+                                        if (
+                                            previousCentroid.x.isFinite() &&
+                                            previousCentroid.y.isFinite() &&
+                                            currentCentroid.x.isFinite() &&
+                                            currentCentroid.y.isFinite() &&
+                                            zoomChange.isFinite() &&
+                                            zoomChange >
+                                            0f
+                                        ) {
+                                            /*
+                                             * Establish the immutable anchor
+                                             * exactly once for this pinch.
+                                             */
+                                            if (
+                                                !gestureBaseReady
+                                            ) {
+                                                val visibleItems =
+                                                    listState
+                                                        .layoutInfo
+                                                        .visibleItemsInfo
+
+                                                val anchorItem =
+                                                    visibleItems
+                                                        .firstOrNull { item ->
+                                                            val top =
+                                                                item.offset
+                                                                    .toFloat()
+
+                                                            val bottom =
+                                                                (
+                                                                        item.offset +
+                                                                                item.size
+                                                                        )
+                                                                    .toFloat()
+
+                                                            previousCentroid.y >=
+                                                                    top &&
+                                                                    previousCentroid.y <=
+                                                                    bottom
+                                                        }
+                                                        ?: visibleItems
+                                                            .minByOrNull { item ->
+                                                                val top =
+                                                                    item.offset
+                                                                        .toFloat()
+
+                                                                val bottom =
+                                                                    (
+                                                                            item.offset +
+                                                                                    item.size
+                                                                            )
+                                                                        .toFloat()
+
+                                                                when {
+                                                                    previousCentroid.y <
+                                                                            top ->
+                                                                        top -
+                                                                                previousCentroid.y
+
+                                                                    previousCentroid.y >
+                                                                            bottom ->
+                                                                        previousCentroid.y -
+                                                                                bottom
+
+                                                                    else ->
+                                                                        0f
+                                                                }
+                                                            }
+
+                                                if (
+                                                    anchorItem != null &&
+                                                    anchorItem.size >
+                                                    0
+                                                ) {
+                                                    gestureBaseReady =
+                                                        true
+
+                                                    gestureBaseZoom =
+                                                        committedZoom
+
+                                                    gestureBaseHorizontalScroll =
+                                                        horizontalScrollState
+                                                            .value
+                                                            .toFloat()
+
+                                                    gestureBaseCentroidX =
+                                                        previousCentroid.x
+
+                                                    gestureBaseCentroidY =
+                                                        previousCentroid.y
+
+                                                    gestureAnchorIndex =
+                                                        anchorItem.index
+
+                                                    val rawAnchorLocalY =
+                                                        previousCentroid.y -
+                                                                anchorItem
+                                                                    .offset
+                                                                    .toFloat()
+
+                                                    gestureAnchorLocalY =
+                                                        rawAnchorLocalY
+                                                            .coerceIn(
+                                                                0f,
+                                                                anchorItem
+                                                                    .size
+                                                                    .toFloat(),
+                                                            )
+
+                                                    gestureAnchorFixedYOffset =
+                                                        rawAnchorLocalY -
+                                                                gestureAnchorLocalY
+
+                                                    gestureScaleValue =
+                                                        1f
+
+                                                    lastCentroidX =
+                                                        previousCentroid.x
+
+                                                    lastCentroidY =
+                                                        previousCentroid.y
+                                                }
+                                            }
+
+                                            if (
+                                                gestureBaseReady
+                                            ) {
+                                                /*
+                                                 * Accumulate zoom only as a
+                                                 * visual transform.
+                                                 *
+                                                 * Clamp using the final logical
+                                                 * PDF zoom range, not an
+                                                 * arbitrary graphics-layer range.
+                                                 */
+                                                val minGestureScale =
+                                                    MIN_PDF_ZOOM /
+                                                            gestureBaseZoom
+
+                                                val maxGestureScale =
+                                                    MAX_PDF_ZOOM /
+                                                            gestureBaseZoom
+
+                                                gestureScaleValue =
+                                                    (
+                                                            gestureScaleValue *
+                                                                    zoomChange
+                                                            )
+                                                        .coerceIn(
+                                                            minGestureScale,
+                                                            maxGestureScale,
+                                                        )
+
+                                                lastCentroidX =
+                                                    currentCentroid.x
+
+                                                lastCentroidY =
+                                                    currentCentroid.y
+
+                                                /*
+                                                 * The graphics layer belongs
+                                                 * to the full-width LazyColumn
+                                                 * child of horizontalScroll.
+                                                 *
+                                                 * Its local horizontal origin
+                                                 * is therefore displaced by the
+                                                 * real horizontal scroll value,
+                                                 * which must be included when
+                                                 * keeping the centroid fixed.
+                                                 */
+                                                gestureTranslationX =
+                                                    currentCentroid.x +
+                                                            gestureBaseHorizontalScroll -
+                                                            (
+                                                                    gestureBaseCentroidX +
+                                                                            gestureBaseHorizontalScroll
+                                                                    ) *
+                                                            gestureScaleValue
+
+                                                /*
+                                                 * Vertically the LazyColumn
+                                                 * layer itself remains at y=0;
+                                                 * scrolling occurs inside it.
+                                                 */
+                                                gestureTranslationY =
+                                                    currentCentroid.y -
+                                                            gestureBaseCentroidY *
+                                                            gestureScaleValue
+
+                                                gestureScale =
+                                                    gestureScaleValue
+                                            }
+                                        }
+                                    }
+
+                                    /*
+                                     * Multi-touch transformation is owned
+                                     * entirely by this pointer handler.
+                                     */
+                                    event.changes
+                                        .forEach {
+                                            it.consume()
+                                        }
+                                } else if (
+                                    multiTouchStarted
+                                ) {
+                                    /*
+                                     * Once a gesture became multi-touch,
+                                     * consume its remainder so the final
+                                     * finger cannot suddenly become a normal
+                                     * LazyColumn drag.
+                                     */
+                                    event.changes
+                                        .forEach {
+                                            it.consume()
+                                        }
                                 }
 
-                                event.changes
-                                    .forEach {
-                                        it.consume()
-                                    }
-                            } else if (
-                                multiTouchStarted
-                            ) {
-                                /*
-                                 * Once a gesture became a pinch, consume the
-                                 * remainder until every finger is lifted.
-                                 *
-                                 * Otherwise the last remaining finger could
-                                 * suddenly turn into a LazyColumn scroll.
-                                 */
-                                event.changes
-                                    .forEach {
-                                        it.consume()
-                                    }
+                                if (
+                                    event.changes
+                                        .none {
+                                            it.pressed
+                                        }
+                                ) {
+                                    break
+                                }
                             }
 
+                            /*
+                             * ------------------------------------------------
+                             * One-time real layout commit
+                             * ------------------------------------------------
+                             *
+                             * The entire pinch above changed only draw
+                             * properties. Now convert the final visual
+                             * transform into one real LazyColumn layout.
+                             */
                             if (
-                                event.changes
-                                    .none {
-                                        it.pressed
-                                    }
+                                multiTouchStarted &&
+                                gestureBaseReady
                             ) {
-                                break
+                                val finalZoom =
+                                    (
+                                            gestureBaseZoom *
+                                                    gestureScaleValue
+                                            )
+                                        .coerceIn(
+                                            MIN_PDF_ZOOM,
+                                            MAX_PDF_ZOOM,
+                                        )
+
+                                val finalScaleFromBase =
+                                    finalZoom /
+                                            gestureBaseZoom
+
+                                val scaledAnchorLocalY =
+                                    gestureAnchorLocalY *
+                                            finalScaleFromBase +
+                                            gestureAnchorFixedYOffset
+
+                                val requestedVerticalOffset =
+                                    (
+                                            scaledAnchorLocalY -
+                                                    lastCentroidY
+                                            )
+                                        .roundToInt()
+
+                                val maxHorizontalScroll =
+                                    (
+                                            viewportWidthPx
+                                                .toFloat() *
+                                                    (
+                                                            finalZoom -
+                                                                    MIN_PDF_ZOOM
+                                                            )
+                                            )
+                                        .coerceAtLeast(
+                                            0f
+                                        )
+
+                                val targetHorizontalScroll =
+                                    (
+                                            (
+                                                    gestureBaseHorizontalScroll +
+                                                            gestureBaseCentroidX
+                                                    ) *
+                                                    finalScaleFromBase -
+                                                    lastCentroidX
+                                            )
+                                        .coerceIn(
+                                            0f,
+                                            maxHorizontalScroll,
+                                        )
+
+                                pendingVerticalAnchorIndex =
+                                    gestureAnchorIndex
+
+                                pendingVerticalScrollOffsetPx =
+                                    requestedVerticalOffset
+
+                                requestedHorizontalScrollPx =
+                                    targetHorizontalScroll
+
+                                /*
+                                 * Tell LazyColumn which page must survive the
+                                 * one real zoom-induced remeasure.
+                                 */
+                                listState
+                                    .requestScrollToItem(
+                                        index =
+                                            gestureAnchorIndex,
+                                        scrollOffset =
+                                            requestedVerticalOffset,
+                                    )
+
+                                /*
+                                 * Move as far horizontally as the old range
+                                 * allows. If zooming in requires a larger
+                                 * range, the LaunchedEffect above completes
+                                 * the correction after remeasure.
+                                 */
+                                val horizontalDelta =
+                                    targetHorizontalScroll -
+                                            horizontalScrollState
+                                                .value
+                                                .toFloat()
+
+                                if (
+                                    horizontalDelta !=
+                                    0f
+                                ) {
+                                    horizontalScrollState
+                                        .dispatchRawDelta(
+                                            horizontalDelta
+                                        )
+                                }
+
+                                /*
+                                 * These writes are observed together by the
+                                 * next Compose frame:
+                                 *
+                                 * visual transform -> identity
+                                 * committed layout -> final zoom
+                                 *
+                                 * so there is no deliberate intermediate
+                                 * frame that double-applies the scale.
+                                 */
+                                committedZoom =
+                                    finalZoom
+
+                                commitSequence +=
+                                    1
                             }
+
+                            gestureScale =
+                                1f
+
+                            gestureTranslationX =
+                                0f
+
+                            gestureTranslationY =
+                                0f
+
+                            isPinching =
+                                false
                         }
+                    } finally {
+                        /*
+                         * Covers document replacement and composition disposal.
+                         */
+                        gestureScale =
+                            1f
+
+                        gestureTranslationX =
+                            0f
+
+                        gestureTranslationY =
+                            0f
+
+                        isPinching =
+                            false
                     }
                 },
     ) {
@@ -446,6 +1106,11 @@ fun PdfPreviewView(
             return@Box
         }
 
+        /*
+         * Only committedZoom participates in layout.
+         *
+         * gestureScale is deliberately absent from this calculation.
+         */
         val contentWidth =
             with(
                 density
@@ -453,7 +1118,7 @@ fun PdfPreviewView(
                 (
                         viewportWidthPx
                             .toFloat() *
-                                zoom
+                                committedZoom
                         )
                     .toDp()
             }
@@ -477,110 +1142,167 @@ fun PdfPreviewView(
                         state =
                             horizontalScrollState,
                         enabled =
-                            zoom >
+                            committedZoom >
                                     MIN_PDF_ZOOM +
                                     PDF_ZOOM_EPSILON,
                     ),
         ) {
-            LazyColumn(
-                state =
-                    listState,
+            /*
+             * This wrapper is the only object transformed during pinch.
+             *
+             * Its measured width/height remain completely unchanged; only its
+             * draw layer is scaled/translated.
+             */
+            Box(
                 modifier =
                     Modifier
                         .width(
                             contentWidth
                         )
-                        .fillMaxHeight(),
-                contentPadding =
-                    PaddingValues(
-                        0.dp
-                    ),
-                verticalArrangement =
-                    Arrangement.spacedBy(
-                        8.dp
-                    ),
+                        .fillMaxHeight()
+                        .graphicsLayer {
+                            transformOrigin =
+                                TransformOrigin(
+                                    pivotFractionX =
+                                        0f,
+                                    pivotFractionY =
+                                        0f,
+                                )
+
+                            scaleX =
+                                gestureScale
+
+                            scaleY =
+                                gestureScale
+
+                            translationX =
+                                gestureTranslationX
+
+                            translationY =
+                                gestureTranslationY
+
+                            clip =
+                                false
+                        },
             ) {
-                items(
-                    count =
-                        pageCount,
-                    key = { pageIndex ->
-                        "$filePath:$pageIndex"
-                    },
-                ) { pageIndex ->
-                    /*
-                     * produceState retains its previous state while the
-                     * keyed producer restarts, so an existing lower-
-                     * resolution bitmap remains visible while the sharper
-                     * version is rendered in the background.
-                     */
-                    val bitmap =
-                        produceState<Bitmap?>(
-                            initialValue =
-                                null,
-                            key1 =
-                                filePath,
-                            key2 =
-                                pageIndex,
-                            key3 =
-                                targetWidthPx,
-                        ) {
-                            value =
-                                withContext(
-                                    Dispatchers.Default
-                                ) {
-                                    holder.render(
+                LazyColumn(
+                    state =
+                        listState,
+                    modifier =
+                        Modifier.fillMaxSize(),
+                    contentPadding =
+                        PaddingValues(
+                            0.dp
+                        ),
+                    verticalArrangement =
+                        Arrangement.spacedBy(
+                            8.dp
+                        ),
+                ) {
+                    items(
+                        count =
+                            pageCount,
+                        key = { pageIndex ->
+                            "$filePath:$pageIndex"
+                        },
+                    ) { pageIndex ->
+                        /*
+                         * Reuse an already rendered page immediately when
+                         * possible.
+                         *
+                         * If the exact target width is unavailable, the closest
+                         * cached resolution is used temporarily while a sharper
+                         * page is produced in the background.
+                         */
+                        val bitmap =
+                            produceState<Bitmap?>(
+                                initialValue =
+                                    holder.findCachedBitmap(
                                         pageIndex =
                                             pageIndex,
                                         targetWidthPx =
                                             targetWidthPx,
-                                    )
-                                }
-                        }.value
-
-                    Surface(
-                        modifier =
-                            Modifier.fillMaxWidth(),
-                        shape =
-                            RoundedCornerShape(
-                                14.dp
-                            ),
-                        color =
-                            Color.White,
-                        border =
-                            BorderStroke(
-                                1.dp,
-                                borderColor,
-                            ),
-                    ) {
-                        if (
-                            bitmap == null
-                        ) {
-                            Box(
-                                modifier =
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .height(
-                                            200.dp
-                                        ),
-                                contentAlignment =
-                                    Alignment.Center,
+                                    ),
+                                key1 =
+                                    filePath,
+                                key2 =
+                                    pageIndex,
+                                key3 =
+                                    targetWidthPx,
                             ) {
-                                CircularProgressIndicator()
-                            }
-                        } else {
-                            Image(
-                                bitmap =
-                                    bitmap
-                                        .asImageBitmap(),
-                                contentDescription =
-                                    null,
-                                modifier =
-                                    Modifier
-                                        .fillMaxWidth(),
-                                contentScale =
-                                    ContentScale
-                                        .FillWidth,
+                                value =
+                                    withContext(
+                                        Dispatchers.Default
+                                    ) {
+                                        holder.render(
+                                            pageIndex =
+                                                pageIndex,
+                                            targetWidthPx =
+                                                targetWidthPx,
+                                        )
+                                    }
+                            }.value
+
+                        /*
+                         * The page container itself always reserves a PDF-like
+                         * aspect ratio.
+                         *
+                         * Page 0's real ratio is available as the document
+                         * default immediately. Once a particular page has been
+                         * rendered, its own exact ratio replaces that default.
+                         *
+                         * Consequently a cache miss no longer collapses the
+                         * item to a fixed 200dp spinner and then expands it when
+                         * the Bitmap arrives.
+                         */
+                        val pageAspectRatio =
+                            holder.pageAspectRatio(
+                                pageIndex
                             )
+
+                        Surface(
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(
+                                        pageAspectRatio
+                                    ),
+                            shape =
+                                RoundedCornerShape(
+                                    14.dp
+                                ),
+                            color =
+                                Color.White,
+                            border =
+                                BorderStroke(
+                                    1.dp,
+                                    borderColor,
+                                ),
+                        ) {
+                            if (
+                                bitmap == null
+                            ) {
+                                Box(
+                                    modifier =
+                                        Modifier.fillMaxSize(),
+                                    contentAlignment =
+                                        Alignment.Center,
+                                ) {
+                                    CircularProgressIndicator()
+                                }
+                            } else {
+                                Image(
+                                    bitmap =
+                                        bitmap
+                                            .asImageBitmap(),
+                                    contentDescription =
+                                        null,
+                                    modifier =
+                                        Modifier.fillMaxSize(),
+                                    contentScale =
+                                        ContentScale.Fit,
+                                )
+                            }
                         }
                     }
                 }
@@ -593,8 +1315,7 @@ private class PdfRendererHolder(
     file: File,
 ) {
     /*
-     * PdfRenderer owns this ParcelFileDescriptor after construction
-     * succeeds. Do not close it separately from renderer.close().
+     * PdfRenderer owns this ParcelFileDescriptor once construction succeeds.
      */
     private val renderer:
             PdfRenderer =
@@ -617,7 +1338,54 @@ private class PdfRendererHolder(
                 }
             }
 
-    private var closed = false
+    private var closed =
+        false
+
+    /*
+     * Read the first page ratio once while the holder is created on IO.
+     *
+     * Most PDFs use a consistent page size, so this gives unseen lazy pages a
+     * far better placeholder geometry than an arbitrary fixed 200dp height.
+     * Mixed-size PDFs are corrected to their exact ratio after each page is
+     * first rendered.
+     */
+    private val defaultPageAspectRatio:
+            Float =
+        if (
+            renderer.pageCount >
+            0
+        ) {
+            renderer
+                .openPage(
+                    0
+                )
+                .use { page ->
+                    page.width
+                        .toFloat() /
+                            page.height
+                                .toFloat()
+                }
+        } else {
+            1f
+        }
+
+    /*
+     * Tiny metadata cache; unlike Bitmap caching this has negligible memory
+     * cost even for a large document.
+     */
+    private val pageAspectRatios =
+        mutableMapOf<Int, Float>()
+            .apply {
+                if (
+                    renderer.pageCount >
+                    0
+                ) {
+                    put(
+                        0,
+                        defaultPageAspectRatio,
+                    )
+                }
+            }
 
     private val renderedPages =
         object :
@@ -650,6 +1418,68 @@ private class PdfRendererHolder(
             }
         }
 
+    /*
+     * Returns the exact page ratio once known, otherwise the first page's real
+     * ratio as a stable placeholder.
+     */
+    @Synchronized
+    fun pageAspectRatio(
+        pageIndex: Int,
+    ): Float {
+        return pageAspectRatios[
+            pageIndex
+        ] ?: defaultPageAspectRatio
+    }
+
+    /*
+     * Prefer an exact cached raster.
+     *
+     * When the requested zoom resolution is new, keep showing the closest
+     * existing raster instead of replacing the page with a spinner while
+     * PdfRenderer catches up.
+     *
+     * snapshot() does not keep extra cache ownership: it is only used to find
+     * an already-LRU-managed Bitmap.
+     */
+    @Synchronized
+    fun findCachedBitmap(
+        pageIndex: Int,
+        targetWidthPx: Int,
+    ): Bitmap? {
+        val exactKey =
+            PdfRenderKey(
+                pageIndex =
+                    pageIndex,
+                targetWidthPx =
+                    targetWidthPx,
+            )
+
+        renderedPages
+            .get(
+                exactKey
+            )
+            ?.let {
+                return it
+            }
+
+        return renderedPages
+            .snapshot()
+            .entries
+            .asSequence()
+            .filter { entry ->
+                entry.key.pageIndex ==
+                        pageIndex &&
+                        !entry.value.isRecycled
+            }
+            .minByOrNull { entry ->
+                abs(
+                    entry.key.targetWidthPx -
+                            targetWidthPx
+                )
+            }
+            ?.value
+    }
+
     @Synchronized
     fun render(
         pageIndex: Int,
@@ -657,8 +1487,7 @@ private class PdfRendererHolder(
     ): Bitmap? {
         /*
          * A queued render may acquire this monitor after close() has already
-         * closed PdfRenderer. Treat that render as cancelled instead of touching
-         * the closed native renderer.
+         * closed PdfRenderer.
          */
         if (
             closed
@@ -687,6 +1516,17 @@ private class PdfRendererHolder(
                 pageIndex
             )
             .use { page ->
+                /*
+                 * Record the real geometry before allocating the Bitmap.
+                 */
+                pageAspectRatios[
+                    pageIndex
+                ] =
+                    page.width
+                        .toFloat() /
+                            page.height
+                                .toFloat()
+
                 val requestedScale =
                     targetWidthPx
                         .toDouble() /
@@ -696,9 +1536,7 @@ private class PdfRendererHolder(
                 /*
                  * ARGB_8888 uses four bytes per pixel.
                  *
-                 * Full-page high-resolution rendering is intentionally bounded.
-                 * This prevents an unusually tall/wide PDF page or a large zoom
-                 * level from allocating an enormous bitmap.
+                 * Keep the existing hard single-page memory boundary.
                  */
                 val pagePixels =
                     page.width
@@ -761,9 +1599,8 @@ private class PdfRendererHolder(
                 )
 
                 /*
-                 * close() cannot run concurrently because both methods use the
-                 * same monitor, so reaching here guarantees the holder is still
-                 * open.
+                 * render() and close() share the same monitor, so the renderer
+                 * cannot be closed while this Bitmap is being produced.
                  */
                 renderedPages.put(
                     cacheKey,
@@ -776,19 +1613,22 @@ private class PdfRendererHolder(
 
     @Synchronized
     fun close() {
-        if (closed) return
+        if (
+            closed
+        ) {
+            return
+        }
+
+        closed =
+            true
 
         /*
-         * Flip the state while holding the same monitor used by render().
-         * Any render waiting behind this close will see closed == true.
-         */
-        closed = true
-
-        /*
-         * Do not recycle the Bitmap objects manually. A Compose Image may still
-         * briefly hold a reference after the cache releases it.
+         * Do not recycle manually. Compose may still hold a short-lived
+         * reference to an evicted Bitmap.
          */
         renderedPages.evictAll()
+
+        pageAspectRatios.clear()
 
         renderer.close()
     }
