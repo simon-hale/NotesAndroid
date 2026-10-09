@@ -347,9 +347,47 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    private fun isReadingPreviewTypeSupported(
+        type: String,
+    ): Boolean =
+        when (
+            type.lowercase()
+        ) {
+            "pdf",
+            "md",
+            "markdown",
+            "docx",
+            "xlsx",
+            "xls",
+            "pptx",
+                -> true
+
+            else ->
+                false
+        }
+
     fun selectReadingFile(
         file: FileEntry,
     ) {
+        /*
+         * The directory listing already carries the file type. Reject unsupported
+         * files before changing Reading state so they can never become the current
+         * selection through the normal Disk flow.
+         */
+        if (
+            !isReadingPreviewTypeSupported(
+                file.type
+            )
+        ) {
+            sendWarningMessage(
+                strings()
+                    .reading
+                    .unsupportedFileType
+            )
+
+            return
+        }
+
         /*
          * Selecting another file invalidates any preview that is currently being
          * downloaded or parsed. The previously displayed preview itself remains
@@ -363,8 +401,12 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                     it.reading.copy(
                         selectedFile =
                             SelectedFile(
-                                file.id,
-                                file.name,
+                                id =
+                                    file.id,
+                                name =
+                                    file.name,
+                                type =
+                                    file.type,
                             ),
                         isRefreshing =
                             false,
@@ -613,25 +655,65 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                 )
             }.onSuccess { warningMessage ->
                 refreshCurrentDirectory()
+
+                /*
+                 * Backend derives File.type from the renamed file extension as well.
+                 * Keep the Reading snapshot consistent immediately instead of waiting
+                 * for the asynchronously refreshed directory listing.
+                 */
+                val renamedType =
+                    trimmed.substringAfterLast(
+                        delimiter = '.',
+                        missingDelimiterValue = "null",
+                    )
+
                 _uiState.update { state ->
                     val reading = state.reading
+
                     state.copy(
-                        reading = reading.copy(
-                            selectedFile = reading.selectedFile
-                                ?.takeIf { it.id == file.id }
-                                ?.copy(name = trimmed)
-                                ?: reading.selectedFile,
-                            displayedFile = reading.displayedFile
-                                ?.takeIf { it.id == file.id }
-                                ?.copy(name = trimmed)
-                                ?: reading.displayedFile,
-                        )
+                        reading =
+                            reading.copy(
+                                selectedFile =
+                                    reading.selectedFile
+                                        ?.takeIf {
+                                            it.id ==
+                                                    file.id
+                                        }
+                                        ?.copy(
+                                            name =
+                                                trimmed,
+                                            type =
+                                                renamedType,
+                                        )
+                                        ?: reading.selectedFile,
+                                displayedFile =
+                                    reading.displayedFile
+                                        ?.takeIf {
+                                            it.id ==
+                                                    file.id
+                                        }
+                                        ?.copy(
+                                            name =
+                                                trimmed,
+                                            type =
+                                                renamedType,
+                                        )
+                                        ?: reading.displayedFile,
+                            )
                     )
                 }
-                if (warningMessage.isNullOrBlank()) {
-                    sendSuccessMessage(strings.fileDisk.renamed)
+
+                if (
+                    warningMessage.isNullOrBlank()
+                ) {
+                    sendSuccessMessage(
+                        strings.fileDisk
+                            .renamed
+                    )
                 } else {
-                    sendWarningMessage(warningMessage)
+                    sendWarningMessage(
+                        warningMessage
+                    )
                 }
             }.onFailure { throwable ->
                 sendThrowableMessage(throwable)
@@ -3280,11 +3362,13 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                         _uiState.value
                             .reading
 
+                    /*
+                     * Refresh always requires an explicit current selection.
+                     * Do not fall back to a previously displayed file.
+                     */
                     val selectedFile =
                         readingBeforeRefresh
                             .selectedFile
-                            ?: readingBeforeRefresh
-                                .displayedFile
 
                     if (
                         selectedFile == null
@@ -3296,6 +3380,29 @@ class NotesAppViewModel(application: Application) : AndroidViewModel(application
                             sendWarningMessage(
                                 strings.reading
                                     .selectFileFirst
+                            )
+                        }
+
+                        return@launch
+                    }
+
+                    /*
+                     * Disk normally prevents unsupported files from ever becoming
+                     * selected. Keep this second guard here so an invalid Reading
+                     * state can never reach the backend preview endpoint either.
+                     */
+                    if (
+                        !isReadingPreviewTypeSupported(
+                            selectedFile.type
+                        )
+                    ) {
+                        if (
+                            generation ==
+                            readingPreviewGeneration
+                        ) {
+                            sendWarningMessage(
+                                strings.reading
+                                    .unsupportedFileType
                             )
                         }
 
