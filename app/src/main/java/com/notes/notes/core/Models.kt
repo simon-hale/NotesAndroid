@@ -116,7 +116,6 @@ data class UploadCandidate(
 data class SelectedFile(
     val id: Long,
     val name: String,
-
     val type: String,
 )
 
